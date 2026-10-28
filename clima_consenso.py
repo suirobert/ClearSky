@@ -59,7 +59,8 @@ MIN_HORAS_LLUVIA    = 5
 TOLERANCIA_H        = 1
 BINS_CALIB          = 10
 SUAVIZADO_CALIB     = 5
-VERSION             = 4          # versión de la lógica de datos (si cambia, se re-verifica)
+VERSION             = 5          # versión de la lógica de datos (si cambia, se re-verifica)
+DIAS_RECIENTES      = 21         # días recientes para la calibración que se adapta a la temporada
 DIAS_PRUEBA         = 10         # últimos días reservados para examinar al sistema (no se usan para aprender)
 MIN_COBERTURA_OBS   = 0.70       # si el aeropuerto reportó menos del 70% de las horas, no se actualiza
 MIN_MODELOS         = 3          # mínimo de modelos con historial para actualizar
@@ -297,9 +298,28 @@ def verificar_ciudad(nombre, cfg):
     return calibrar(obs, prev)
 
 
+def tabla_mezcla(tabla, alfa=0.5):
+    """Punto medio entre la calibración y el valor sin ajustar (más prudente ante cambios de temporada)."""
+    if not tabla:
+        return []
+    return [[float(x), round(alfa * calibrar_prob(x, tabla) + (1 - alfa) * x, 1)] for x in range(0, 101, 5)]
+
+
+def opciones_calibracion(hs, pr, ob):
+    """Candidatas de calibración aprendidas con las horas hs. pr: {hora: prob}, ob: {hora: 0/1}."""
+    completa = ajustar_calibracion([pr[k] for k in hs], [ob[k] for k in hs])
+    rec = hs[-24 * DIAS_RECIENTES:]
+    reciente = ajustar_calibracion([pr[k] for k in rec], [ob[k] for k in rec])
+    return {"sin_ajuste": [], "completa": completa, "reciente": reciente,
+            "mezcla": tabla_mezcla(completa), "mezcla_reciente": tabla_mezcla(reciente)}
+
+
+ORDEN_PRUDENCIA = ["mezcla_reciente", "reciente", "mezcla", "completa", "sin_ajuste"]
+
+
 def calibrar(obs, prev):
-    """Aprende pesos, umbral y calibración. Antes de aceptarlos los examina con días que NO usó
-       para aprender; si algo no mejora en el examen, se usa la opción más simple y segura."""
+    """Aprende pesos, umbral y calibración. Prueba varias formas de calibrar con días que NO usó
+       para aprender y se queda con la que mejor acierta. Así se adapta a cambios de temporada."""
     ahora = datetime.now().strftime("%Y-%m-%dT%H:00")
     horas = sorted(k for k in obs if k < ahora and sum(k in prev[m] for m in prev) >= 2)
     if not horas or not prev:
@@ -330,56 +350,55 @@ def calibrar(obs, prev):
             pesos[m] = max(puntaje(met, hl), 0) + 0.05
         media = statistics.mean(pesos.values())
         pesos = {m: round(w / media, 3) for m, w in pesos.items()}
-        pl = probs(hs, umbral, pesos)
-        tabla = ajustar_calibracion([pl[k] for k in hs], [ol[k] for k in hs])
-        pdz = probs(hs, UMBRAL_LLOVIZNA, pesos)
-        tabla_dz = ajustar_calibracion([pdz[k] for k in hs], [o_dz[k] for k in hs])
-        return {"umbral": umbral, "pesos": pesos, "tabla": tabla, "tabla_dz": tabla_dz,
-                "modelos": met_mod, "hss_estricto": hss_e, "umbrales_eval": ev, "horas_lluvia": hl}
+        return {"umbral": umbral, "pesos": pesos, "modelos": met_mod, "hss_estricto": hss_e,
+                "umbrales_eval": ev, "horas_lluvia": hl}
 
     # ---- 1) EXAMEN: aprender con los días viejos, evaluar con los últimos DIAS_PRUEBA días ----
     corte = (datetime.strptime(horas[-1], "%Y-%m-%dT%H:00") - timedelta(days=DIAS_PRUEBA)).strftime("%Y-%m-%dT%H:00")
     ent = [k for k in horas if k <= corte]
     pru = [k for k in horas if k > corte]
-    examen = None
-    usar_pesos, usar_calib = True, True
+    examen, usar_pesos, modo = None, True, "completa"
     if len(ent) >= 24 * 14 and len(pru) >= 24 * 3:
         aj = ajustar(ent)
         real = [o_lluvia[k] for k in pru]
         base = sum(o_lluvia[k] for k in ent) / len(ent)
-        p_eq = probs(pru, aj["umbral"], iguales)
-        p_w = probs(pru, aj["umbral"], aj["pesos"])
+        resultados = {}                                   # (usar_pesos, modo) -> brier
+        for con_pesos, pesos in ((True, aj["pesos"]), (False, iguales)):
+            p_ent = probs(ent, aj["umbral"], pesos)
+            p_pru = probs(pru, aj["umbral"], pesos)
+            for nombre, tabla in opciones_calibracion(ent, p_ent, o_lluvia).items():
+                resultados[(con_pesos, nombre)] = brier([calibrar_prob(p_pru[k], tabla) for k in pru], real)
+        # el mejor; ante empate (diferencia < 0.001) se prefiere lo más prudente
+        mejor_b = min(resultados.values())
+        usar_pesos, modo = min((k for k, b in resultados.items() if b <= mejor_b + 0.001),
+                               key=lambda k: (not k[0], ORDEN_PRUDENCIA.index(k[1])))
+        b_sis = resultados[(usar_pesos, modo)]
         b_clima = brier([base * 100] * len(pru), real)
-        b_crudo = brier([p_eq[k] for k in pru], real)
-        b_pesos = brier([p_w[k] for k in pru], real)
-        b_final = brier([calibrar_prob(p_w[k], aj["tabla"]) for k in pru], real)
-        p_eq_ent = probs(ent, aj["umbral"], iguales)
-        tabla_eq = ajustar_calibracion([p_eq_ent[k] for k in ent], [o_lluvia[k] for k in ent])
-        b_eq_cal = brier([calibrar_prob(p_eq[k], tabla_eq) for k in pru], real)
-        usar_calib = b_final <= b_pesos
-        usar_pesos = b_final <= b_eq_cal if usar_calib else b_pesos <= b_crudo
-        b_elegido = (b_final if usar_pesos else b_eq_cal) if usar_calib else (b_pesos if usar_pesos else b_crudo)
-        cal_pru = [calibrar_prob((p_w if usar_pesos else p_eq)[k], aj["tabla"] if usar_pesos else tabla_eq) if usar_calib else (p_w if usar_pesos else p_eq)[k]
-                   for k in pru]
+        b_crudo = resultados[(False, "sin_ajuste")]
+        p_pru = probs(pru, aj["umbral"], aj["pesos"] if usar_pesos else iguales)
+        p_ent = probs(ent, aj["umbral"], aj["pesos"] if usar_pesos else iguales)
+        tabla_ex = opciones_calibracion(ent, p_ent, o_lluvia)[modo]
         examen = {"desde": pru[0][:10], "hasta": pru[-1][:10], "horas": len(pru), "horas_lluvia": sum(real),
-                  "brier_clima": b_clima, "brier_crudo": b_crudo, "brier_sistema": b_elegido,
-                  "mejora_vs_clima_pct": round((1 - b_elegido / b_clima) * 100) if b_clima else None,
-                  "mejora_vs_crudo_pct": round((1 - b_elegido / b_crudo) * 100) if b_crudo else None,
-                  "tramos": tabla_tramos(cal_pru, real),
-                  "usar_pesos": usar_pesos, "usar_calibracion": usar_calib}
+                  "brier_clima": b_clima, "brier_crudo": b_crudo, "brier_sistema": b_sis,
+                  "mejora_vs_clima_pct": round((1 - b_sis / b_clima) * 100) if b_clima else None,
+                  "mejora_vs_crudo_pct": round((1 - b_sis / b_crudo) * 100) if b_crudo else None,
+                  "tramos": tabla_tramos([calibrar_prob(p_pru[k], tabla_ex) for k in pru], real),
+                  "usar_pesos": usar_pesos, "usar_calibracion": modo != "sin_ajuste",
+                  "modo_calibracion": modo,
+                  "brier_opciones": {f"{'pesos' if a else 'iguales'}/{b}": v for (a, b), v in sorted(resultados.items())}}
 
-    # ---- 2) AJUSTE FINAL con todos los días, respetando lo que aprobó el examen ----
+    # ---- 2) AJUSTE FINAL con todos los días, usando la combinación que ganó el examen ----
     aj = ajustar(horas)
     pesos = aj["pesos"] if usar_pesos else {m: 1.0 for m in prev}
     sin_datos = [m for m in MODELOS if m not in pesos]
     for m in sin_datos:
         pesos[m] = round(min(pesos.values()), 3)
     p_lluvia = probs(horas, aj["umbral"], pesos)
+    tabla_lluvia = opciones_calibracion(horas, p_lluvia, o_lluvia)[modo]
+    p_dz = probs(horas, UMBRAL_LLOVIZNA, pesos)
+    tabla_dz = opciones_calibracion(horas, p_dz, o_dz)[modo]
     bruta = [p_lluvia[k] for k in horas]
     real = [o_lluvia[k] for k in horas]
-    tabla_lluvia = ajustar_calibracion(bruta, real) if usar_calib else []
-    pdz = probs(horas, UMBRAL_LLOVIZNA, pesos)
-    tabla_dz = ajustar_calibracion([pdz[k] for k in horas], [o_dz[k] for k in horas]) if usar_calib else []
     cal = [calibrar_prob(p, tabla_lluvia) for p in bruta]
     hl = aj["horas_lluvia"]
     return {"umbral": aj["umbral"], "pesos": pesos, "verificado": True, "tolerancia_h": TOLERANCIA_H,
@@ -389,7 +408,7 @@ def calibrar(obs, prev):
             "consenso": metricas(binario(p_lluvia), o_lluvia),
             "consenso_igual": metricas(binario(probs(horas, aj["umbral"], {m: 1.0 for m in prev})), o_lluvia),
             "consenso_hss_estricto": metricas(binario(p_lluvia), o_lluvia, tol=0)["hss"],
-            "tabla_lluvia": tabla_lluvia, "tabla_llovizna": tabla_dz,
+            "tabla_lluvia": tabla_lluvia, "tabla_llovizna": tabla_dz, "modo_calibracion": modo,
             "frecuencia_base_pct": round(sum(real) / len(real) * 100, 1),
             "brier_bruto": brier(bruta, real), "brier_calibrado": brier(cal, real),
             "calibracion": tabla_tramos(bruta, real), "calibracion_post": tabla_tramos(cal, real),
@@ -497,7 +516,7 @@ def verificar(p):
             print(f"  {c}: {r['horas']} h, {r['horas_lluvia']} con lluvia, umbral {r['umbral']} mm/h, "
                   f"HSS {r['consenso']['hss']} | examen ({ex.get('horas', 0)} h no vistas): "
                   f"Brier clima {ex.get('brier_clima')} / crudo {ex.get('brier_crudo')} / sistema {ex.get('brier_sistema')} "
-                  f"| pesos {'sí' if ex.get('usar_pesos', True) else 'NO'}, calibración {'sí' if ex.get('usar_calibracion', True) else 'NO'}")
+                  f"| pesos {'sí' if ex.get('usar_pesos', True) else 'NO'}, calibración {ex.get('modo_calibracion', '-')}")
         except Exception as e:
             log_error(f"verificación {c}: {e} (se mantiene la configuración anterior)")
     guardar_archivo_obs(arch)
