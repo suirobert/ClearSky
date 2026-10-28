@@ -1,0 +1,59 @@
+# Actualiza el pronóstico cada hora, guarda lo aprendido en el repositorio y publica la página.
+name: Actualizar pronóstico
+
+on:
+  schedule:
+    - cron: "7 * * * *"          # minuto 7 de cada hora (UTC); GitHub puede retrasarlo unos minutos
+  workflow_dispatch:              # botón "Run workflow" para ejecutarlo a mano
+    inputs:
+      verificar:
+        description: "Forzar verificación y aprendizaje ahora"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write                 # guardar los datos aprendidos
+  pages: write                    # publicar la página
+  id-token: write
+
+concurrency:                      # nunca dos ejecuciones al mismo tiempo
+  group: clima-consenso
+  cancel-in-progress: false
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      CC_DATOS: datos
+      CC_HTML: sitio/index.html
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generar pronóstico (y aprender si corresponde)
+        run: python clima_consenso.py --no-open ${{ inputs.verificar && '--verificar' || '' }}
+
+      - name: Guardar datos en el repositorio
+        if: ${{ !cancelled() }}
+        run: |
+          git config user.name  "clima-consenso-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add datos
+          if git diff --cached --quiet; then echo "Sin cambios"; exit 0; fi
+          git commit -m "Datos $(TZ=America/Guayaquil date '+%Y-%m-%d %H:%M')"
+          for i in 1 2 3; do git pull --rebase && git push && exit 0; sleep 10; done
+          exit 1
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: sitio
+      - id: deploy
+        uses: actions/deploy-pages@v4
