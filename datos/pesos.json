@@ -1,5 +1,5 @@
 {
-  "actualizado": "2026-10-28T13:09:15",
+  "actualizado": "2026-10-28T13:21:28",
   "version": 7,
   "ciudades": {
     "Guayaquil": {
@@ -1540,18 +1540,18 @@
         "modo": "sin_ajuste"
       },
       "real": {
-        "horas": 4,
+        "horas": 5,
         "desde": "2026-10-28",
         "hasta": "2026-10-28",
         "horas_lluvia": 0,
-        "brier": 0.0243,
+        "brier": 0.0211,
         "brier_clima": 0.0,
         "mejora_vs_clima_pct": null,
         "anuncios": 0,
         "anuncios_acertados": 0,
         "tramos": {
           "0-20%": {
-            "horas": 4,
+            "horas": 5,
             "llovio_pct": 0
           }
         }
