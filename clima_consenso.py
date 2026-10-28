@@ -13,6 +13,7 @@ Página (index.html, generada aquí y dibujada con JavaScript):
   - Primero "Mi ubicación" (el navegador calcula el pronóstico del punto del usuario con la
     configuración aprendida en la ciudad verificada más parecida); las ciudades van en una lista aparte.
   - Ícono del cielo según el sol que llega de verdad (las nubes altas finas ya no dan "nublado").
+  - Modo claro y oscuro automático según el dispositivo, con botón para elegirlo a mano.
   - Mapa de lluvia por horas, satélite GOES, íconos animados Meteocons, gráfica y barra que se
     pueden arrastrar con el dedo, instalable como app (PWA) y con uso sin conexión.
 
@@ -1016,7 +1017,10 @@ def generar_html(resultados, p, mapa=None, iconos=None):
 PLANTILLA = """<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0b0f17">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="dark light">
+<script>(function(){var t=null;try{t=localStorage.getItem('cc_tema')}catch(e){}
+if(t!=='claro'&&t!=='oscuro')t=matchMedia('(prefers-color-scheme: light)').matches?'claro':'oscuro';
+document.documentElement.dataset.tema=t;document.querySelector('meta[name=theme-color]').content=t==='claro'?'#f4f6fa':'#0b0f17';})();</script>
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -1028,7 +1032,7 @@ PLANTILLA = """<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
 <meta name="description" content="Pronóstico del tiempo para Ecuador que combina 7 modelos y mide en público cuánto acierta: lluvia y tormentas eléctricas verificadas cada día.">
 <title>ClearSky · Pronóstico verificado</title>
 <style>__CSS__</style></head><body>
-<header class="top"><div class="brand">ClearSky</div><button class="lugarbtn" id="lugarbtn" aria-haspopup="dialog"><span id="lugarnom">Tu ubicación</span><span aria-hidden="true">▾</span></button></header>
+<header class="top"><div class="brand">ClearSky</div><div class="topder"><button class="temabtn" id="temabtn" aria-label="Cambiar tema"></button><button class="lugarbtn" id="lugarbtn" aria-haspopup="dialog"><span id="lugarnom">Tu ubicación</span><span aria-hidden="true">▾</span></button></div></header>
 <div class="ptr" id="ptr" aria-hidden="true">↻</div>
 <main class="wrap"><div id="aviso"></div><div id="vista"><div class="vacio"><span class="cargando"></span>Cargando…</div></div><div class="pie" id="pie"></div></main>
 <div class="sheet-bg" id="sheetbg" hidden></div>
@@ -1049,7 +1053,7 @@ button{font:inherit;color:inherit}
 .top{position:sticky;top:0;z-index:50;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:calc(10px + var(--sat)) 16px 10px;background:rgba(11,15,23,.82);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);border-bottom:1px solid rgba(255,255,255,.04)}
 .top>*{max-width:760px}
 .brand{font-weight:700;font-size:16px;letter-spacing:.3px;color:#cbd5e1}
-.lugarbtn{display:flex;align-items:center;gap:6px;max-width:62vw;min-height:40px;border:0;background:var(--card2);border-radius:999px;padding:8px 14px;font-size:14px;cursor:pointer;transition:transform .12s,background .2s}
+.lugarbtn{display:flex;align-items:center;gap:6px;max-width:52vw;min-height:40px;border:0;background:var(--card2);border-radius:999px;padding:8px 14px;font-size:14px;cursor:pointer;transition:transform .12s,background .2s}
 .lugarbtn span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .lugarbtn:active{transform:scale(.96);background:#1d2533}
 .wrap{max-width:760px;margin:0 auto;padding:6px 16px calc(40px + var(--sab))}
@@ -1163,6 +1167,48 @@ details.tec{background:#0d121b;margin-top:14px}
 .pie{font-size:11.5px;color:var(--tx3);margin-top:22px;line-height:1.6}
 .pie a{color:#93c5fd}
 .ic img{display:block}
+.topder{display:flex;gap:8px;align-items:center;min-width:0}
+.temabtn{flex:none;width:40px;height:40px;border:0;border-radius:50%;background:var(--card2);font-size:17px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:transform .12s}
+.temabtn:active{transform:scale(.92)}
+html,body,.card,details,.chip,.top,.sheet{transition:background-color .25s,color .25s}
+/* ---------- MODO CLARO ---------- */
+html[data-tema=claro]{color-scheme:light;--bg:#f4f6fa;--card:#ffffff;--card2:#e9edf3;--line:#e3e8ef;--tx:#0f172a;--tx2:#475569;--tx3:#64748b;--acc:#2563eb;--acc2:#2563eb}
+html[data-tema=claro] .top{background:rgba(244,246,250,.85);border-bottom-color:rgba(15,23,42,.06)}
+html[data-tema=claro] .brand,html[data-tema=claro] .blq,html[data-tema=claro] .tldet,html[data-tema=claro] .dexp p,
+html[data-tema=claro] .fbres,html[data-tema=claro] .mapht,html[data-tema=claro] .sheet h2{color:#334155}
+html[data-tema=claro] .chip{color:#334155}html[data-tema=claro] .chip b{color:#0f172a}
+html[data-tema=claro] .chip.ts{background:#ede9fe;color:#5b21b6}html[data-tema=claro] .chip.ts b{color:#4c1d95}
+html[data-tema=claro] .card,html[data-tema=claro] details{box-shadow:0 1px 3px rgba(15,23,42,.06),0 1px 2px rgba(15,23,42,.04)}
+html[data-tema=claro] .card h3 button,html[data-tema=claro] .btn.sec,html[data-tema=claro] .mapctl button{background:#e9edf3;color:#1d4ed8}
+html[data-tema=claro] .aviso-top{background:#dbeafe}
+html[data-tema=claro] .lugarbtn:active{background:#dde3eb}
+html[data-tema=claro] .seg{border-right-color:#fff}
+html[data-tema=claro] .graf .grid{stroke:#e5e7eb}html[data-tema=claro] .graf .dia{stroke:#cbd5e1}
+html[data-tema=claro] .graf .linea{stroke:#2563eb}html[data-tema=claro] .graf .lineadz{stroke:#64748b}
+html[data-tema=claro] .graf .lineats{stroke:#7c3aed}html[data-tema=claro] .graf .mm{fill:#93c5fd;opacity:.7}
+html[data-tema=claro] .graf .cursor{stroke:#334155}html[data-tema=claro] .graf .punto{fill:#2563eb;stroke:#fff}
+html[data-tema=claro] .tip{background:#fff;border-color:#e2e8f0;color:#334155;box-shadow:0 8px 24px rgba(15,23,42,.15)}
+html[data-tema=claro] .tip b{color:#0f172a}
+html[data-tema=claro] .pp{color:#2563eb}html[data-tema=claro] .pp.off{color:#cbd5e1}
+html[data-tema=claro] .trng,html[data-tema=claro] .calib .cb div{background:#e5e7eb}
+html[data-tema=claro] .drow:active{background:#eef2f7}html[data-tema=claro] .drow.sel{background:#e8f0fe}
+@media(hover:hover){html[data-tema=claro] .drow:hover{background:#f1f5f9}}
+html[data-tema=claro] summary,html[data-tema=claro] .pie a{color:#1d4ed8}
+html[data-tema=claro] summary:before{color:#94a3b8}
+html[data-tema=claro] th{background:#f1f5f9}html[data-tema=claro] tr.dsep td{background:#e9edf3;color:#334155}
+html[data-tema=claro] tr.star td{background:#dcfce7}html[data-tema=claro] tr.alt td{background:#dbeafe}
+html[data-tema=claro] .aviso{color:#92400e;background:#fef3c7}
+html[data-tema=claro] details.tec{background:#f8fafc}
+html[data-tema=claro] .fbb button{background:#f1f5f9;border-color:#e2e8f0}
+html[data-tema=claro] #mapa,html[data-tema=claro] .sat img{background:#e9edf3}
+html[data-tema=claro] .sheet-bg{background:rgba(15,23,42,.35)}
+html[data-tema=claro] .sheet{background:#fff;box-shadow:0 -8px 30px rgba(15,23,42,.12)}
+html[data-tema=claro] .grab{background:#cbd5e1}
+html[data-tema=claro] .lit:active{background:#f1f5f9}html[data-tema=claro] .lit.on{background:#e8f0fe}
+html[data-tema=claro] .toast{background:#fff;border-color:#e2e8f0;box-shadow:0 8px 30px rgba(15,23,42,.18)}
+html[data-tema=claro] .toast button{color:#1d4ed8}
+html[data-tema=claro] .cargando{border-color:#cbd5e1;border-top-color:#2563eb}
+html[data-tema=claro] .ptr{box-shadow:0 2px 8px rgba(15,23,42,.15)}
 @media(max-width:560px){
   .hero .t{font-size:54px}.hero h1{font-size:18.5px}
   .drow{grid-template-columns:64px 30px 38px 26px 1fr 28px;gap:7px;font-size:14px}.dmm{display:none}
@@ -1285,6 +1331,9 @@ function cielo(r) {
   if (nub >= 35) return [n ? 'parcial_noche' : 'parcial_dia', 'Parcialmente nublado', '#94a3b8'];
   return [n ? 'luna' : 'sol', 'Despejado', '#cbd5e1'];
 }
+const claro = () => document.documentElement.dataset.tema === 'claro';
+const COL_CLARO = {'#cbd5e1': '#fcd34d', '#94a3b8': '#cbd5e1', '#64748b': '#94a3b8', '#a8a29e': '#d6d3d1'};
+const colSeg = c => claro() ? (COL_CLARO[c] || c) : c;
 function condicion(r) {
   if ((r.prob_ts || 0) >= 30) return ['tormenta', r.prob_ts >= 50 ? 'Tormenta eléctrica probable' : 'Posible tormenta eléctrica', '#7c3aed'];
   if (r.prob >= 40) return ['lluvia', 'Lluvia probable', '#1d4ed8'];
@@ -1337,11 +1386,11 @@ function nivelUV(u) { return u < 3 ? 'bajo' : u < 6 ? 'moderado' : u < 8 ? 'alto
 
 // ---------- línea de tiempo (se puede arrastrar el dedo) ----------
 const CORTOS = {'Parcialmente nublado': 'Nubes', 'Sol y nubes': 'Nubes', 'Lluvia probable': 'Lluvia', 'Posible lluvia': 'Lluvia',
-  'Despejado': 'Sol', 'Soleado': 'Sol', 'Posible tormenta eléctrica': 'Tormenta', 'Tormenta eléctrica probable': 'Tormenta'};
+  'Soleado': 'Sol', 'Posible tormenta eléctrica': 'Tormenta', 'Tormenta eléctrica probable': 'Tormenta'};
 function lineaTiempo(rows, ahora) {
   const n = rows.length; if (!n) return '';
   const conds = rows.map(condicion);
-  const segs = rows.map((r, i) => `<div class="seg${estado.tlSel === r.hora ? ' sel' : ''}" data-i="${i}" style="background:${conds[i][2]}"></div>`).join('');
+  const segs = rows.map((r, i) => `<div class="seg${estado.tlSel === r.hora ? ' sel' : ''}" data-i="${i}" style="background:${colSeg(conds[i][2])}"></div>`).join('');
   const tks = rows.map((r, i) => i % 2 ? '' : `<div class="tk" style="left:${i / n * 100}%"><b>${r.hora === ahora ? 'Ahora' : r.hora.slice(11, 13) + 'h'}</b><span>${r.temp != null ? Math.round(r.temp) : '-'}°</span></div>`).join('');
   const fam = (r, i) => conds[i][0] === 'tormenta' ? 'tormenta' : r.prob >= 20 ? 'lluvia' : conds[i][1];
   const runs = [];
@@ -1360,7 +1409,7 @@ function lineaTiempo(rows, ahora) {
   const LEY = {'Soleado': 'Despejado', 'Sol y nubes': 'Algo nublado', 'Parcialmente nublado': 'Algo nublado',
     'Tormenta eléctrica probable': 'Tormenta', 'Posible tormenta eléctrica': 'Tormenta'};
   const usados = new Map(); conds.forEach(c => usados.set(LEY[c[1]] || c[1], c[2]));
-  const ley = [...usados].map(([t, c]) => `<span><i style="background:${c};height:8px"></i>${t}</span>`).join('');
+  const ley = [...usados].map(([t, c]) => `<span><i style="background:${colSeg(c)};height:8px"></i>${t}</span>`).join('');
   return `<div class="tl"><div class="blqs">${blq}</div><div class="bar" role="slider" aria-label="Próximas horas">${segs}</div><div class="tks">${tks}</div>` +
     `<div class="tldet">Toca o desliza el dedo sobre la barra para ver cada hora.</div><div class="ley">${ley}</div></div>`;
 }
@@ -1425,7 +1474,9 @@ function grafica(cont, filas, ahora, hoy) {
     tip.hidden = false;
     const tw = tip.offsetWidth, th = tip.offsetHeight;
     tip.style.left = Math.max(0, Math.min(W - tw, X(i) - tw / 2)) + 'px';
-    tip.style.top = (ev.pointerType === 'mouse' ? -6 : -th - 8) + 'px';   // con el dedo, el globo va arriba para que no lo tape
+    // con el dedo, el globo va arriba para que no lo tape; si arriba lo taparía la barra superior, va abajo
+    const cab = ($('.top') || {}).offsetHeight || 60, arribaLibre = rc.top - th - 8 > cab + 4;
+    tip.style.top = (ev.pointerType === 'mouse' ? -6 : arribaLibre ? -th - 8 : H + 6) + 'px';
   };
   const ocultar = () => { tip.hidden = true; cur.setAttribute('visibility', 'hidden'); pto.setAttribute('visibility', 'hidden'); ult = -1; };
   svg.addEventListener('pointerdown', e => { activo = true; mostrar(e); });
@@ -1513,7 +1564,7 @@ function activarMapa(v) {
     $('#mapa').innerHTML = '';
     const map = L.map('mapa', {zoomControl: !tactil, dragging: !tactil, tap: false, scrollWheelZoom: false, attributionControl: true})
       .setView([v.lat ?? -1.6, v.lon ?? -78.6], 6.4);
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {maxZoom: 10, subdomains: 'abcd',
+    L.tileLayer(`https://{s}.basemaps.cartocdn.com/${claro() ? 'light_all' : 'dark_all'}/{z}/{x}/{y}{r}.png`, {maxZoom: 10, subdomains: 'abcd',
       attribution: '&copy; OpenStreetMap &copy; CARTO'}).addTo(map);
     const rects = [], d = M.paso / 2;
     M.lats.forEach(la => M.lons.forEach(lo => rects.push(L.rectangle([[la - d, lo - d], [la + d, lo + d]], {weight: 0, fillOpacity: 0, interactive: true}).addTo(map))));
@@ -1521,7 +1572,7 @@ function activarMapa(v) {
     const sl = $('#mslider'), lab = $('#mhora');
     const pintar = j => {
       const ps = M.p[j]; rects.forEach((r, k) => { const p = ps[k], c = p >= 0 ? colorP(p) : null;
-        r.setStyle({fillColor: c || '#000', fillOpacity: c ? 0.55 : 0}); r.unbindTooltip(); if (p >= 0) r.bindTooltip(`${p}% de lluvia`, {sticky: true}); });
+        r.setStyle({fillColor: c || '#000', fillOpacity: c ? (claro() ? 0.45 : 0.55) : 0}); r.unbindTooltip(); if (p >= 0) r.bindTooltip(`${p}% de lluvia`, {sticky: true}); });
       const hr = M.horas[j]; lab.textContent = `${nombreDia(hr.slice(0, 10), hoy)} ${hr.slice(11, 16)}`;
     };
     const ahora = ahoraISO(D.offset); let j0 = M.horas.findIndex(h => h >= ahora); if (j0 < 0) j0 = 0;
@@ -1725,7 +1776,8 @@ function cabecera() {
   $('#lugarnom').textContent = (estado.vista === 'ubic' ? '📍 ' : '') + v;
 }
 function leyenda(hayTs) {
-  return [['lluvia', '#60a5fa', 'Lluvia', '3px'], ['llovizna', '#94a3b8', 'Llovizna', '3px'], ...(hayTs ? [['tormenta', '#a78bfa', 'Tormenta', '3px']] : []), ['mm', '#1e40af', 'Cantidad', '8px']]
+  const k = claro();
+  return [['lluvia', k ? '#2563eb' : '#60a5fa', 'Lluvia', '3px'], ['llovizna', k ? '#64748b' : '#94a3b8', 'Llovizna', '3px'], ...(hayTs ? [['tormenta', k ? '#7c3aed' : '#a78bfa', 'Tormenta', '3px']] : []), ['mm', k ? '#93c5fd' : '#1e40af', 'Cantidad', '8px']]
     .map(([k, c, t, hh]) => `<span class="lg${estado.ocultas.has(k) ? ' off' : ''}" data-s="${k}" role="button" tabindex="0"><i style="background:${c};height:${hh}"></i>${t}</span>`).join('') +
     '<span class="lg" style="cursor:default"><i style="background:#f59e0b"></i>Ahora</span>';
 }
@@ -1836,8 +1888,28 @@ function sugerirInstalar() {
 }
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
 
+// ---------- tema claro / oscuro ----------
+// Modos: 'auto' (sigue al teléfono o computadora), 'claro', 'oscuro'. El botón los recorre en ese orden.
+const ICO_TEMA = {auto: '◐', claro: '☀️', oscuro: '🌙'}, TXT_TEMA = {auto: 'Tema automático', claro: 'Tema claro', oscuro: 'Tema oscuro'};
+const prefClaro = matchMedia('(prefers-color-scheme: light)');
+function modoTema() { const t = leer('cc_tema'); return t === 'claro' || t === 'oscuro' ? t : 'auto'; }
+function aplicarTema(redibujar) {
+  const m = modoTema(), t = m === 'auto' ? (prefClaro.matches ? 'claro' : 'oscuro') : m, antes = document.documentElement.dataset.tema;
+  document.documentElement.dataset.tema = t;
+  const mt = document.querySelector('meta[name=theme-color]'); if (mt) mt.content = t === 'claro' ? '#f4f6fa' : '#0b0f17';
+  const b = $('#temabtn'); if (b) { b.textContent = ICO_TEMA[m]; b.title = TXT_TEMA[m] + ' (toca para cambiar)'; b.setAttribute('aria-label', b.title); }
+  if (redibujar && antes !== t && ctx) { const y = scrollY; mapa = null; render(); scrollTo(0, y); }
+}
+function cambiarTema() {
+  const sig = {auto: 'claro', claro: 'oscuro', oscuro: 'auto'}[modoTema()];
+  if (sig === 'auto') { try { localStorage.removeItem('cc_tema'); } catch (e) {} } else guardar('cc_tema', sig);
+  tocar(); aplicarTema(true); toast(TXT_TEMA[sig] + (sig === 'auto' ? ': sigue la configuración de tu dispositivo.' : '.'));
+}
+(prefClaro.addEventListener ? prefClaro.addEventListener('change', () => aplicarTema(true)) : prefClaro.addListener(() => aplicarTema(true)));
+
 // ---------- inicio: primero la ubicación de la persona ----------
 async function inicio() {
+  aplicarTema(false); $('#temabtn').onclick = cambiarTema;
   pie();
   $('#lugarbtn').onclick = () => { tocar(); abrirSelector(); };
   $('#sheetbg').onclick = () => cerrarSelector();
