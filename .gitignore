@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
+*.tmp
+*.bak
 dashboard.html
 sitio/
-*.tmp
+feedback/node_modules/
+feedback/.wrangler/

@@ -4,7 +4,7 @@ name: Actualizar pronóstico
 on:
   schedule:
     - cron: "7 * * * *"          # minuto 7 de cada hora (UTC); GitHub puede retrasarlo unos minutos
-  workflow_dispatch:              # botón "Run workflow" para ejecutarlo a mano
+  workflow_dispatch:
     inputs:
       verificar:
         description: "Forzar verificación y aprendizaje ahora"
@@ -12,24 +12,25 @@ on:
         default: false
 
 permissions:
-  contents: write                 # guardar los datos aprendidos
-  pages: write                    # publicar la página
+  contents: write
+  pages: write
   id-token: write
 
-concurrency:                      # nunca dos ejecuciones al mismo tiempo
+concurrency:
   group: clima-consenso
   cancel-in-progress: false
 
 jobs:
   actualizar:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     env:
       CC_DATOS: datos
       CC_HTML: sitio/index.html
+      CC_FEEDBACK_URL: ${{ vars.FEEDBACK_URL }}
     steps:
       - uses: actions/checkout@v4
 
