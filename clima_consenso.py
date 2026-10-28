@@ -806,38 +806,62 @@ def svg_grafica(filas, ancho=900, alto=200):
     return "".join(out)
 
 
+CORTOS = {"Parcialmente nublado": "Algo nublado", "Lluvia probable": "Lluvia", "Posible lluvia": "Lluvia"}
+
+
 def html_linea_tiempo(prox24):
+    """Barra de 24 h. Las horas con lluvia se agrupan en un solo tramo y los textos
+       se acortan o se ocultan según el espacio, para que nunca queden cortados."""
+    n = len(prox24)
     segs, etqs = [], []
     for i, r in enumerate(prox24):
         _, txt, col = condicion(r)
-        segs.append(f'<div class="seg" style="background:{col}" title="{r["hora"][11:16]} · {txt} · lluvia {r["prob"]}%"></div>')
+        segs.append(f'<div class="seg" style="background:{col}" '
+                    f'title="{r["hora"][11:16]} · {txt} · lluvia {r["prob"]}%"></div>')
         if i % 2 == 0:
             etq = "Ahora" if i == 0 else r["hora"][11:13] + "h"
-            etqs.append(f'<div class="tk" style="left:{i/len(prox24)*100:.2f}%"><b>{etq}</b>'
+            etqs.append(f'<div class="tk" style="left:{i/n*100:.2f}%"><b>{etq}</b>'
                         f'<span>{round(r["temp"]) if r["temp"] is not None else "-"}°</span></div>')
-    # textos de bloque: se unen tramos cortos sin lluvia para no repetir etiquetas
-    n = len(prox24)
-    runs = []
+
+    familia = lambda r: "lluvia" if r["prob"] >= 20 else condicion(r)[1]
+    runs = []                                   # [familia, inicio, fin, prob_max]
     for i, r in enumerate(prox24):
-        txt = condicion(r)[1]
-        if runs and runs[-1][0] == txt:
+        f = familia(r)
+        if runs and runs[-1][0] == f:
             runs[-1][2] = i + 1
+            runs[-1][3] = max(runs[-1][3], r["prob"])
         else:
-            runs.append([txt, i, i + 1])
-    lluviosos = ("Lluvia probable", "Posible lluvia", "Llovizna")
-    unidos = []
+            runs.append([f, i, i + 1, r["prob"]])
+    unidos = []                                 # tramos cortos sin lluvia se unen al anterior
     for run in runs:
-        corto = run[2] - run[1] < 3 and run[0] not in lluviosos
-        if unidos and corto:
-            unidos[-1][2] = run[2]
-        elif unidos and unidos[-1][0] == run[0]:
+        if unidos and run[0] != "lluvia" and (run[2] - run[1] < 3 or unidos[-1][0] == run[0]) \
+                and unidos[-1][0] != "lluvia":
             unidos[-1][2] = run[2]
         else:
             unidos.append(run)
-    bloques = [f'<div class="blq" style="left:{i0/n*100:.2f}%;width:{(i1-i0)/n*100:.2f}%">{txt}</div>'
-               for txt, i0, i1 in unidos]
+
+    bloques = []
+    for f, i0, i1, pmax in unidos:
+        largo = i1 - i0
+        texto = ("Lluvia probable" if pmax >= 40 else "Posible lluvia") if f == "lluvia" else f
+        if largo >= 4:
+            pass
+        elif largo >= 2:
+            texto = CORTOS.get(texto, texto if len(texto) <= 8 else "")
+        else:
+            texto = ""
+        if texto:
+            bloques.append(f'<div class="blq" style="left:{i0/n*100:.2f}%;width:{largo/n*100:.2f}%">{texto}</div>')
+
+    ley = ('<div class="ley" style="margin-top:2px">'
+           '<span><i style="background:#cbd5e1;height:8px"></i>Despejado</span>'
+           '<span><i style="background:#94a3b8;height:8px"></i>Algo nublado</span>'
+           '<span><i style="background:#64748b;height:8px"></i>Nublado</span>'
+           '<span><i style="background:#60a5fa;height:8px"></i>Llovizna</span>'
+           '<span><i style="background:#3b82f6;height:8px"></i>Posible lluvia</span>'
+           '<span><i style="background:#1d4ed8;height:8px"></i>Lluvia probable</span></div>')
     return (f'<div class="tl"><div class="blqs">{"".join(bloques)}</div>'
-            f'<div class="bar">{"".join(segs)}</div><div class="tks">{"".join(etqs)}</div></div>')
+            f'<div class="bar">{"".join(segs)}</div><div class="tks">{"".join(etqs)}</div>{ley}</div>')
 
 
 def html_dias(filas):
@@ -1068,8 +1092,9 @@ def html(resultados, p):
         tit, sub = titular(prox[:24])
         hoy = [r for r in filas if r["hora"][:10] == date.today().isoformat() and r["temp"] is not None]
         nivel = nivel_fiabilidad(cfg.get("consenso", {}).get("hss")) if cfg.get("verificado") else "En evaluación"
-        chips = (f'<span class="chip">Ahora: <b>{cond_txt}</b></span>'
-                 f'<span class="chip">Lluvia en la próxima hora: <b>{actual["prob"]}%</b></span>'
+        txt_prox = (f'{cond_txt.lower()} ({actual["prob"]}%)' if actual['prob'] >= 20
+                    else f'{cond_txt}, sin lluvia')
+        chips = (f'<span class="chip">Próxima hora: <b>{txt_prox}</b></span>'
                  + (f'<span class="chip">Hoy: <b>{round(max(r["temp"] for r in hoy))}°</b> / {round(min(r["temp"] for r in hoy))}°</span>' if hoy else "")
                  + f'<span class="chip">Fiabilidad del pronóstico: <b>{nivel}</b></span>')
         secciones.append(f"""
