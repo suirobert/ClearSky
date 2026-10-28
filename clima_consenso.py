@@ -100,7 +100,7 @@ def log_error(msg):
 
 def http_get(url, params):
     full = url + "?" + urllib.parse.urlencode(params, doseq=True)
-    req = urllib.request.Request(full, headers={"User-Agent": "ClimaConsenso/4.0"})
+    req = urllib.request.Request(full, headers={"User-Agent": "ClearSky/1.0"})
     with urllib.request.urlopen(req, timeout=120) as r:
         return r.read().decode("utf-8", errors="replace")
 
@@ -1078,8 +1078,8 @@ def html(resultados, p):
     doc = f"""<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="1800">
-<title>Clima Consenso</title><style>{CSS}</style></head><body><div class="wrap">
-<div class="top"><div class="brand">CLIMA CONSENSO</div><div class="tabs">{tabs}</div></div>
+<title>ClearSky</title><style>{CSS}</style></head><body><div class="wrap">
+<div class="top"><div class="brand">ClearSky</div><div class="tabs">{tabs}</div></div>
 {''.join(secciones)}
 <div class="pie">Actualizado: {ahora_txt}<br>
 ¿Cómo funciona? Combinamos {len(MODELOS)} modelos meteorológicos internacionales y damos más peso a los que mejor han
