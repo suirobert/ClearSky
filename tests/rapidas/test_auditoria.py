@@ -180,3 +180,140 @@ def test_el_script_sin_carpeta_de_datos_da_un_mensaje_claro(aud, tmp_path):
     with pytest.raises(SystemExit) as e:
         aud.main(["--datos", str(tmp_path / "no_existe")])
     assert "carpeta de datos" in str(e.value)
+
+
+# ================================================================= lo que mostró la ejecución real: pocos datos y ceros sin explicación
+def _escribir_historial(carpeta, ciudad, inicio_ejec, horas_validas, prob=30.0):
+    (carpeta / "historial").mkdir(parents=True, exist_ok=True)
+    with open(carpeta / "historial" / "2026-10-28.csv", "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if f.tell() == 0:
+            w.writerow(["ejecucion", "ciudad", "hora_valida", "modelo", "lluvia_mm", "prob_lluvia", "prob_bruta"])
+        for hv in horas_validas:
+            w.writerow([inicio_ejec.strftime("%Y-%m-%d %H:%M"), ciudad, hv.strftime("%Y-%m-%dT%H:00"), "CONSENSO", 0, prob, prob + 5])
+
+
+def _escribir_obs(carpeta, ciudad, horas, lluvia=()):
+    (carpeta / "observaciones").mkdir(parents=True, exist_ok=True)
+    ruta = carpeta / "observaciones" / "2026-10.json"
+    actual = json.loads(ruta.read_text(encoding="utf-8")) if ruta.exists() else {}
+    actual.setdefault(ciudad, {}).update({h.strftime("%Y-%m-%dT%H:00"): [1 if h in lluvia else 0, 0, 0] for h in horas})
+    ruta.write_text(json.dumps(actual), encoding="utf-8")
+
+
+def _escenario_real(tmp_path):
+    """Lo que había el 29 de oct: historial desde el 28 a las 20:00; Guayaquil con 23 h en común y 1 hora de lluvia; Ambato sin observaciones;
+       Coca con observaciones de otro día (no coinciden)."""
+    ej = datetime(2026, 10, 28, 20, 0)
+    horas = [datetime(2026, 10, 28, 21) + timedelta(hours=i) for i in range(23)]
+    _escribir_historial(tmp_path, "Guayaquil", ej, horas); _escribir_obs(tmp_path, "Guayaquil", horas, lluvia={horas[10]})
+    _escribir_historial(tmp_path, "Guayaquil", datetime(2026, 10, 29, 2, 0), horas[10:])            # otra ejecución, más tarde: «primera» y «última» difieren
+    _escribir_historial(tmp_path, "Ambato", ej, horas)                                                  # pronósticos, pero ningún aeropuerto
+    _escribir_historial(tmp_path, "Coca", ej, horas); _escribir_obs(tmp_path, "Coca", [datetime(2026, 9, 1) + timedelta(hours=i) for i in range(48)])
+    return tmp_path
+
+
+def test_la_salida_resume_en_una_tabla_y_no_repite_tres_bloques_por_ciudad(aud, tmp_path, capsys):
+    carpeta = _escenario_real(tmp_path)
+    aud.main(["--datos", str(carpeta), "--sin-historial", "--remuestras", "100"])
+    salida = capsys.readouterr().out
+    assert "Horas comparables por ciudad (hacen falta 72)" in salida and "≥24 h" in salida
+    assert salida.count("Todavía no hay datos suficientes") == 0, "ya no se repite una frase por ciudad y antelación"
+    fila = [l for l in salida.splitlines() if l.strip().startswith("Guayaquil")][0].split()
+    assert fila[1] == "23" and fila[-2:] == ["23", "23"], fila               # 23 h comparables con ≥1 h; 23 publicadas y 23 observadas
+    assert fila[3] == "0", f"con ≥24 h de antelación no hay nada comparable: {fila}"
+    assert "Todavía ninguna ciudad llega a 72 horas" in salida, "y dice claramente que no hay veredicto todavía"
+
+
+def test_explica_por_que_cada_ciudad_no_tiene_datos(aud, tmp_path, capsys):
+    carpeta = _escenario_real(tmp_path)
+    aud.main(["--datos", str(carpeta), "--sin-historial", "--remuestras", "100", "--ciudad", "Ambato", "--ciudad", "Coca"])
+    salida = capsys.readouterr().out
+    assert "Todavía sin datos suficientes en" in salida
+    assert "Ambato" in salida and "no hay observaciones de aeropuerto" in salida
+    assert "Coca" in salida and "ninguna hora coincide" in salida, "hay pronósticos y observaciones, pero de fechas distintas"
+    assert aud.motivo_sin_datos({"pub": 0, "obs": 5, "comunes": 0}) == "no hay pronósticos publicados de esta ciudad en datos/historial"
+    assert aud.motivo_sin_datos({"pub": 9, "obs": 9, "comunes": 20}) == "solo 20 horas en común"
+
+
+def test_explica_por_que_no_hay_pronosticos_con_24_h_de_antelacion(aud, tmp_path, capsys):
+    carpeta = _escenario_real(tmp_path)
+    aud.main(["--datos", str(carpeta), "--sin-historial", "--remuestras", "100", "--ciudad", "Guayaquil"])
+    salida = capsys.readouterr().out
+    assert "El historial de pronósticos publicados empieza el 2026-10-28 20:00" in salida
+    assert "(guarda 0.2 días de historia)" in salida, "la duración va de la primera a la última ejecución (6 h = 0,25 días)"
+    assert "solo se puede comparar con horas posteriores al 2026-10-29 20:00" in salida
+    pri = aud.primer_pronostico(str(carpeta)); assert pri[0] == datetime(2026, 10, 28, 20, 0)
+    assert aud.primer_pronostico(str(carpeta / "no_hay")) is None
+
+
+def test_con_pocas_horas_con_lluvia_no_concluye_aunque_haya_muchas_horas_y_dias(aud, tmp_path):
+    """El caso peligroso: 30 días de datos pero casi sin lluvia. Un pronóstico con probabilidades razonables saldría «peor» que el promedio."""
+    carpeta = tmp_path
+    (carpeta / "historial").mkdir(); (carpeta / "observaciones").mkdir()
+    rng = random.Random(3); obs = {}
+    for d in range(30):
+        dia = date(2026, 9, 1) + timedelta(days=d); filas = []
+        for h in range(24):
+            hv = datetime.combine(dia, datetime.min.time()) + timedelta(hours=h)
+            llovio = int(d == 4 and h == 15)                                    # una sola hora de lluvia en un mes
+            obs[hv.strftime("%Y-%m-%dT%H:00")] = [llovio, 0, 0]
+            filas.append([(hv - timedelta(hours=6)).strftime("%Y-%m-%d %H:%M"), "Guayaquil", hv.strftime("%Y-%m-%dT%H:00"), "CONSENSO", 0, 25.0, 30.0])
+        with open(carpeta / "historial" / f"{dia:%Y-%m-%d}.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f); w.writerow(["ejecucion", "ciudad", "hora_valida", "modelo", "lluvia_mm", "prob_lluvia", "prob_bruta"]); w.writerows(filas)
+    (carpeta / "observaciones" / "2026-09.json").write_text(json.dumps({"Guayaquil": obs}), encoding="utf-8")
+    r = aud.evaluar(str(carpeta), "Guayaquil", 6, 200)
+    assert r["dias"] == 30 and r["total"]["llovio"] == 1
+    assert r["ver_clima"].startswith("pocas horas con lluvia (1 de 10"), r["ver_clima"]
+    assert not r["ver_clima"].startswith("PEOR") and not r["ver_clima"].startswith("MEJOR")
+
+
+def test_el_historial_marca_con_asterisco_los_porcentajes_con_pocos_datos(aud, capsys):
+    f = lambda fecha, real, horas, lluvia: {"actualizado": fecha + "T04:00:00", "fecha": fecha, "pesos": {"a": 1.0}, "umbral": 1.0, "modo": "reciente", "ex_clima": 29, "ex_crudo": 11,
+                                           "real_clima": real, "real_horas": horas, "real_lluvia": lluvia}
+    aud.imprimir_historial("Guayaquil", [f("2026-10-28", -51, 16, 1), f("2026-10-29", -147, 23, 1)])
+    salida = capsys.readouterr().out
+    assert "-147% (23 h · 1 con lluvia)*" in salida and "-51% (16 h · 1 con lluvia)*" in salida
+    assert "Muy pocos datos" in salida and "NO significa que el pronóstico sea malo ni bueno" in salida
+    aud.imprimir_historial("Quito", [f("2026-10-01", 20, 300, 50), f("2026-10-02", 22, 320, 55)])
+    limpio = capsys.readouterr().out
+    assert "*" not in limpio.replace("* ", "") and "Muy pocos datos" not in limpio, "con datos suficientes no hay advertencia"
+
+
+def test_un_pronostico_perfecto_con_pocas_horas_puede_salir_negativo_y_por_eso_se_exige_un_minimo(aud):
+    """La razón de ser del mínimo de horas con lluvia, comprobada: pronóstico PERFECTAMENTE calibrado, 23 horas, 1 hora de lluvia."""
+    rng = random.Random(11); malos = 0; n = 300
+    for _ in range(n):
+        horas = [rng.randrange(24) for _ in range(23)]
+        pv = [0.04 + 0.55 * max(0.0, math.sin((h - 9) / 24 * 2 * math.pi)) ** 2 for h in horas]
+        while True:
+            o = [int(rng.random() < q) for q in pv]
+            if sum(o) == 1: break
+        dias = aud.por_dia([(f"2026-09-01T{h:02d}:00", oo, q, None) for h, oo, q in zip(range(23), o, pv)])
+        s = aud.puntajes(dias, ["2026-09-01"])
+        malos += s["vs_clima"] < 0
+    assert malos / n > 0.8, "con 1 hora de lluvia, un pronóstico perfecto sale peor que el promedio casi siempre: la métrica no sirve ahí"
+
+
+def test_la_salida_agrupa_las_ciudades_con_el_mismo_problema_en_vez_de_repetir_parrafos(aud, tmp_path, capsys):
+    carpeta = _escenario_real(tmp_path)
+    ej = datetime(2026, 10, 28, 20, 0); horas = [datetime(2026, 10, 28, 21) + timedelta(hours=i) for i in range(20)]
+    _escribir_historial(carpeta, "Quito", ej, horas); _escribir_obs(carpeta, "Quito", horas)
+    aud.main(["--datos", str(carpeta), "--sin-historial", "--remuestras", "50", "--ciudad", "Guayaquil", "--ciudad", "Quito", "--ciudad", "Ambato"])
+    salida = capsys.readouterr().out
+    assert salida.count("tienen solo unas pocas horas en común") == 1 and "Guayaquil, Quito" in salida, "Guayaquil y Quito van en un solo párrafo"
+    assert salida.count("Todavía sin datos suficientes en") == 2, "uno para «pocas horas» y otro para Ambato"
+
+
+def test_en_el_historial_las_ciudades_sin_evolucion_van_en_una_sola_linea(aud, tmp_path, capsys):
+    _git(tmp_path, "init", "-q"); _git(tmp_path, "config", "user.email", "a@b.c"); _git(tmp_path, "config", "user.name", "t")
+    (tmp_path / "datos").mkdir()
+    carpeta = _escenario_real(tmp_path / "datos")
+    for act, real in (("2026-10-28T04:00:00", 5), ("2026-10-29T04:00:00", 7)):
+        (tmp_path / "datos" / "pesos.json").write_text(json.dumps(_pesos(act, {"a": 1.0}, 10, 8, real)), encoding="utf-8")
+        _git(tmp_path, "add", "-A"); _git(tmp_path, "commit", "-q", "-m", act)
+    aud.main(["--datos", str(tmp_path / "datos"), "--remuestras", "50", "--ciudad", "Guayaquil", "--ciudad", "Ambato", "--ciudad", "Coca"])
+    salida = capsys.readouterr().out
+    assert "Guayaquil · lo aprendido día a día" in salida, "la que sí tiene 2 verificaciones se muestra"
+    assert "Sin evolución que mostrar todavía" in salida and "Ambato, Coca" in salida
+    assert salida.count("menos de 2 verificaciones") == 1, "una sola línea para todas las demás"

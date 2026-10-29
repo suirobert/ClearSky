@@ -25,11 +25,12 @@ Uso (desde la carpeta del proyecto, con el repositorio actualizado: git pull):
     python auditar_aprendizaje.py --sin-historial       # omite la parte B (no usa git)
 """
 import argparse, csv, glob, json, os, random, subprocess, sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 ANTICIPACIONES = (1, 6, 24)       # horas de antelación con que se hizo el pronóstico que se evalúa
 MIN_DIAS_VEREDICTO = 14           # menos días que esto: no se concluye nada
 MIN_HORAS = 72                    # menos horas comparables que esto: no se calcula
+MIN_HORAS_LLUVIA = 10             # menos horas CON LLUVIA que esto: la comparación depende de 1 o 2 horas y no significa nada
 NIVEL = 0.90                      # nivel del intervalo de confianza
 SEMILLA = 20261029                # el remuestreo es determinista: el mismo dato da siempre el mismo intervalo
 
@@ -132,9 +133,11 @@ def intervalos(dias, remuestras, nivel=NIVEL):
     return ic(a), ic(b)
 
 
-def veredicto(ic, n_dias):
+def veredicto(ic, n_dias, llovio=None):
     if n_dias < MIN_DIAS_VEREDICTO:
         return f"pocos días ({n_dias} de {MIN_DIAS_VEREDICTO}): todavía no se puede concluir"
+    if llovio is not None and llovio < MIN_HORAS_LLUVIA:
+        return f"pocas horas con lluvia ({llovio} de {MIN_HORAS_LLUVIA} mínimas): todavía no se puede concluir"
     if ic is None:
         return "sin datos suficientes"
     if ic[0] > 0:
@@ -160,6 +163,42 @@ def anuncios(pares, umbral=0.40):
     return len(sel), sum(sel)
 
 
+def primer_pronostico(datos):
+    """(primera, última) ejecución guardada en datos/historial, o None. Sirve para explicar cuánta historia hay."""
+    primera = ultima = None
+    for ruta in sorted(glob.glob(os.path.join(datos, "historial", "*.csv"))):
+        with open(ruta, encoding="utf-8") as f:
+            for fila in csv.DictReader(f):
+                try:
+                    ej = datetime.strptime(fila["ejecucion"], "%Y-%m-%d %H:%M")
+                except (KeyError, ValueError):
+                    continue
+                primera = ej if primera is None or ej < primera else primera
+                ultima = ej if ultima is None or ej > ultima else ultima
+    return (primera, ultima) if primera else None
+
+
+def cobertura(datos, ciudad):
+    """Cuántas horas hay publicadas, observadas y en común para una ciudad, y de qué fechas."""
+    pub, obs = leer_publicados(datos, ciudad, 0), leer_observaciones(datos, ciudad)
+    comunes = [k for k in pub if k in obs]
+    return {"pub": len(pub), "obs": len(obs), "comunes": len(comunes),
+            "pub_desde": min(pub) if pub else None, "pub_hasta": max(pub) if pub else None,
+            "obs_desde": min(obs) if obs else None, "obs_hasta": max(obs) if obs else None}
+
+
+def motivo_sin_datos(c):
+    """Una frase que dice POR QUÉ no hay horas comparables (en vez de un «0» sin explicación)."""
+    if c["obs"] == 0:
+        return "no hay observaciones de aeropuerto en datos/observaciones (su aeropuerto no publica o todavía no se descargó)"
+    if c["pub"] == 0:
+        return "no hay pronósticos publicados de esta ciudad en datos/historial"
+    if c["comunes"] == 0:
+        return (f"hay {c['pub']} h publicadas ({c['pub_desde'][:13]} a {c['pub_hasta'][:13]}) y {c['obs']} h observadas "
+                f"({c['obs_desde'][:13]} a {c['obs_hasta'][:13]}), pero ninguna hora coincide")
+    return f"solo {c['comunes']} horas en común"
+
+
 def evaluar(datos, ciudad, anticipacion, remuestras):
     pub, obs = leer_publicados(datos, ciudad, anticipacion), leer_observaciones(datos, ciudad)
     pares = emparejar(pub, obs)
@@ -172,7 +211,7 @@ def evaluar(datos, ciudad, anticipacion, remuestras):
     total = puntajes(dias, sorted(dias))
     ic_cli, ic_bru = intervalos(dias, remuestras)
     return {"ciudad": ciudad, "anticipacion": anticipacion, "horas": len(pares), "dias": len(dias), "total": total, "ic_clima": ic_cli, "ic_bruta": ic_bru,
-            "ver_clima": veredicto(ic_cli, len(dias)), "ver_bruta": veredicto(ic_bru, len(dias)) if total["b_bru"] is not None else None,
+            "ver_clima": veredicto(ic_cli, len(dias), total["llovio"]), "ver_bruta": veredicto(ic_bru, len(dias), total["llovio"]) if total["b_bru"] is not None else None,
             "tendencia": tendencia(dias), "anuncios": anuncios(pares)}
 
 
@@ -235,7 +274,7 @@ def historial_ciudad(versiones, ciudad):
         ex, real = c.get("examen") or {}, c.get("real") or {}
         fila = {"actualizado": act, "fecha": act[:10], "pesos": c.get("pesos") or {}, "umbral": c.get("umbral"), "modo": c.get("modo_calibracion"),
                 "ex_clima": ex.get("mejora_vs_clima_pct"), "ex_crudo": ex.get("mejora_vs_crudo_pct"),
-                "real_clima": real.get("mejora_vs_clima_pct"), "real_horas": real.get("horas")}
+                "real_clima": real.get("mejora_vs_clima_pct"), "real_horas": real.get("horas"), "real_lluvia": real.get("horas_lluvia")}
         if fila["fecha"] not in por_fecha or act > por_fecha[fila["fecha"]]["actualizado"]:
             por_fecha[fila["fecha"]] = fila
     return [por_fecha[f] for f in sorted(por_fecha)]
@@ -251,14 +290,19 @@ def imprimir_historial(ciudad, filas):
     if len(filas) < 2:
         print("   Todavía hay menos de 2 verificaciones guardadas en git: no hay evolución que mostrar.")
         return
-    print("   fecha        examen vs promedio  examen vs sin aprender  real vs promedio   calibración   cambio de pesos")
-    previo = None
+    print("   fecha        examen vs promedio  examen vs sin aprender  real vs promedio (horas · con lluvia)   calibración   cambio de pesos")
+    previo, hay_pocos = None, False
     for f in filas[-14:]:
         cambio = "" if previo is None else f"{cambio_pesos(previo['pesos'], f['pesos']):.2f}"
-        real = "—" if f["real_clima"] is None else f"{f['real_clima']:+d}% ({f['real_horas']} h)"
+        pocos = f["real_horas"] is not None and (f["real_horas"] < MIN_HORAS or (f["real_lluvia"] is not None and f["real_lluvia"] < MIN_HORAS_LLUVIA))
+        llu = "" if f["real_lluvia"] is None else f" · {f['real_lluvia']} con lluvia"
+        real = "—" if f["real_clima"] is None else f"{f['real_clima']:+d}% ({f['real_horas']} h{llu})" + ("*" if pocos else "")
+        hay_pocos = hay_pocos or (pocos and f["real_clima"] is not None)
         fmt = lambda x: "—" if x is None else f"{x:+d}%"
-        print(f"   {f['fecha']}   {fmt(f['ex_clima']):>16}   {fmt(f['ex_crudo']):>20}   {real:>15}   {str(f['modo'] or '—'):<12}  {cambio:>8}")
+        print(f"   {f['fecha']}   {fmt(f['ex_clima']):>16}   {fmt(f['ex_crudo']):>20}   {real:>34}   {str(f['modo'] or '—'):<12}  {cambio:>8}")
         previo = f
+    if hay_pocos:
+        print(f"   * Muy pocos datos (menos de {MIN_HORAS} horas o de {MIN_HORAS_LLUVIA} horas con lluvia): ese porcentaje depende de 1 o 2 horas y NO significa que el pronóstico sea malo ni bueno.")
     cambios = sum(1 for a, b in zip(filas, filas[1:]) if cambio_pesos(a["pesos"], b["pesos"]) > 1e-9)
     print(f"   Los pesos cambiaron en {cambios} de {len(filas) - 1} verificaciones. (Que cambien NO prueba que mejoren: mira las columnas «real».)")
 
@@ -271,7 +315,9 @@ Cómo leer esto
   · Los pronósticos evaluados son los que de verdad se publicaron: ninguna de esas horas se usó para aprender. Ese es el dato limpio.
   · El «examen sin trampa» de pesos.json (columna «examen») es útil pero algo optimista: el sistema prueba varias combinaciones y presenta
     la que mejor le fue en esos mismos 10 días. Por eso la columna «real» manda cuando discrepan.
-  · «Decir siempre el promedio» usa la frecuencia de lluvia de la propia muestra, que le da una pequeña ventaja: es un listón exigente.
+  · «Decir siempre el promedio» usa la frecuencia de lluvia de la propia muestra (conoce la respuesta de antemano). Con cientos de horas la ventaja
+    es pequeña; con pocas horas, o pocas con lluvia, es enorme: un pronóstico PERFECTO puede salir en negativo si en la muestra llovió 1 o 2 horas.
+    Por eso se exige un mínimo de horas y de horas con lluvia, y los porcentajes con pocos datos van con asterisco.
   · Esto mide la lluvia en el aeropuerto de cada ciudad (un solo punto) y solo compara calibrado contra sin calibrar. Para medir el efecto de
     TODO lo aprendido (pesos incluidos) en datos reales habría que guardar también el pronóstico «sin aprender»; hoy eso solo está en el examen.
   · Poca lluvia = poca evidencia: en épocas secas es normal que el veredicto sea «no se distingue».
@@ -308,9 +354,32 @@ def main(argv=None):
         sys.exit("--anticipaciones debe ser una lista de números, por ejemplo 1,6,24")
     print("AUDITORÍA DEL APRENDIZAJE DE CLEARSKY\n" + "=" * 37)
     print("A) Lo que se publicó contra lo que pasó (datos que el sistema no usó para aprender)")
+    historia = primer_pronostico(a.datos)
+    if historia:
+        desde, hasta = historia
+        dias = (hasta - desde).total_seconds() / 86400
+        print(f"   El historial de pronósticos publicados empieza el {desde:%Y-%m-%d %H:%M} (guarda {dias:.1f} días de historia).")
+        if max(antic) >= 24:
+            print(f"   Un pronóstico con ≥24 h de antelación solo se puede comparar con horas posteriores al {desde + timedelta(hours=24):%Y-%m-%d %H:%M}.")
+    evals = {c: {n: evaluar(a.datos, c, n, a.remuestras) for n in antic} for c in ciudades}
+    cob = {c: cobertura(a.datos, c) for c in ciudades}
+    print(f"\n   Horas comparables por ciudad (hacen falta {MIN_HORAS}):")
+    print("   " + f"{'ciudad':<15}" + "".join(f"{'≥' + str(n) + ' h':>9}" for n in antic) + f"{'publicadas':>13}{'observadas':>12}")
     for c in ciudades:
-        for n in antic:
-            imprimir_evaluacion(evaluar(a.datos, c, n, a.remuestras))
+        print("   " + f"{c:<15}" + "".join(f"{evals[c][n]['horas']:>9}" for n in antic) + f"{cob[c]['pub']:>13}{cob[c]['obs']:>12}")
+    sin_datos = [c for c in ciudades if all(evals[c][n].get("insuficiente") for n in antic)]
+    por_motivo = {}
+    for c in sin_datos:
+        m = motivo_sin_datos(cob[c])
+        m = "tienen solo unas pocas horas en común todavía (mira la tabla de arriba)" if m.startswith("solo ") else m      # las cifras ya están en la tabla
+        por_motivo.setdefault(m, []).append(c)
+    for motivo, cs in por_motivo.items():
+        print(f"\n   Todavía sin datos suficientes en {', '.join(cs)}:\n      {motivo}.")
+    detalladas = [(c, n) for c in ciudades for n in antic if not evals[c][n].get("insuficiente")]
+    if not detalladas:
+        print(f"\n   Todavía ninguna ciudad llega a {MIN_HORAS} horas comparables con ninguna antelación: no hay veredicto que dar. Vuelve a ejecutarlo en unos días.")
+    for c, n in detalladas:
+        imprimir_evaluacion(evals[c][n])
     if not a.sin_historial:
         raiz = os.path.dirname(os.path.abspath(a.datos))
         versiones = versiones_pesos(raiz, 400)
@@ -318,8 +387,15 @@ def main(argv=None):
         if versiones is None:
             print("   No pude leer el historial de git (¿no es un repositorio o falta git?). Usa --sin-historial para omitir esta parte.")
         else:
+            sin_evolucion = []
             for c in ciudades:
-                imprimir_historial(c, historial_ciudad(versiones, c))
+                filas = historial_ciudad(versiones, c)
+                if len(filas) >= 2:
+                    imprimir_historial(c, filas)
+                else:
+                    sin_evolucion.append(c)
+            if sin_evolucion:
+                print(f"\nSin evolución que mostrar todavía (menos de 2 verificaciones guardadas en git): {', '.join(sin_evolucion)}.")
     print(NOTAS)
 
 
