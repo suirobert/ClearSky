@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ClearSky · capa AHORA y OFICIAL (v16)
+ClearSky · capa AHORA y OFICIAL (v17)
 -------------------------------------
 Se ejecuta cada 10 minutos (workflow ahora.yml) y genera dos archivos:
 
@@ -285,19 +285,23 @@ def _parabola(a, b, c):
 
 def desplazamientos(A, B, paso, nty, ntx, tile_cells):
     """Para cada cuadro, cuánto se movió la lluvia entre B (antes) y A (ahora): (dy, dx) en celdas, positivo = al sur / al este.
-       Devuelve una lista de listas con dicts {dy, dx, mejora, celdas} o None si no hay lluvia suficiente o no hay mejora."""
+       Devuelve (res, info): res es una lista de listas con dicts {dy, dx, mejora, celdas} o None si no hay lluvia suficiente o
+       no hay mejora; info dice, para cada cuadro con lluvia, por qué se aceptó o se descartó (para el diagnóstico)."""
     import numpy as np
     g = lambda F: np.log1p(np.clip(F, 0, 30))
     GA, GB = g(A), g(B)
     ny, nx = A.shape
     desp = np.arange(-MOV_MAX_DESP, MOV_MAX_DESP + 1)
     res = [[None] * ntx for _ in range(nty)]
+    info = {}
     for ty in range(nty):
         for tx in range(ntx):
             y0, y1 = ty * tile_cells, min((ty + 1) * tile_cells, ny)
             x0, x1 = tx * tile_cells, min((tx + 1) * tile_cells, nx)
             celdas = int((A[y0:y1, x0:x1] >= 1.0).sum())
             if celdas < MOV_MIN_CELDAS:
+                if celdas:
+                    info[(ty, tx)] = {"celdas": celdas, "motivo": "poca lluvia"}
                 continue
             wy0, wy1, wx0, wx1 = max(y0 - MOV_MARGEN, 0), min(y1 + MOV_MARGEN, ny), max(x0 - MOV_MARGEN, 0), min(x1 + MOV_MARGEN, nx)
             ventana = GA[wy0:wy1, wx0:wx1]
@@ -308,17 +312,21 @@ def desplazamientos(A, B, paso, nty, ntx, tile_cells):
             i0, j0 = MOV_MAX_DESP, MOV_MAX_DESP
             base = mse[i0, j0]
             if base <= 1e-9:
+                info[(ty, tx)] = {"celdas": celdas, "motivo": "sin cambio"}
                 continue
             i, j = np.unravel_index(int(np.argmin(mse)), mse.shape)
+            mejora = float(1 - mse[i, j] / base)
             if i in (0, len(desp) - 1) or j in (0, len(desp) - 1):
+                info[(ty, tx)] = {"celdas": celdas, "mejora": round(mejora, 2), "motivo": "en el borde de la búsqueda"}
                 continue                                                 # en el borde de la búsqueda: no es confiable
-            mejora = 1 - mse[i, j] / base
             if mejora < MOV_MIN_MEJORA:
+                info[(ty, tx)] = {"celdas": celdas, "mejora": round(mejora, 2), "motivo": "casi igual a no moverse"}
                 continue
             dy = float(desp[i]) + _parabola(mse[i - 1, j], mse[i, j], mse[i + 1, j])
             dx = float(desp[j]) + _parabola(mse[i, j - 1], mse[i, j], mse[i, j + 1])
-            res[ty][tx] = {"dy": dy, "dx": dx, "mejora": float(mejora), "celdas": celdas}
-    return res
+            res[ty][tx] = {"dy": dy, "dx": dx, "mejora": mejora, "celdas": celdas}
+            info[(ty, tx)] = {"celdas": celdas, "mejora": round(mejora, 2), "motivo": "ok"}
+    return res, info
 
 
 def _csi(np, pred, real, umbral=1.0):
@@ -330,44 +338,80 @@ def _csi(np, pred, real, umbral=1.0):
 def movimiento_lluvia(A, B, C, paso=PASO_FINO, dt=MOV_DT_MIN):
     """Movimiento de la lluvia por cuadros de 2° (km/h hacia el este y hacia el norte) a partir de tres imágenes:
        A (ahora), B (hace 30 min), C (hace 60 min). Un cuadro solo se publica si, con el movimiento medido entre C y B,
-       se predijo A mejor que suponiendo que la lluvia no se mueve (validación con datos reales de los últimos 30 min)."""
+       se predijo A mejor que suponiendo que la lluvia no se mueve (validación con datos reales de los últimos 30 min).
+       Devuelve (movimiento o None, diagnóstico): el diagnóstico cuenta cuántos cuadros pasaron cada etapa y por qué se descartaron."""
     import numpy as np
     s0, n0, w0, e0 = AHORA_CAJA
     tile_cells = int(round(MOV_TILE_DEG / paso))
     ny, nx = A.shape
     nty, ntx = -(-ny // tile_cells), -(-nx // tile_cells)
-    ahora = desplazamientos(A, B, paso, nty, ntx, tile_cells)          # movimiento B -> A (para predecir)
-    previo = desplazamientos(B, C, paso, nty, ntx, tile_cells)         # movimiento C -> B (para validar)
+    ahora, inf1 = desplazamientos(A, B, paso, nty, ntx, tile_cells)          # movimiento B -> A (para predecir)
+    previo, inf0 = desplazamientos(B, C, paso, nty, ntx, tile_cells)         # movimiento C -> B (para validar)
     u = [[None] * ntx for _ in range(nty)]
     v = [[None] * ntx for _ in range(nty)]
     q = [[None] * ntx for _ in range(nty)]
-    validos = 0
+    validos = ambos = rech_csi = rech_vel = 0
+    csi_filas = {}
     for ty in range(nty):
         for tx in range(ntx):
             m1, m0 = ahora[ty][tx], previo[ty][tx]
             if not m1 or not m0:
                 continue
+            ambos += 1
             y0, y1 = ty * tile_cells, min((ty + 1) * tile_cells, ny)
             x0, x1 = tx * tile_cells, min((tx + 1) * tile_cells, nx)
             # validación: con el movimiento de hace 30 min, ¿se adivina la imagen de ahora mejor que sin movimiento?
             pred = _fuente(np, B, y0, y1, x0, x1, int(round(m0["dy"])), int(round(m0["dx"])))
             real = A[y0:y1, x0:x1]
             csi_adv, csi_per = _csi(np, pred, real), _csi(np, B[y0:y1, x0:x1], real)
+            csi_filas[(ty, tx)] = (csi_adv, csi_per)
             if csi_adv is None or csi_per is None or csi_adv < csi_per + MOV_MIN_CSI_GANANCIA:
+                rech_csi += 1
                 continue
             latc = n0 - (y0 + y1) / 2 * paso
             km_x = m1["dx"] * paso * 111.32 * math.cos(math.radians(latc))
             km_y = -m1["dy"] * paso * 111.32
             ve, vn = km_x * 60 / dt, km_y * 60 / dt
             if math.hypot(ve, vn) > 90:
+                rech_vel += 1
                 continue
             u[ty][tx], v[ty][tx] = round(ve, 1), round(vn, 1)
             q[ty][tx] = round(csi_adv - csi_per, 2)
             validos += 1
+    cuenta = lambda inf, m: sum(1 for d in inf.values() if d["motivo"] in (m, "sin cambio") and d["celdas"] >= MOV_MIN_CELDAS) if m == "casi igual a no moverse" \
+        else sum(1 for d in inf.values() if d["motivo"] == m)
+    # los 6 cuadros con más lluvia, con el motivo exacto por el que se aceptaron o se descartaron
+    top = []
+    for k, d in sorted(inf1.items(), key=lambda kv: -kv[1]["celdas"])[:6]:
+        ty, tx = k
+        fila = {"lat": round(n0 - (ty + 0.5) * MOV_TILE_DEG, 1), "lon": round(w0 + (tx + 0.5) * MOV_TILE_DEG, 1), "celdas": d["celdas"],
+                "ahora": d["motivo"] + (f" ({d['mejora']})" if d.get("mejora") is not None else "")}
+        d0 = inf0.get(k)
+        fila["antes"] = (d0["motivo"] + (f" ({d0['mejora']})" if d0.get("mejora") is not None else "")) if d0 else "sin lluvia"
+        if k in csi_filas:
+            a, b = csi_filas[k]
+            fila["csi"] = [None if a is None else round(a, 2), None if b is None else round(b, 2)]
+        top.append(fila)
+    diag = {"cuadros": nty * ntx, "celdas_1mm": int((A >= 1.0).sum()), "con_lluvia": sum(1 for d in inf1.values() if d["celdas"] >= MOV_MIN_CELDAS),
+            "ahora_ok": cuenta(inf1, "ok"), "ahora_igual": cuenta(inf1, "casi igual a no moverse"), "ahora_borde": cuenta(inf1, "en el borde de la búsqueda"),
+            "antes_ok": cuenta(inf0, "ok"), "antes_igual": cuenta(inf0, "casi igual a no moverse"), "antes_borde": cuenta(inf0, "en el borde de la búsqueda"),
+            "ambos": ambos, "rechazo_validacion": rech_csi, "rechazo_velocidad": rech_vel, "validos": validos, "top": top}
     if not validos:
-        return None
+        return None, diag
     return {"tile": MOV_TILE_DEG, "lat0": n0, "lon0": w0, "ny": nty, "nx": ntx, "dt_min": dt,
-            "u": u, "v": v, "skill": q, "validos": validos}
+            "u": u, "v": v, "skill": q, "validos": validos}, diag
+
+
+def motivo_movimiento(d):
+    """Explica en una frase por qué no hay movimiento (a partir del diagnóstico)."""
+    if not d.get("celdas_1mm"):
+        return "no hay lluvia de 1 mm/h o más en la imagen actual"
+    if not d.get("con_lluvia"):
+        return f"hay lluvia ({d['celdas_1mm']} celdas) pero repartida: ningún cuadro de 2° llega a {MOV_MIN_CELDAS} celdas"
+    if not d.get("ambos"):
+        return (f"{d['con_lluvia']} cuadros con lluvia suficiente. Movimiento medible: {d['ahora_ok']} (ahora) y {d['antes_ok']} (hace 30 min); "
+                f"casi igual a no moverse: {d['ahora_igual']} y {d['antes_igual']}; fuera del rango de búsqueda: {d['ahora_borde']} y {d['antes_borde']}")
+    return f"movimiento medido en {d['ambos']} cuadros, pero ninguno superó la validación con la imagen real ({d['rechazo_validacion']} descartados)"
 
 
 def lluvia_y_movimiento():
@@ -418,17 +462,22 @@ def lluvia_y_movimiento():
         except Exception as e:
             raise RuntimeError(f"{e} (archivo {lista[0]['key']})")
         mov, motivo = None, None
+        tf = lambda a: iso_local(_inicio_err(a["key"])) if a and _inicio_err(a["key"]) else None
+        diag = {"imagenes": {"ahora": iso_local(utc), "hace30": tf(previos["B"]), "hace60": tf(previos["C"])}}
         if r_b and r_c:
             try:
                 (B,), _ = leer_lluvia_nc(r_b, (PASO_FINO,))
                 (C,), _ = leer_lluvia_nc(r_c, (PASO_FINO,))
-                mov = movimiento_lluvia(g05, B, C)
+                mov, d = movimiento_lluvia(g05, B, C)
+                diag.update(d)
                 if mov is None:
-                    motivo = "sin lluvia suficiente o sin mejora frente a 'no se mueve'"
+                    motivo = motivo_movimiento(d)
             except Exception as e:
                 motivo = f"no se pudo medir: {e}"
         else:
-            motivo = "faltan las imágenes de hace 30 y 60 min"
+            motivo = ("faltan las imágenes de hace 30 y 60 min: " +
+                      ", ".join(n for n, r in (("hace 30 min", r_b), ("hace 60 min", r_c)) if not r) +
+                      f" (hay {len(lista)} archivos recientes de NOAA)")
     finally:
         for r in rutas:
             try:
@@ -444,7 +493,7 @@ def lluvia_y_movimiento():
         iy, ix = int((n0 - la) / PASO_FINO), int((lo - w0) / PASO_FINO)
         sub = g05[max(iy - 1, 0):iy + 2, max(ix - 1, 0):ix + 2]
         ciudades[c] = round(float(sub.max()), 1) if sub.size else None
-    return lluvia, mov, motivo, ciudades, utc
+    return lluvia, mov, motivo, ciudades, utc, diag
 
 
 # =====================================================================================================
@@ -738,11 +787,12 @@ def main():
     carpeta = destino if os.path.isdir(destino) else os.path.dirname(os.path.abspath(destino))
     ruta_ahora = os.path.join(destino, "ahora.json") if os.path.isdir(destino) else destino
     ruta_hist = os.path.join(carpeta, "hist.json")
-    salida = {"generado": iso_local(ahora_utc()), "lluvia": None, "movimiento": None, "rayos": None, "oficial": None, "errores": []}
+    salida = {"generado": iso_local(ahora_utc()), "lluvia": None, "movimiento": None, "mov_diag": None, "rayos": None, "oficial": None, "errores": []}
     utc_frame, lluvia_c, franjas = None, None, None
     t0 = time.time()
     try:
-        salida["lluvia"], salida["movimiento"], motivo, lluvia_c, utc_frame = lluvia_y_movimiento()
+        salida["lluvia"], salida["movimiento"], motivo, lluvia_c, utc_frame, diag = lluvia_y_movimiento()
+        salida["mov_diag"] = dict(diag or {}, motivo=motivo)        # se guarda en ahora.json: ya no hay que mirar el log
         print(f"  lluvia: OK ({time.time() - t0:.0f} s)")
         if salida["movimiento"]:
             print(f"  movimiento: {salida['movimiento']['validos']} cuadros validados")

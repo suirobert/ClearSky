@@ -21,7 +21,7 @@ Página (index.html, generada aquí y dibujada con JavaScript):
   - Temperatura y humedad verificadas cada hora contra el aeropuerto y corregidas (solo si mejora en el examen).
   - Tormentas verificadas con los rayos del satélite (GLM) y ciudades sin aeropuerto verificadas con la lluvia
     satelital, ambas solo cuando hay suficientes días acumulados y pasan el examen (datos/observado/).
-  - Tablero público de aciertos día por día y selector de rango 24 h / 3 días / 7 días.
+  - Tablero público de aciertos día por día (tarjeta "Cómo nos fue esta semana") y selector de rango 24 h / 3 días / 7 días.
   - Calor: sensación térmica (índice de calor NOAA), alerta desde 32° y onda de calor frente a lo normal
     de los últimos 30 días; humedad, viento y UV por hora. Botón para instalar como app.
   - Mapa de lluvia por horas, satélite GOES, íconos animados Meteocons, gráfica y barra que se
@@ -2476,6 +2476,36 @@ html[data-tema=claro] .acv.ok{background:#dcfce7;color:#166534}html[data-tema=cl
 .sw input:after{content:"";position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:#fff;transition:transform .2s}
 .sw input:checked{background:var(--acc2)}.sw input:checked:after{transform:translateX(18px)}
 html[data-tema=claro] .sw input{background:#cbd5e1}html[data-tema=claro] .sw input:checked{background:var(--acc2)}
+/* ---------- v17: izquierda = cabecera, botones, 24 h y 7 días; derecha = pestañas; aciertos como tarjeta ---------- */
+.cab:empty{display:none}
+.cab .aviso-top{margin-top:12px}
+.cab .aviso-top .btn{min-height:40px;padding:8px 16px;font-size:14px}
+.col1{display:flex;flex-direction:column}
+.col1>*{min-width:0}
+.col1>.cabA{order:1}.col1>.acciones{order:2}.col1>.fbmini{order:3}.col1>.card{order:4}
+.chips{width:auto;max-width:none}
+.sumac{display:flex;align-items:center;flex-wrap:wrap;gap:4px 0}
+.sumac:before{margin-right:6px}
+.sumac .sm-t{flex:1 1 auto}
+.sumac .sm-r{margin-left:12px}
+.sumac .sm-r{display:inline-flex;align-items:center;gap:10px;color:var(--tx2);font-size:13px}
+.sumac .sm-r b{color:var(--tx);font-weight:600}
+.pts{display:inline-flex;gap:5px}
+.pt{display:inline-block;width:11px;height:11px;border-radius:50%;background:#64748b}
+.pt.ok{background:#22c55e}.pt.mal{background:#ef4444}.pt.neu{background:#64748b}
+.acierdet .ac{padding-top:2px}
+@media(min-width:421px){.acf{grid-template-columns:66px 1fr 1fr 118px}}
+.acv{justify-self:end}
+@media(min-width:980px){
+  .cab{display:block;grid-area:cab}
+  .lay{grid-template-areas:"cab cab" "col1 col2"}
+  .chips,.cabA .chips{width:auto;max-width:100%;flex-wrap:wrap;overflow:visible;margin:10px 0 0;padding:0}
+  .col1>.acciones{order:9;display:grid;grid-template-columns:1fr 1fr;overflow:visible;margin-top:14px}
+  .acciones .acc{justify-content:center;text-align:center}
+  .col1>.fbmini{order:10}
+  .hero{margin-top:6px}
+  .col2 .card:first-child{margin-top:14px}
+}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 """
 
@@ -2888,7 +2918,7 @@ function grafica(cont, filas, ahora, hoy, vr) {
   if (vr === 'temp' && hi > UMBRAL_CALOR) banda(Math.max(UMBRAL_CALOR, lo), hi, C.calor, 'CALOR INTENSO');
   if (vr === 'viento' && hi > 40) banda(40, hi, C.calor, 'RÁFAGAS FUERTES');
   for (const v of ticks) s += `<line x1="${pl}" x2="${W - pr}" y1="${Y(v)}" y2="${Y(v)}" stroke="${C.grid}" stroke-width="1"${v === lo ? '' : ' stroke-dasharray="2 4"'}/><text x="${pl - 6}" y="${Y(v) + 4}" text-anchor="end" font-size="10.5" fill="${C.txt}">${fy(v)}</text>`;
-  if (vr === 'viento') s += `<text x="${pl}" y="${pt - 14}" font-size="10" fill="${C.txt}">km/h</text>`;
+  if (vr === 'viento') s += `<text x="${pl - 6}" y="${pt - 6}" text-anchor="end" font-size="10" fill="${C.txt}">km/h</text>`;
   const inicios = filas.map((r, i) => i === 0 || r.hora.slice(11, 13) === '00' ? i : -1).filter(i => i >= 0);
   inicios.forEach((i, q) => { const fin = q + 1 < inicios.length ? inicios[q + 1] : n, ancho = X(fin - 1) - X(i);
     if (i) s += `<line x1="${X(i)}" x2="${X(i)}" y1="${pt - 18}" y2="${pt + h}" stroke="${C.grid}" stroke-width="1"/>`;
@@ -3333,20 +3363,24 @@ async function normalUbic(lat, lon) {
     if (u && u.lat === lat && u.lon === lon) { u.normal_max = normalGuardada(lat, lon) - (u.tarde || 0); if (estado.vista === 'ubic' && ctx) render(); }
   } catch (e) {}
 }
+// fuera de Ecuador no hay nada aprendido: se usan los modelos tal cual, con pesos iguales y sin calibrar
+const sinCalibrar = c => Object.assign({}, c, {tabla_lluvia: [], tabla_llovizna: [], tabla_tormenta: [], franjas: null, plazos: {}, temp: null,
+  pesos: Object.fromEntries(KEYS.map(k => [k, 1]))});
 function construirUbic(c) {
   const {lat, lon, om, nombre} = c;
+  const dentro = enEcuador({lat, lon});
   const {ref, dist, aprox} = referencia(lat, lon, om.elevation ?? 0);
-  const nota = aprox
+  const nota = !dentro ? 'Estás fuera de Ecuador: usamos los modelos tal cual, sin ajustes ni verificación.' : aprox
     ? `Ajuste aproximado: todavía no tenemos una estación verificada cerca de ti. Usamos lo aprendido en ${ref.nombre} (${dist} km).`
     : `Pronóstico de tu ubicación exacta, ajustado con lo aprendido en ${ref.nombre} (${dist} km).`;
   const off = om.utc_offset_seconds ?? D.offset;
   // la corrección de temperatura del aeropuerto solo se usa si estás a menos de 60 km
-  const cfgU = dist <= 60 ? ref.cfg : Object.assign({}, ref.cfg, {temp: null});
+  const cfgU = !dentro ? sinCalibrar(ref.cfg) : dist <= 60 ? ref.cfg : Object.assign({}, ref.cfg, {temp: null});
   const tarde = cfgU.temp && cfgU.temp.activa ? (cfgU.temp.sesgo || {}).tarde || 0 : 0;
   const nm = normalGuardada(lat, lon);
-  return {nombre: nombre || 'Tu ubicación', ref: ref.nombre, lat, lon, filas: filasDesdeOM(om.hourly, cfgU, lat, lon, off), cfg: cfgU, offset: off,
+  return {nombre: nombre || 'Tu ubicación', ref: dentro ? ref.nombre : '', lat, lon, filas: filasDesdeOM(om.hourly, cfgU, lat, lon, off), cfg: cfgU, offset: off,
     normal_max: nm == null ? undefined : nm - tarde, tarde,
-    nivel: ref.nivel + (aprox ? ' (aprox.)' : ''), lugar: enEcuador({lat, lon}) ? nota : 'Tu navegador te ubica fuera de Ecuador (¿VPN activa?). ClearSky solo cubre Ecuador: elige una ciudad en el botón de arriba.', t: c.t, verif_html: `<p class="aviso">${esc(nota)}</p>` + ref.verif_html};
+    nivel: !dentro ? 'No verificado' : ref.nivel + (aprox ? ' (aprox.)' : ''), lugar: dentro ? nota : 'Tu navegador te ubica fuera de Ecuador (¿VPN activa?). ClearSky solo cubre Ecuador: elige una ciudad en el botón de arriba.', t: c.t, verif_html: `<p class="aviso">${esc(nota)}</p>` + (dentro ? ref.verif_html : '')};
 }
 async function cargarUbicacion(opc = {}) {
   if (estado.buscando) return; estado.buscando = true;
@@ -3488,7 +3522,7 @@ function pintarDias() {
       const s = document.querySelector('.drow.sel'); if (s) s.scrollIntoView({block: 'nearest', behavior: 'smooth'}); };
     d.onclick = f; d.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); f(); } }; });
 }
-const TABS = [['graf', 'Por hora'], ['mapa', 'Mapa'], ['sat', 'Satélite'], ['acier', 'Aciertos']];
+const TABS = [['graf', 'Por hora'], ['mapa', 'Mapa'], ['sat', 'Satélite']];
 function mostrarTab(t, foco) {
   estado.tab = t; guardar('cc_tab', t);
   $$('.tab').forEach(b => { const on = b.dataset.t === t; b.classList.toggle('on', on); b.setAttribute('aria-selected', on); b.tabIndex = on ? 0 : -1; if (on && foco) b.focus(); });
@@ -3503,7 +3537,7 @@ function alertaPara(v) {
 function hace(t) { const m = Math.round((Date.now() - t) / 6e4); return m < 2 ? 'ahora' : m < 60 ? `hace ${m} min` : `hace ${Math.round(m / 60)} h`; }
 function render() {
   // recordar qué secciones desplegables estaban abiertas para dejarlas igual después de actualizar
-  const abiertos = new Set([...document.querySelectorAll('#vista details')].filter(d => d.open).map(d => (d.querySelector('summary') || {}).textContent));
+  const abiertos = new Set([...document.querySelectorAll('#vista details')].filter(d => d.open).map(d => d.id || (d.querySelector('summary') || {}).textContent));
   cabecera();
   const v = vistaActual(); if (!v) return;
   const ahora = ahoraISO(v.offset), hoy = ahora.slice(0, 10), ev = evidencia(v);
@@ -3547,18 +3581,21 @@ function render() {
     uvMax != null && uvMax >= 3 && !esNoche(ahora) ? `<span class="chip">UV <b>${Math.round(uvMax)}</b> ${nivelUV(uvMax)}${uvPico ? ' a las ' + uvPico.hora.slice(11, 16) : ''}</span>` : '',
     rfMax != null && rfMax >= 40 ? `<span class="chip">Ráfagas <b>${rfMax} km/h</b></span>` : '', chipAciertos(v)].join('');
   const al = alertaPara(v);
+  const fuera = v.lat != null && !enEcuador(v);                    // el navegador ubica a la persona fuera de Ecuador (VPN, red de empresa)
   const push = leer('cc_push') ? '🔔 Avisos activos' : '🔔 Avisarme';
   $('#vista').innerHTML =
-    `<div class="lay"><section class="cab" aria-label="Ahora">` +
+    `<div class="lay"><section class="cab" aria-label="Avisos">` +
+    (fuera ? `<div class="aviso-top fuera" role="alert"><p>📍 <b>Tu navegador te ubica fuera de Ecuador</b> (¿VPN activa?). Mostramos el pronóstico de ese punto, pero los avisos oficiales, los rayos y la lluvia en camino solo cubren Ecuador, y este pronóstico no está verificado allí.</p><button class="btn" id="elegirec">Elegir una ciudad de Ecuador</button></div>` : '') +
     (onda ? `<div class="alerta calor" role="alert">🔥 <b>Onda de calor:</b> ${onda.dias.length} días seguidos con máximas de hasta ${onda.max}°, más de lo normal para esta época (${onda.normal}°). Hidrátate, usa protector solar y evita el sol de 11:00 a 15:00.</div>` : '') +
     (al ? `<div class="alerta" role="alert">${al.tormenta ? '⛈️' : '🌧️'} <b>El pronóstico cambió:</b> ${al.prob}% de lluvia hacia las ${al.hora.slice(11, 16)} (antes ${al.antes}%).</div>` : '') +
+    `</section><section class="col1" aria-label="Pronóstico">` +
     `<div class="cabA"><div class="hero"><div class="ic">${icono(ic, 64)}</div><div class="ht"><div class="t">${act.temp != null ? Math.round(act.temp) : '-'}<sup>°</sup></div>` +
     `<div class="hs">${sAhora != null && sAhora - act.temp >= 1.5 ? `Se siente <b>${Math.round(sAhora)}°</b> · ` : ''}${tmax != null ? `Máx ${tmax}° · Mín ${tmin}°` : ''}</div>` + `</div></div>` +
     `<h1 class="tit">${tit}</h1><p class="sub">${sub}</p>` +
     `<div class="lugar">📍 ${esc(v.nombre)}</div>` +
-    `<div class="chips">${chips}</div></div><div class="cabB">` +
+    `<div class="chips">${chips}</div></div>` +
     `<div class="acciones">` + (D.feedback_url ? `<button class="acc" id="breporte">☂️ Reportar clima</button><button class="acc" id="bpush" aria-pressed="${!!leer('cc_push')}">${push}</button>` : '') +
-    `<button class="acc" id="bcompartir">↗ Compartir</button>${standalone || leer('cc_inst_no') === '2' ? '' : '<button class="acc inst" id="binstalar">📲 Instalar app</button>'}</div><div class="fbmini" id="fbmini"></div></div></section><section class="col1" aria-label="Pronóstico">` +
+    `<button class="acc" id="bcompartir">↗ Compartir</button>${standalone || leer('cc_inst_no') === '2' ? '' : '<button class="acc inst" id="binstalar">📲 Instalar app</button>'}</div><div class="fbmini" id="fbmini"></div>` +
     `<div class="card" id="c24"><h3>Próximas 24 horas</h3>${lineaTiempo(p24, ahora)}</div>` +
     `<div class="card"><h3>Próximos 7 días <span class="sub">Toca un día para ver el detalle</span></h3><div id="dias" role="list"></div></div>` +
     `</section><section class="col2" aria-label="Gráfica, mapa y satélite">` +
@@ -3566,22 +3603,23 @@ function render() {
     TABS.map(([t, n]) => `<button class="tab" role="tab" id="tab-${t}" data-t="${t}" aria-controls="panel-${t}">${n}</button>`).join('') + `</div>` +
     `<div class="panel" data-t="graf" id="panel-graf" role="tabpanel" aria-labelledby="tab-graf"><h3><span id="titg"></span><button id="todo" hidden>Ver todo</button></h3><div class="gsel" id="gsel" role="group" aria-label="Qué mostrar"></div><div class="rsel" id="rsel" role="group" aria-label="Cuánto tiempo mostrar"></div><div id="graf" style="position:relative"></div><div class="ley" id="leyg"></div></div>` +
     `<div class="panel" data-t="mapa" id="panel-mapa" role="tabpanel" aria-labelledby="tab-mapa" hidden>${htmlMapa()}</div>` +
-    `<div class="panel" data-t="sat" id="panel-sat" role="tabpanel" aria-labelledby="tab-sat" hidden>${htmlSatelite()}</div>` +
-    `<div class="panel" data-t="acier" id="panel-acier" role="tabpanel" aria-labelledby="tab-acier" hidden>${htmlAciertos(v)}</div></div>` +
+    `<div class="panel" data-t="sat" id="panel-sat" role="tabpanel" aria-labelledby="tab-sat" hidden>${htmlSatelite()}</div></div>` +
     `<details><summary>Qué dice cada modelo meteorológico</summary>${tablaModelos(prox.slice(0, 72), v.cfg, hoy)}</details>` +
+    htmlCardAciertos(v, fuera) +
     `<details><summary>¿Qué tan confiable es este pronóstico?</summary>${v.verif_html}</details>` +
     `<details id="como"><summary>Cómo funciona ClearSky</summary>${htmlComo()}</details>` +
     `</section></div>`;
-  document.querySelectorAll('#vista details').forEach(d => { if (abiertos.has((d.querySelector('summary') || {}).textContent)) d.open = true; });
+  document.querySelectorAll('#vista details').forEach(d => { if (abiertos.has(d.id || (d.querySelector('summary') || {}).textContent)) d.open = true; });
   activarLinea($('#c24'), p24);
   pintarDias();
   $$('.tab').forEach((b, i, todos) => { b.onclick = () => { tocar(); mostrarTab(b.dataset.t); };
     b.onkeydown = e => { const d = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0; if (d) { e.preventDefault(); mostrarTab(todos[(i + d + todos.length) % todos.length].dataset.t, true); } }; });
   mostrarTab(TABS.some(([t]) => t === estado.tab) ? estado.tab : 'graf');
   $('#todo').onclick = () => { estado.dia = null; pintarDias(); pintarGrafica(); };
+  const ee = $('#elegirec'); if (ee) ee.onclick = () => { tocar(); abrirSelector(); };
   const br = $('#breporte'); if (br) br.onclick = () => { tocar(); abrirReporte(); };
   const bp = $('#bpush'); if (bp) bp.onclick = () => { tocar(); abrirAvisos(); };
-  const ca = $('#chipac'); if (ca) ca.onclick = () => { tocar(); mostrarTab('acier'); const el = document.querySelector('.cmulti'); el && el.scrollIntoView({behavior: 'smooth', block: 'start'}); };
+  const ca = $('#chipac'); if (ca) ca.onclick = () => { tocar(); const d = $('#aciertos'); if (d) { d.open = true; d.scrollIntoView({behavior: 'smooth', block: 'start'}); } };
   $('#bcompartir').onclick = () => { tocar(); compartir(); };
   const bi = $('#binstalar'); if (bi) bi.onclick = () => { tocar(); instalar(); };
   if (Math.abs(scrollY - y0) > 2) scrollTo(0, y0);
@@ -3597,8 +3635,21 @@ function tableroDe(v) {
   return c ? Object.assign({ciudad: c}, T.ciudades[c]) : null;
 }
 function chipAciertos(v) {
+  if (v.lat != null && !enEcuador(v)) return '';
   const t = tableroDe(v);
   return t && t.n >= 4 ? `<button class="chip btnchip" id="chipac" aria-label="Ver cómo nos fue esta semana">✓ Acertamos <b>${t.a} de ${t.n}</b> días</button>` : '';
+}
+// tarjeta desplegable: arriba, 7 puntos (uno por día: verde acertamos, rojo falló) y "6 de 7"; al abrirla, el detalle día por día
+function htmlCardAciertos(v, fuera) {
+  const t = fuera ? null : tableroDe(v);
+  let resumen;
+  if (t && t.n) {
+    const pts = t.dias.map(d => { const f = new Date(d.d + 'T12:00:00Z'), [txt, cls] = VEREDICTO[d.c] || ['', 'neu'];
+      return `<i class="pt ${cls}" title="${DIAS_C[f.getUTCDay()]} ${f.getUTCDate()}: dijimos ${d.max}% · ${d.llovio ? 'llovió' : 'no llovió'} · ${txt}"></i>`; }).join('');
+    resumen = `<span class="pts" aria-hidden="true">${pts}</span><b>${t.a} de ${t.n}</b>`;
+  } else resumen = `<span class="sm-n">${fuera ? 'solo en Ecuador' : 'reuniendo datos'}</span>`;
+  const cuerpo = fuera ? '<div class="ac"><p class="nota">ClearSky solo comprueba su pronóstico en Ecuador. Elige una ciudad de Ecuador para ver cómo nos ha ido.</p></div>' : htmlAciertos(v);
+  return `<details class="acierdet" id="aciertos"><summary class="sumac"><span class="sm-t">Cómo nos fue esta semana</span><span class="sm-r">${resumen}</span></summary>${cuerpo}</details>`;
 }
 function htmlAciertos(v) {
   const T = D.tablero, t = tableroDe(v);
@@ -4023,6 +4074,7 @@ html[data-tema=claro] .ah-rayo{background:linear-gradient(90deg,rgba(250,204,21,
     const v = ctx && ctx.v, cab = document.querySelector('.cab');
     if (!v || !cab) return;
     document.querySelectorAll('.ah-b').forEach(e => e.remove());
+    if (v.lat != null && !enEcuador(v)) return;            // fuera de Ecuador: sin aviso del INAMHI, rayos ni lluvia en camino
     const hoy = ctx.hoy, piezas = [];
     const ry = rayosCerca(v);
     if (ry && ry.n20 >= 1) {
