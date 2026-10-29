@@ -2445,6 +2445,7 @@ html[data-tema=claro] .alerta.calor{background:linear-gradient(90deg,#ea580c,#dc
 .gb{flex:none;border:1px solid var(--line);background:none;border-radius:999px;padding:6px 13px;font-size:13px;color:var(--tx2);cursor:pointer;min-height:34px}
 .gb.on{background:var(--card2);border-color:var(--card2);color:var(--tx);font-weight:600}
 .ley .lg{cursor:default}
+.ley .nota-ley{color:var(--tx3);font-size:11.5px;flex-basis:100%;min-height:0;padding:0 2px}
 html[data-tema=claro] .dc.agua b{color:#2563eb}html[data-tema=claro] .dc.ts b{color:#7c3aed}html[data-tema=claro] .dc.hot b{color:#dc2626}
 @media(min-width:980px){.dcards{grid-template-columns:repeat(3,minmax(0,1fr))}}
 /* ---------- v16: rango, aciertos, avisos a elegir ---------- */
@@ -2882,7 +2883,9 @@ function grafica(cont, filas, ahora, hoy, vr) {
                  linea: '#2563eb', area: '#3b82f6', ts: '#7c3aed', pico: '#0f172a', fondo: '#ffffff', temp: '#f59e0b', sens: '#dc2626', vto: '#0d9488', calor: 'rgba(239,68,68,.07)'}
                : {txt: '#7c8696', fuerte: '#cbd5e1', grid: '#1c2433', noche: 'rgba(255,255,255,.03)', banda1: 'rgba(96,165,250,.08)', banda2: 'rgba(96,165,250,.035)',
                  linea: '#60a5fa', area: '#3b82f6', ts: '#a78bfa', pico: '#ffffff', fondo: '#111723', temp: '#fbbf24', sens: '#f87171', vto: '#5eead4', calor: 'rgba(239,68,68,.09)'};
-  const pl = 36, pr = 12, pt = 30, h = W < 500 ? 170 : 210, pb = 24, H = pt + h + pb, w = W - pl - pr, dx = w / Math.max(n - 1, 1);
+  const largo = n > 100;                                              // 7 días: gráfica más limpia, con el máximo de cada día arriba
+  const pl = 36, pr = 12, pt = largo ? 48 : 30, h = W < 500 ? 170 : 210, pb = 24, H = pt + h + pb, w = W - pl - pr, dx = w / Math.max(n - 1, 1);
+  const arr = largo ? 36 : 18;                                        // cuánto suben arriba las líneas separadoras de día
   const X = i => pl + i * dx;
   const val = (r, c) => r[c] == null ? null : r[c];
   // escala de cada variable
@@ -2910,7 +2913,7 @@ function grafica(cont, filas, ahora, hoy, vr) {
   const orient = vr === 'lluvia' ? filas.map(r => !verificadoA((ctx && ctx.v && ctx.v.cfg) || {}, r.plazo || 1)) : [];
   for (let i = 0; i < n;) { if (!orient[i]) { i++; continue; } let j = i; while (j + 1 < n && orient[j + 1]) j++;
     s += `<rect x="${xa(i)}" y="${pt}" width="${xb(j) - xa(i)}" height="${h}" fill="url(#hat)"/>`;
-    if (xb(j) - xa(i) > 90) s += `<text x="${xa(i) + 6}" y="${pt + h - 6}" font-size="10" fill="${C.txt}" letter-spacing=".5">ORIENTATIVO</text>`; i = j + 1; }
+    if (xb(j) - xa(i) > 90) s += `<text x="${xa(i) + 6}" y="${pt + 13}" font-size="10" fill="${C.txt}" letter-spacing=".5">ORIENTATIVO</text>`; i = j + 1; }
   const banda = (v0, v1, color, txt) => { const y0 = Y(v1), y1 = Y(v0);
     s += `<rect x="${pl}" y="${y0}" width="${w}" height="${Math.max(y1 - y0, 0)}" fill="${color}"/>`;
     if (txt) s += `<text x="${W - pr - 4}" y="${y0 + 13}" text-anchor="end" font-size="10.5" fill="${C.txt}" letter-spacing=".4">${txt}</text>`; };
@@ -2920,28 +2923,65 @@ function grafica(cont, filas, ahora, hoy, vr) {
   for (const v of ticks) s += `<line x1="${pl}" x2="${W - pr}" y1="${Y(v)}" y2="${Y(v)}" stroke="${C.grid}" stroke-width="1"${v === lo ? '' : ' stroke-dasharray="2 4"'}/><text x="${pl - 6}" y="${Y(v) + 4}" text-anchor="end" font-size="10.5" fill="${C.txt}">${fy(v)}</text>`;
   if (vr === 'viento') s += `<text x="${pl - 6}" y="${pt - 6}" text-anchor="end" font-size="10" fill="${C.txt}">km/h</text>`;
   const inicios = filas.map((r, i) => i === 0 || r.hora.slice(11, 13) === '00' ? i : -1).filter(i => i >= 0);
+  // cabecera de cada día (solo 7 días): nombre y el valor máximo del día, centrados sobre su columna
+  const cabeceraDia = (i, fin, ancho) => {
+    if (ancho < 24) return;
+    const rs = filas.slice(i, fin), cx = (X(i) + X(fin - 1)) / 2, dia = nombreDia(filas[i].hora.slice(0, 10), hoy);
+    const nombre = ancho >= 66 ? dia : dia === 'Hoy' ? 'Hoy' : dia.slice(0, 3);
+    let txt = '–', col = C.txt;
+    if (vr === 'lluvia') { const m = Math.max(...rs.map(r => r.prob)), t = Math.max(...rs.map(r => r.prob_ts || 0));
+      if (m >= 10) { txt = (t >= 30 ? '⚡' : '') + m + '%'; col = m >= 50 ? C.pico : C.linea; } else if (t >= 30) txt = '⚡' + t + '%'; }
+    else if (vr === 'temp') { const m = Math.max(...rs.filter(r => r.temp != null).map(r => r.temp)); if (isFinite(m)) { txt = Math.round(m) + '°'; col = C.temp; } }
+    else if (vr === 'viento') { const m = Math.max(...rs.map(r => r.rafaga ?? r.viento ?? 0)); if (m > 0) { txt = Math.round(m); col = C.vto; } }
+    else { const m = Math.max(...rs.map(r => r.uv || 0)); if (m >= 1) { txt = Math.round(m); col = m >= 8 ? '#ef4444' : m >= 6 ? '#fb923c' : m >= 3 ? '#facc15' : '#4ade80'; } }
+    s += `<text x="${cx}" y="${pt - 30}" text-anchor="middle" font-size="11" font-weight="600" fill="${C.fuerte}">${nombre}</text>` +
+         `<text x="${cx}" y="${pt - 14}" text-anchor="middle" font-size="12.5" font-weight="700" fill="${col}">${txt}</text>`;
+  };
   inicios.forEach((i, q) => { const fin = q + 1 < inicios.length ? inicios[q + 1] : n, ancho = X(fin - 1) - X(i);
-    if (i) s += `<line x1="${X(i)}" x2="${X(i)}" y1="${pt - 18}" y2="${pt + h}" stroke="${C.grid}" stroke-width="1"/>`;
-    if (ancho > 38) s += `<text x="${X(i) + 5}" y="${pt - 12}" font-size="11.5" font-weight="600" fill="${C.fuerte}">${nombreDia(filas[i].hora.slice(0, 10), hoy)}</text>`; });
-  filas.forEach((r, i) => { const hh = +r.hora.slice(11, 13); if (hh % paso === 0 && X(i) > pl + 8 && X(i) < W - pr - 8)
+    if (i) s += `<line x1="${X(i)}" x2="${X(i)}" y1="${pt - arr}" y2="${pt + h}" stroke="${C.grid}" stroke-width="1"/>`;
+    if (largo) cabeceraDia(i, fin, ancho); else if (ancho > 38) s += `<text x="${X(i) + 5}" y="${pt - 12}" font-size="11.5" font-weight="600" fill="${C.fuerte}">${nombreDia(filas[i].hora.slice(0, 10), hoy)}</text>`; });
+  filas.forEach((r, i) => { const hh = +r.hora.slice(11, 13); if ((largo ? hh === 12 : hh % paso === 0) && X(i) > pl + 8 && X(i) < W - pr - 8)
     s += `<text x="${X(i)}" y="${H - 7}" text-anchor="middle" font-size="10.5" fill="${C.txt}">${hh}h</text>`; });
   const serie = (f, min = -Infinity) => filas.map((r, i) => { const v = f(r); return v == null ? null : [X(i), Y(v >= min ? v : lo)]; }).filter(Boolean);
-  const etiqueta = (x0, y0, txt, sub) => { const x = Math.max(pl + 22, Math.min(W - pr - 40, x0)), y = Math.max(pt + 12, y0 - 9);
+  const etiqueta = (x0, y0, txt, sub) => { if (largo) return; const x = Math.max(pl + 22, Math.min(W - pr - 40, x0)), y = Math.max(pt + 12, y0 - 9);
     s += `<text x="${x}" y="${y}" text-anchor="middle" font-size="11.5" font-weight="700" fill="${C.pico}" paint-order="stroke" stroke="${C.fondo}" stroke-width="3">${txt}${sub ? `<tspan font-weight="400" fill="${C.txt}"> ${sub}</tspan>` : ''}</text>`; };
   const picoDia = f => inicios.map((i, q) => { const fin = q + 1 < inicios.length ? inicios[q + 1] : n; let b = i;
     for (let j = i; j < fin; j++) if ((f(filas[j]) ?? -1e9) > (f(filas[b]) ?? -1e9)) b = j; return fin - i >= 4 ? b : -1; }).filter(b => b >= 0);
   let leyenda = [];
+  // en 7 días se dibuja el promedio móvil de 3 horas (los 168 puntos de cada modelo dan una curva escalonada); al tocar se ve el valor real de cada hora
+  const suave = f => {
+    const a = filas.map(f), out = [], maxDia = new Map();
+    inicios.forEach((ini, q) => { const fin = q + 1 < inicios.length ? inicios[q + 1] : n; let m = -Infinity;
+      for (let j = ini; j < fin; j++) if (a[j] != null && a[j] > m) m = a[j]; for (let j = ini; j < fin; j++) maxDia.set(j, m); });
+    for (let i = 0; i < n; i++) {
+      if (a[i] == null) { out.push(null); continue; }
+      const ven = a.slice(Math.max(0, i - 3), i + 4).filter(x => x != null);
+      if (a[i] >= Math.max(...ven) || a[i] === maxDia.get(i)) { out.push(a[i]); continue; }     // pico real: no se rebaja
+      const w = [a[i - 1], a[i], a[i + 1]].filter(x => x != null); out.push(w.reduce((p, c) => p + c, 0) / w.length);
+    }
+    return out;
+  };
+  const serieS = (f) => { const sm = largo ? suave(f) : null; return filas.map((r, i) => { const v = largo ? sm[i] : f(r); return v == null ? null : [X(i), Y(v)]; }).filter(Boolean); };
   if (vr === 'lluvia') {
-    const d = curvaSuave(serie(r => r.prob));
+    const d = curvaSuave(serieS(r => r.prob));
     s += `<path d="${d} L${X(n - 1)},${Y(0)} L${X(0)},${Y(0)} Z" fill="url(#gl)"/><path d="${d}" fill="none" stroke="${C.linea}" stroke-width="2.4" stroke-linejoin="round"/>`;
     leyenda.push([C.linea, 'Probabilidad de lluvia', '']);
     if (orient.some(Boolean)) leyenda.push([C.txt, 'Orientativo (sin verificar)', 'sq']);
     if (filas.some(r => (r.prob_ts || 0) >= 15)) {
-      s += `<path d="${curvaSuave(serie(r => r.prob_ts || 0, 15))}" fill="none" stroke="${C.ts}" stroke-width="1.6" stroke-dasharray="1.5 3.5" stroke-linecap="round"/>`;
-      filas.forEach((r, i) => { if ((r.prob_ts || 0) >= 30 && (i === 0 || (filas[i - 1].prob_ts || 0) < 30)) s += `<text x="${X(i)}" y="${Y(r.prob_ts) - 6}" text-anchor="middle" font-size="13">⚡</text>`; });
-      leyenda.push([C.ts, 'Tormenta eléctrica', 'pt']);
+      if (largo) {                                  // 7 días: un ⚡ por cada episodio de tormenta (máximo local de 25% o más), sin línea punteada
+        let ult = -1e9;
+        filas.forEach((r, i) => { const t = r.prob_ts || 0; if (t < 25 || t < (filas[i - 1] ? filas[i - 1].prob_ts || 0 : 0) || t < (filas[i + 1] ? filas[i + 1].prob_ts || 0 : 0)) return;
+          if (X(i) - ult < 34) return; ult = X(i);
+          s += `<text x="${X(i)}" y="${Math.max(pt + 12, Y(Math.max(r.prob, t)) - 8)}" text-anchor="middle" font-size="14">⚡</text>`; });
+        leyenda.push([C.ts, 'Tormenta eléctrica (25% o más)', 'ray']);
+      } else {
+        s += `<path d="${curvaSuave(serie(r => r.prob_ts || 0, 15))}" fill="none" stroke="${C.ts}" stroke-width="1.6" stroke-dasharray="1.5 3.5" stroke-linecap="round"/>`;
+        filas.forEach((r, i) => { if ((r.prob_ts || 0) >= 30 && (i === 0 || (filas[i - 1].prob_ts || 0) < 30)) s += `<text x="${X(i)}" y="${Y(r.prob_ts) - 6}" text-anchor="middle" font-size="13">⚡</text>`; });
+        leyenda.push([C.ts, 'Tormenta eléctrica', 'pt']);
+      }
     }
-    picoDia(r => r.prob).forEach(b => { if (filas[b].prob >= 20) { s += `<circle cx="${X(b)}" cy="${Y(filas[b].prob)}" r="3.5" fill="${C.linea}" stroke="${C.fondo}" stroke-width="1.5"/>`;
+    if (largo) leyenda.push([C.txt, 'Curva suavizada (los picos son reales); toca para ver cada hora', 'nota']);
+    picoDia(r => r.prob).forEach(b => { if (filas[b].prob >= 20 && !largo) { s += `<circle cx="${X(b)}" cy="${Y(filas[b].prob)}" r="3.5" fill="${C.linea}" stroke="${C.fondo}" stroke-width="1.5"/>`;
       etiqueta(X(b), Y(filas[b].prob), filas[b].prob + '%', filas[b].hora.slice(11, 13) + 'h'); } });
     if (filas.every(r => r.prob < 10)) s += `<text x="${pl + w / 2}" y="${pt + h / 2}" text-anchor="middle" font-size="13" fill="${C.txt}">Sin lluvia prevista</text>`;
   } else if (vr === 'temp') {
@@ -2954,10 +2994,11 @@ function grafica(cont, filas, ahora, hoy, vr) {
     picoDia(r => r.temp).forEach(b => { s += `<circle cx="${X(b)}" cy="${Y(filas[b].temp)}" r="3.5" fill="${C.temp}" stroke="${C.fondo}" stroke-width="1.5"/>`;
       etiqueta(X(b), Y(filas[b].temp), Math.round(filas[b].temp) + '°', filas[b].hora.slice(11, 13) + 'h'); });
   } else if (vr === 'viento') {
-    const d = curvaSuave(serie(r => r.viento));
-    if (filas.some(r => r.rafaga != null)) { s += `<path d="${curvaSuave(serie(r => r.rafaga))}" fill="none" stroke="${C.vto}" stroke-width="1.4" stroke-dasharray="4 3" opacity=".8"/>`; }
+    const d = curvaSuave(serieS(r => r.viento));
+    if (filas.some(r => r.rafaga != null)) { s += `<path d="${curvaSuave(serieS(r => r.rafaga))}" fill="none" stroke="${C.vto}" stroke-width="1.4" stroke-dasharray="4 3" opacity=".8"/>`; }
     s += `<path d="${d} L${X(n - 1)},${Y(0)} L${X(0)},${Y(0)} Z" fill="url(#gv)"/><path d="${d}" fill="none" stroke="${C.vto}" stroke-width="2.4"/>`;
     leyenda.push([C.vto, 'Viento', ''], [C.vto, 'Ráfagas', 'dash']);
+    if (largo) leyenda.push([C.txt, 'Curva suavizada (los picos son reales); toca para ver cada hora', 'nota']);
     picoDia(r => r.rafaga ?? r.viento).forEach(b => { const v = filas[b].rafaga ?? filas[b].viento; etiqueta(X(b), Y(v), Math.round(v), filas[b].hora.slice(11, 13) + 'h'); });
   } else {
     const colUV = u => u < 3 ? '#4ade80' : u < 6 ? '#facc15' : u < 8 ? '#fb923c' : u < 11 ? '#ef4444' : '#a855f7';
@@ -2968,7 +3009,7 @@ function grafica(cont, filas, ahora, hoy, vr) {
     if (filas.every(r => !(r.uv > 0.4))) s += `<text x="${pl + w / 2}" y="${pt + h / 2}" text-anchor="middle" font-size="13" fill="${C.txt}">Sin sol en estas horas</text>`;
   }
   const ia = filas.findIndex(r => r.hora === ahora);
-  if (ia >= 0) s += `<line x1="${X(ia)}" x2="${X(ia)}" y1="${pt - 18}" y2="${pt + h}" stroke="${C.fuerte}" stroke-width="1.5" stroke-dasharray="3 3"/>`;
+  if (ia >= 0) s += `<line x1="${X(ia)}" x2="${X(ia)}" y1="${pt - arr}" y2="${pt + h}" stroke="${C.fuerte}" stroke-width="1.5" stroke-dasharray="3 3"/>`;
   s += `<line class="cursor" y1="${pt}" y2="${pt + h}" visibility="hidden" stroke="${C.fuerte}" stroke-width="1"/><circle class="punto" r="5" visibility="hidden" fill="${vr === 'temp' ? C.temp : vr === 'viento' ? C.vto : C.linea}" stroke="${C.fondo}" stroke-width="2"/></svg><div class="tip" hidden></div>`;
   cont.innerHTML = s;
   cont._leyenda = leyenda;
@@ -3494,7 +3535,7 @@ const VARS_G = [['lluvia', 'Lluvia'], ['temp', 'Temperatura'], ['viento', 'Vient
 // si va a llover, la gráfica abre en lluvia; si no, en temperatura
 const varAuto = filas => filas.some(r => r.prob >= 20 || (r.prob_ts || 0) >= 30 || r.prob_dz >= 50) ? 'lluvia' : 'temp';
 function leyendaG(items) {
-  return items.map(([c, t, tipo]) => `<span class="lg"><i style="background:${tipo === 'dash' || tipo === 'pt' ? `repeating-linear-gradient(90deg,${c} 0 4px,transparent 4px 7px)` : c};height:${tipo === 'sq' ? '10px' : '3px'};${tipo === 'sq' ? 'width:10px;border-radius:2px' : ''}"></i>${t}</span>`).join('') +
+  return items.map(([c, t, tipo]) => tipo === 'ray' ? `<span class="lg"><span aria-hidden="true" style="font-size:12px">⚡</span>${t}</span>` : tipo === 'nota' ? `<span class="lg nota-ley">${t}</span>` : `<span class="lg"><i style="background:${tipo === 'dash' || tipo === 'pt' ? `repeating-linear-gradient(90deg,${c} 0 4px,transparent 4px 7px)` : c};height:${tipo === 'sq' ? '10px' : '3px'};${tipo === 'sq' ? 'width:10px;border-radius:2px' : ''}"></i>${t}</span>`).join('') +
     `<span class="lg"><i style="background:repeating-linear-gradient(90deg,${claro() ? '#334155' : '#cbd5e1'} 0 3px,transparent 3px 6px);height:2px"></i>Ahora</span>`;
 }
 let ctx = null;
