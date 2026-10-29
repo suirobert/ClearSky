@@ -78,3 +78,17 @@ Carpeta `feedback/` (Worker + D1, configurado desde el panel de Cloudflare). Sec
 - Índice de calor: fórmula de la NOAA / National Weather Service.
 - Mapa y barrios: [Leaflet](https://leafletjs.com/) y © [OpenStreetMap](https://www.openstreetmap.org/copyright).
 - Íconos: [Meteocons](https://github.com/basmilius/meteocons) de Bas Milius, MIT.
+
+
+## Ahora y aviso oficial (v15)
+
+Cada 10 minutos el workflow `ahora.yml` ejecuta `ahora.py` y publica `ahora.json` en la rama `ahora`:
+
+- **Rayos**: descargas eléctricas de los últimos 20-30 minutos (GOES-19 GLM, NOAA). Si hay 5 o más en 20 min a menos de 25 km, la página dice "Tormenta eléctrica activa cerca de ti" y el servicio de avisos notifica.
+- **Lluvia observada**: estimación satelital de NOAA (la misma de antes, ahora cada 10 minutos).
+- **Aviso oficial**: último boletín del INAMHI (`advertencia.pdf`): nivel de amenaza, vigencia, fenómeno, zonas afectadas por región y qué puede pasar. Solo se muestra si está vigente o empieza en las próximas 24 h y afecta tu región.
+
+La página lee `ahora.json` cada 5 minutos. Si esa capa falla, la página sigue funcionando con el pronóstico de siempre.
+Los avisos del teléfono distinguen **tormenta** (máx. uno cada 2 h), **lluvia** (cada 6 h) y **oficial** (una vez por boletín).
+Fuentes oficiales: [INAMHI](https://servicios.inamhi.gob.ec/alertas/), [Alertas Ecuador](https://alertasecuador.gob.ec/), [INOCAR](https://www.inocar.mil.ec/web/index.php/productos/tabla-mareas).
+Los rayos son detecciones satelitales: pueden tardar unos minutos y no sustituyen a las alertas oficiales.

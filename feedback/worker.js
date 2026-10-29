@@ -1,4 +1,4 @@
-// ClearSky · servicio de reportes y avisos (Cloudflare Workers + D1, plan gratuito) · v12
+// ClearSky · servicio de reportes, avisos y vigilancia (Cloudflare Workers + D1, plan gratuito) · v15
 // POST /reporte     {lat, lon, tipo}            -> guarda un reporte (máx. 1 cada 30 min por persona y zona)
 // GET  /resumen?lat=&lon=                       -> reportes de la última hora a ~10 km (público)
 // GET  /export?despues=<id>                     -> reportes nuevos para el script (requiere TOKEN)
@@ -7,16 +7,22 @@
 // POST /desuscribir {endpoint}                  -> los desactiva
 // GET  /vapid-nuevo                             -> genera claves VAPID (requiere TOKEN; se usa una sola vez)
 // GET  /estado                                  -> antigüedad de la página publicada (público)
-// Tarea programada (cron, cada 30 min):
-//   1. Avisos de lluvia: si el satélite o los reportes de la gente dicen que está lloviendo en la zona de un
-//      suscriptor, o si el pronóstico da 60% o más en las próximas 2 horas (máximo un aviso cada 6 horas).
-//   2. Vigilancia: si la página lleva más de 3 horas sin actualizarse, relanza el workflow de GitHub
+// Tarea programada (cron, cada 30 min) -> avisos al teléfono:
+//   1. TORMENTA: 5 o más rayos en 20 min a menos de 25 km (GOES-19 GLM, desde ahora.json). Máximo uno cada 2 h.
+//   2. LLUVIA: el satélite o los reportes de la gente dicen que llueve ahora, o el pronóstico da 60% o más en
+//      las próximas 2 horas. Máximo uno cada 6 h.
+//   3. OFICIAL: cuando el INAMHI publica un boletín que afecta la región de la persona (desde 3 h antes de su
+//      inicio y mientras esté vigente). Una sola vez por boletín.
+//   4. VIGILANCIA: si la página o la capa "ahora" llevan horas sin actualizarse, relanza el workflow de GitHub
 //      (si hay GH_TOKEN) y avisa a los suscriptores administradores.
 const TIPOS = ['soleado', 'nublado', 'llovizna', 'lluvia', 'lluvia_fuerte', 'tormenta'];
 const SITIO = 'https://suirobert.github.io/ClearSky';
-const REPO = 'suirobert/ClearSky', WORKFLOW = 'actualizar.yml';
-const PROB_AVISO = 60, HORAS_ENTRE_AVISOS = 6, MAX_ZONAS = 15, MAX_ENVIOS = 25, HORAS_VIEJA = 3;
+const AHORA_URL = 'https://raw.githubusercontent.com/suirobert/ClearSky/ahora/ahora.json';
+const REPO = 'suirobert/ClearSky';
+const PROB_AVISO = 60, HORAS_ENTRE_AVISOS = 6, HORAS_ENTRE_TORMENTAS = 2, MAX_ZONAS = 15, MAX_ENVIOS = 25, HORAS_VIEJA = 3;
+const RAYOS_AVISO = 5;
 const enEcuador = (lat, lon) => lat >= -6 && lat <= 2.5 && lon >= -92.5 && lon <= -75;
+const REGION_DE_ZONA = { costa: 'litoral', sierra: 'interandina', oriente: 'amazonia', galapagos: 'insular' };
 
 export default {
   async fetch(req, env) {
@@ -116,10 +122,13 @@ export default {
   },
 
   async scheduled(evento, env, ctx) {
-    ctx.waitUntil(Promise.all([
-      revisarAvisos(env).catch(e => console.log('avisos:', e && e.message)),
-      vigilar(env).catch(e => console.log('vigilancia:', e && e.message)),
-    ]));
+    ctx.waitUntil((async () => {
+      const ah = await leerAhora(env);
+      await revisarAvisos(env, ah).catch(e => console.log('avisos:', e && e.message));
+      await avisosOficiales(env, ah).catch(e => console.log('oficial:', e && e.message));
+      await vigilar(env).catch(e => console.log('vigilancia:', e && e.message));
+      await vigilarAhora(env, ah).catch(e => console.log('vigilancia ahora:', e && e.message));
+    })());
   },
 };
 
@@ -130,6 +139,27 @@ async function resumen(env, lat, lon, ahora) {
   const o = { total: 0 };
   for (const x of r.results) { o[x.tipo] = x.n; o.total += x.n; }
   return o;
+}
+
+// =================== LA CAPA "AHORA" (ahora.json, cada 10 min desde GitHub Actions) ===================
+const horaEc = (s) => Date.parse(String(s || '') + ':00-05:00');          // "2026-10-29T02:50" (hora de Ecuador) -> ms
+async function leerAhora(env) {
+  try {
+    const r = await fetch(env.AHORA_URL || AHORA_URL, { cf: { cacheTtl: 120 } });
+    if (!r.ok) return null;
+    const j = await r.json();
+    j._edadMin = (Date.now() - horaEc(j.generado)) / 60000;
+    if (!(j._edadMin < 40)) { j.rayos = null; j.lluvia = null; }               // dato viejo: no es "ahora"
+    if (j.rayos && !((Date.now() - horaEc(j.rayos.t)) / 60000 < 25)) j.rayos = null;
+    return j;
+  } catch (e) { return null; }
+}
+function rayosEn(R, lat, lon) {
+  if (!R || !R.celdas) return null;
+  const radio = R.radio_km || 25;
+  let n20 = 0, n30 = 0;
+  for (const [la, lo, a, b] of R.celdas) if (km(lat, lon, la, lo) <= radio) { n20 += a; n30 += b; }
+  return { n20, n30, radio };
 }
 
 // =================== AVISOS: el mismo cálculo que la página ===================
@@ -148,15 +178,20 @@ function referencia(conf, lat, lon, elev) {
   const misma = todas.filter(c => c.zona === zona), lista = misma.length ? misma : todas;
   return lista.reduce((a, b) => km(lat, lon, a.lat, a.lon) <= km(lat, lon, b.lat, b.lon) ? a : b);
 }
+function regionDe(conf, lat, lon) {
+  if (lon < -88) return 'insular';
+  const c = conf.ciudades.reduce((a, b) => km(lat, lon, a.lat, a.lon) <= km(lat, lon, b.lat, b.lon) ? a : b);
+  return REGION_DE_ZONA[c.zona] || 'litoral';
+}
 function tablaHora(cfg, conf, hora) {
   const h = +hora.slice(11, 13);
   if (cfg.franjas && cfg.franjas.activa) for (const n in conf.franjas) { const [a, b] = conf.franjas[n];
     if (h >= a && h < b && cfg.franjas.tablas && cfg.franjas.tablas[n]) return cfg.franjas.tablas[n]; }
   return cfg.tabla_lluvia;
 }
-function satelite(conf) {
-  const A = conf.ahora; if (!A || !A.q) return null;
-  const t = Date.parse(A.t + ':00-05:00'); if (!(Date.now() - t < 3 * 3600e3)) return null;
+function satelite(A) {
+  if (!A || !A.q) return null;
+  if (!(Date.now() - horaEc(A.t) < 3 * 3600e3)) return null;
   const v = Uint8Array.from(atob(A.q), c => c.charCodeAt(0));
   return { t: A.t, en(lat, lon) {
     const iy = Math.floor((A.lat0 - lat) / A.paso), ix = Math.floor((lon - A.lon0) / A.paso); let m = null;
@@ -165,47 +200,56 @@ function satelite(conf) {
     return m;
   } };
 }
-async function revisarAvisos(env) {
+async function revisarAvisos(env, ah) {
   if (!env.VAPID_PRIVATE || !env.VAPID_PUBLIC) return;
   const sitio = (env.SITIO || SITIO).replace(/\/+$/, '');
   const ahora = Math.floor(Date.now() / 1000);
-  const subs = (await env.DB.prepare('SELECT * FROM sub WHERE aviso < ?').bind(ahora - HORAS_ENTRE_AVISOS * 3600).all()).results;
+  const subs = (await env.DB.prepare('SELECT * FROM sub WHERE aviso < ?').bind(ahora - HORAS_ENTRE_TORMENTAS * 3600).all()).results;
   if (!subs.length) return;
   const conf = await (await fetch(`${sitio}/push.json`, { cf: { cacheTtl: 300 } })).json();
-  const sat = satelite(conf);
+  const sat = satelite((ah && ah.lluvia) || conf.ahora);
   const zonas = new Map();                                   // agrupa suscriptores cercanos (~5 km)
   for (const s of subs) { const k = `${(Math.round(s.lat * 20) / 20).toFixed(2)},${(Math.round(s.lon * 20) / 20).toFixed(2)}`;
     (zonas.get(k) || zonas.set(k, []).get(k)).push(s); }
   let envios = 0;
   for (const [k, lista] of [...zonas].slice(0, MAX_ZONAS)) {
     const [lat, lon] = k.split(',').map(Number);
-    // 1) ¿está lloviendo ya? satélite y reportes de la gente de la última hora
-    const mm = sat ? sat.en(lat, lon) : null;
-    const rep = await resumen(env, lat, lon, ahora);
-    const moja = (rep.lluvia || 0) + (rep.lluvia_fuerte || 0) + (rep.tormenta || 0) + 0.5 * (rep.llovizna || 0);
-    const lluviaRep = rep.total >= 3 && moja / rep.total >= 0.6;
-    let aviso = null;
-    if ((mm != null && mm >= 1) || lluviaRep) {
-      const quien = [mm != null && mm >= 0.5 ? 'el satélite' : '', lluviaRep ? `${rep.total} reportes de la gente` : ''].filter(Boolean).join(' y ');
-      aviso = (nombre) => ({ title: `🌧️ Está lloviendo cerca de ${nombre}`, body: `Según ${quien}. ¡Lleva paraguas!`, url: sitio + '/', tag: 'lluvia' });
+    let aviso = null, destinatarios = lista;
+    // 1) tormenta eléctrica: descargas detectadas por el satélite en los últimos 20 minutos
+    const ry = rayosEn(ah && ah.rayos, lat, lon);
+    if (ry && ry.n20 >= RAYOS_AVISO) {
+      aviso = (nombre) => ({ title: `⚡ Tormenta eléctrica cerca de ${nombre}`,
+        body: `${ry.n20} rayos en 20 min a menos de ${ry.radio} km. Busca refugio bajo techo.`, url: sitio + '/', tag: 'tormenta' });
     } else {
-      // 2) pronóstico de las próximas 2 horas
-      const om = await (await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=precipitation` +
-        `&models=${conf.modelos.join(',')}&timezone=auto&forecast_hours=3`)).json();
-      if (!om.hourly) continue;
-      const cfg = referencia(conf, lat, lon, om.elevation ?? 0).cfg;
-      let mejor = null;
-      om.hourly.time.forEach((t, i) => {
-        const v = {}; for (const m of conf.modelos) { const x = (om.hourly[`precipitation_${m}`] || [])[i]; if (x != null) v[m] = x; }
-        if (Object.keys(v).length < 3) return;
-        const p = Math.round(calibrarProb(probConsenso(v, cfg.pesos, cfg.umbral), tablaHora(cfg, conf, t)));
-        if (p >= PROB_AVISO && (!mejor || p > mejor.p)) mejor = { p, t };
-      });
-      if (mejor) aviso = (nombre) => ({ title: `🌧️ Lluvia probable en ${nombre}`,
-        body: `${mejor.p}% de probabilidad hacia las ${mejor.t.slice(11, 16)}. ¡Lleva paraguas!`, url: sitio + '/', tag: 'lluvia' });
+      destinatarios = lista.filter(s => s.aviso < ahora - HORAS_ENTRE_AVISOS * 3600);      // la lluvia avisa como mucho cada 6 h
+      if (!destinatarios.length) continue;
+      // 2) ¿está lloviendo ya? satélite y reportes de la gente de la última hora
+      const mm = sat ? sat.en(lat, lon) : null;
+      const rep = await resumen(env, lat, lon, ahora);
+      const moja = (rep.lluvia || 0) + (rep.lluvia_fuerte || 0) + (rep.tormenta || 0) + 0.5 * (rep.llovizna || 0);
+      const lluviaRep = rep.total >= 3 && moja / rep.total >= 0.6;
+      if ((mm != null && mm >= 1) || lluviaRep) {
+        const quien = [mm != null && mm >= 0.5 ? 'el satélite' : '', lluviaRep ? `${rep.total} reportes de la gente` : ''].filter(Boolean).join(' y ');
+        aviso = (nombre) => ({ title: `🌧️ Está lloviendo cerca de ${nombre}`, body: `Según ${quien}. ¡Lleva paraguas!`, url: sitio + '/', tag: 'lluvia' });
+      } else {
+        // 3) pronóstico de las próximas 2 horas
+        const om = await (await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=precipitation` +
+          `&models=${conf.modelos.join(',')}&timezone=auto&forecast_hours=3`)).json();
+        if (!om.hourly) continue;
+        const cfg = referencia(conf, lat, lon, om.elevation ?? 0).cfg;
+        let mejor = null;
+        om.hourly.time.forEach((t, i) => {
+          const v = {}; for (const m of conf.modelos) { const x = (om.hourly[`precipitation_${m}`] || [])[i]; if (x != null) v[m] = x; }
+          if (Object.keys(v).length < 3) return;
+          const p = Math.round(calibrarProb(probConsenso(v, cfg.pesos, cfg.umbral), tablaHora(cfg, conf, t)));
+          if (p >= PROB_AVISO && (!mejor || p > mejor.p)) mejor = { p, t };
+        });
+        if (mejor) aviso = (nombre) => ({ title: `🌧️ Lluvia probable en ${nombre}`,
+          body: `${mejor.p}% de probabilidad hacia las ${mejor.t.slice(11, 16)}. ¡Lleva paraguas!`, url: sitio + '/', tag: 'lluvia' });
+      }
     }
     if (!aviso) continue;
-    for (const s of lista) {
+    for (const s of destinatarios) {
       if (envios >= MAX_ENVIOS) return;
       const r = await enviarPush(s, aviso(s.nombre.split(',')[0]), env);
       envios++;
@@ -215,35 +259,85 @@ async function revisarAvisos(env) {
   }
 }
 
-// =================== VIGILANCIA: ¿la página se está actualizando? ===================
+// =================== AVISO OFICIAL DEL INAMHI ===================
+const nivelTxt = n => String(n || '').toLowerCase().replace(/muy alto/, 'muy alta').replace(/\balto\b/, 'alta')
+  .replace(/medio/, 'media').replace(/bajo/, 'baja').replace(/\s*[–-]\s*/, ' a ');
+async function avisosOficiales(env, ah) {
+  const o = ah && ah.oficial;
+  if (!o || !o.id || !o.desde || !o.hasta) return;
+  if (!env.VAPID_PRIVATE || !env.VAPID_PUBLIC) return;
+  const ahoraEc = new Date(Date.now() - 5 * 3600e3).toISOString().slice(0, 16);          // hora de Ecuador
+  if (ahoraEc > o.hasta) return;                                                         // vencido
+  if ((horaEc(o.desde) - Date.now()) / 3600e3 > 3) return;                               // se avisa desde 3 h antes del inicio
+  const sitio = (env.SITIO || SITIO).replace(/\/+$/, '');
+  const conf = await (await fetch(`${sitio}/push.json`, { cf: { cacheTtl: 300 } })).json();
+  const clave = 'of:' + o.id;
+  const prev = await env.DB.prepare('SELECT v FROM estado WHERE k = ?').bind(clave).first();
+  const ultimo = prev ? Number(prev.v) : 0;
+  const subs = (await env.DB.prepare('SELECT rowid AS rid, * FROM sub WHERE rowid > ? ORDER BY rowid LIMIT ?').bind(ultimo, MAX_ENVIOS).all()).results;
+  if (!subs.length) return;
+  const zonas = o.zonas || {};
+  let maxRid = ultimo;
+  for (const s of subs) {
+    maxRid = Math.max(maxRid, s.rid);
+    if (Object.keys(zonas).length && !zonas[regionDe(conf, s.lat, s.lon)]) continue;     // no afecta a su región
+    const vig = `Vigente hasta ${o.hasta.slice(8, 10)}/${o.hasta.slice(5, 7)} ${o.hasta.slice(11, 16)}.`;
+    const aviso = { title: '⚠️ Aviso oficial del INAMHI',
+      body: `${o.estatus || 'Advertencia'} · amenaza ${nivelTxt(o.nivel)}: ${String(o.fenomeno || '').toLowerCase()}. ${vig}`,
+      url: o.pagina || sitio + '/', tag: 'oficial-' + o.id };
+    const r = await enviarPush(s, aviso, env);
+    if (r.status === 404 || r.status === 410) await env.DB.prepare('DELETE FROM sub WHERE endpoint = ?').bind(s.endpoint).run();
+  }
+  await env.DB.prepare('INSERT INTO estado (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v').bind(clave, String(maxRid)).run();
+}
+
+// =================== VIGILANCIA: ¿la página y la capa "ahora" se están actualizando? ===================
 async function edadPagina(env) {
   const sitio = (env.SITIO || SITIO).replace(/\/+$/, '');
   try {
     const conf = await (await fetch(`${sitio}/push.json?t=${Date.now()}`, { cf: { cacheTtl: 0 } })).json();
-    const t = Date.parse(conf.generado + ':00-05:00');
-    return { generado: conf.generado, horas: (Date.now() - t) / 36e5 };
+    return { generado: conf.generado, horas: (Date.now() - horaEc(conf.generado)) / 36e5 };
   } catch (e) { return { generado: null, horas: null }; }
+}
+async function relanzar(env, workflow) {
+  if (!env.GH_TOKEN) return false;
+  const r = await fetch(`https://api.github.com/repos/${REPO}/actions/workflows/${workflow}/dispatches`, { method: 'POST',
+    headers: { Authorization: `Bearer ${env.GH_TOKEN}`, Accept: 'application/vnd.github+json', 'User-Agent': 'ClearSky-vigilancia',
+               'X-GitHub-Api-Version': '2022-11-28' }, body: JSON.stringify({ ref: 'main' }) });
+  return r.status === 204;
+}
+async function avisarAdmins(env, titulo, cuerpo, url, tag) {
+  if (!env.VAPID_PRIVATE) return;
+  const admins = (await env.DB.prepare('SELECT * FROM sub WHERE admin = 1').all()).results;
+  for (const s of admins) await enviarPush(s, { title: titulo, body: cuerpo, url, tag }, env).catch(() => {});
+}
+async function puedeVigilar(env, clave, horas) {
+  const ahora = Math.floor(Date.now() / 1000);
+  const ult = await env.DB.prepare('SELECT v FROM estado WHERE k = ?').bind(clave).first().catch(() => null);
+  if (ult && ahora - Number(ult.v) < horas * 3600) return false;                          // como mucho una vez cada N horas
+  await env.DB.prepare('INSERT INTO estado (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v').bind(clave, String(ahora)).run();
+  return true;
 }
 async function vigilar(env) {
   const e = await edadPagina(env);
   if (e.horas != null && e.horas < HORAS_VIEJA) return;
-  const ahora = Math.floor(Date.now() / 1000);
-  const ult = await env.DB.prepare("SELECT v FROM estado WHERE k = 'vigilancia'").first().catch(() => null);
-  if (ult && ahora - Number(ult.v) < HORAS_VIEJA * 3600) return;           // como mucho una vez cada 3 horas
-  await env.DB.prepare("INSERT INTO estado (k, v) VALUES ('vigilancia', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").bind(String(ahora)).run();
-  let relanzado = false;
-  if (env.GH_TOKEN) {
-    const r = await fetch(`https://api.github.com/repos/${REPO}/actions/workflows/${WORKFLOW}/dispatches`, { method: 'POST',
-      headers: { Authorization: `Bearer ${env.GH_TOKEN}`, Accept: 'application/vnd.github+json', 'User-Agent': 'ClearSky-vigilancia',
-                 'X-GitHub-Api-Version': '2022-11-28' }, body: JSON.stringify({ ref: 'main' }) });
-    relanzado = r.status === 204;
-  }
-  if (!env.VAPID_PRIVATE) return;
-  const admins = (await env.DB.prepare('SELECT * FROM sub WHERE admin = 1').all()).results;
+  if (!(await puedeVigilar(env, 'vigilancia', HORAS_VIEJA))) return;
+  const relanzado = await relanzar(env, 'actualizar.yml');
   const cuanto = e.horas == null ? 'no responde' : `lleva ${Math.round(e.horas)} h sin actualizarse`;
-  for (const s of admins) await enviarPush(s, { title: '⚠️ ClearSky ' + cuanto,
-    body: relanzado ? 'Relancé la actualización automáticamente. Revisa GitHub Actions si sigue igual.' : 'Revisa GitHub Actions.',
-    url: `https://github.com/${REPO}/actions`, tag: 'vigilancia' }, env).catch(() => {});
+  await avisarAdmins(env, '⚠️ ClearSky ' + cuanto,
+    relanzado ? 'Relancé la actualización automáticamente. Revisa GitHub Actions si sigue igual.' : 'Revisa GitHub Actions.',
+    `https://github.com/${REPO}/actions`, 'vigilancia');
+}
+async function vigilarAhora(env, ah) {
+  // ahora.json se renueva cada 10 min: si lleva más de 1 h, algo falló (el archivo se lee sin el filtro de "dato viejo")
+  let edad = null;
+  try { const r = await fetch(env.AHORA_URL || AHORA_URL, { cf: { cacheTtl: 0 } }); if (r.ok) edad = (Date.now() - horaEc((await r.json()).generado)) / 36e5; } catch (e) {}
+  if (edad != null && edad < 1) return;
+  if (!(await puedeVigilar(env, 'vigilancia-ahora', HORAS_VIEJA))) return;
+  const relanzado = await relanzar(env, 'ahora.yml');
+  await avisarAdmins(env, '⚠️ ClearSky: la capa "ahora" ' + (edad == null ? 'no responde' : `lleva ${Math.round(edad)} h sin actualizarse`),
+    relanzado ? 'Relancé el workflow ahora.yml automáticamente.' : 'Revisa el workflow ahora.yml en GitHub Actions.',
+    `https://github.com/${REPO}/actions`, 'vigilancia-ahora');
 }
 
 // =================== WEB PUSH (RFC 8291 + VAPID RFC 8292), solo WebCrypto ===================

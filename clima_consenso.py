@@ -3438,6 +3438,238 @@ async function inicio() {
   addEventListener('resize', () => { clearTimeout(rz); rz = setTimeout(() => { if (innerWidth !== ancho && ctx) { ancho = innerWidth; pintarGrafica(); if (mapa) mapa.invalidateSize(); if (mapaSat) mapaSat.invalidateSize(); } }, 200); });
   sugerirInstalar();
 }
+// ---------- v15 capa ahora: AHORA (rayos y lluvia observada) y OFICIAL (INAMHI) ----------
+// Se engancha a render() y pie() sin tocar el resto de la página. Si algo falla aquí, la página sigue igual.
+(function () {
+  const PROVINCIAS = ['esmeraldas', 'manabi', 'santa elena', 'guayas', 'los rios', 'el oro', 'santo domingo', 'carchi', 'imbabura',
+    'pichincha', 'cotopaxi', 'tungurahua', 'bolivar', 'chimborazo', 'canar', 'azuay', 'loja', 'sucumbios', 'orellana', 'napo',
+    'pastaza', 'morona santiago', 'zamora chinchipe', 'galapagos'];
+  const PROV_CIUDAD = {Guayaquil: 'guayas', Quito: 'pichincha', Manta: 'manabi', Salinas: 'santa elena', Esmeraldas: 'esmeraldas',
+    Cuenca: 'azuay', Machala: 'el oro', Portoviejo: 'manabi', 'Santo Domingo': 'santo domingo', Loja: 'loja', Ambato: 'tungurahua',
+    Latacunga: 'cotopaxi', Coca: 'orellana', 'Lago Agrio': 'sucumbios', Macas: 'morona santiago', 'Galápagos': 'galapagos'};
+  const REGION_DE_ZONA = {costa: 'litoral', sierra: 'interandina', oriente: 'amazonia', galapagos: 'insular'};
+  const NOMBRE_REGION = {litoral: 'Litoral', interandina: 'Interandina', amazonia: 'Amazonía', insular: 'Insular'};
+  const RUMBOS = ['norte', 'noreste', 'este', 'sureste', 'sur', 'suroeste', 'oeste', 'noroeste'];
+  const norm = s => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
+  const titulo = s => String(s).split(' ').map(cap).join(' ');
+  const RAW = D.repo ? D.repo.replace('https://github.com/', 'https://raw.githubusercontent.com/') + '/ahora/ahora.json' : null;
+  let AH = null, firma = '';
+  const provCache = {};
+
+  const ahoraMs = () => Date.now() + D.offset * 1000;
+  const msLocal = s => Date.UTC(+s.slice(0, 4), +s.slice(5, 7) - 1, +s.slice(8, 10), +s.slice(11, 13), +s.slice(14, 16));
+  const ahoraMin = () => new Date(ahoraMs()).toISOString().slice(0, 16);
+  const rumbo = (la1, lo1, la2, lo2) => {
+    const R = Math.PI / 180, y = Math.sin((lo2 - lo1) * R) * Math.cos(la2 * R),
+      x = Math.cos(la1 * R) * Math.sin(la2 * R) - Math.sin(la1 * R) * Math.cos(la2 * R) * Math.cos((lo2 - lo1) * R);
+    return RUMBOS[Math.round((((Math.atan2(y, x) / R) + 360) % 360) / 45) % 8];
+  };
+  const zonaDe = v => { const cs = D.ciudades || [], c = cs.find(x => x.nombre === v.ref) || cs.find(x => x.nombre === v.nombre); return c ? c.zona : 'costa'; };
+
+  // ---------- estilos ----------
+  const css = document.createElement('style');
+  css.textContent = `
+.ah-b{margin-top:12px;border-radius:14px;background:var(--card);border:1px solid var(--line);font-size:13.5px;line-height:1.45;color:var(--tx2)}
+.cab .ah-b{grid-column:1/-1}
+.etq{display:inline-flex;align-items:center;gap:6px;font-size:10.5px;font-weight:700;letter-spacing:.7px;text-transform:uppercase;padding:3px 8px;border-radius:999px;white-space:nowrap;flex:none}
+.etq.ahora{background:rgba(34,197,94,.14);color:#4ade80}
+.etq.ahora i{width:6px;height:6px;border-radius:50%;background:#22c55e;animation:ahp 1.6s ease-in-out infinite}
+@keyframes ahp{50%{opacity:.3}}
+.etq.of{background:rgba(245,158,11,.14);color:#fbbf24}
+.etq.pron{background:var(--card2);color:var(--tx3);margin-left:8px;font-weight:600;vertical-align:1px}
+.ah-rayo{display:flex;gap:10px;align-items:center;padding:10px 12px;border-color:rgba(250,204,21,.35);background:linear-gradient(90deg,rgba(250,204,21,.13),transparent 70%),var(--card);color:var(--tx)}
+.ah-rayo b{font-weight:600}
+.ah-of{border-left:4px solid #f59e0b;overflow:hidden}
+.ah-of.n-muyalto{border-left-color:#ef4444}.ah-of.n-alto{border-left-color:#f97316}.ah-of.n-medio{border-left-color:#eab308}
+.ah-sum{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;width:100%;text-align:left;background:none;border:0;padding:11px 12px;cursor:pointer;color:var(--tx);min-height:48px;font:inherit}
+.ah-sum .etq{order:1}
+.ah-sum:after{content:'▾';margin-left:auto;color:var(--tx3);padding-left:6px;order:2}
+.ah-t{order:3;flex:1 1 100%}
+.ah-h3{flex-wrap:wrap;gap:4px 8px;justify-content:flex-start!important}.ah-h3 .sub{margin-left:auto}
+.ah-sum[aria-expanded=true]:after{content:'▴'}
+.ah-t b{display:block;font-size:14px;font-weight:600}
+.ah-t small{display:block;font-size:12.5px;color:var(--tx2);margin-top:2px}
+.ah-d{padding:0 12px 12px}
+.ah-d p{margin:8px 0}.ah-d ul{margin:4px 0 8px;padding-left:18px}
+.ah-d b{color:var(--tx)}
+.ah-hit{background:var(--card2);border-radius:10px;padding:8px 10px;color:var(--tx)}
+.ah-d mark{background:rgba(245,158,11,.28);color:inherit;border-radius:4px;padding:0 2px}
+.ah-d a{color:#93c5fd}
+.ah-ley{font-size:12px;color:var(--tx2);margin-top:8px}
+html[data-tema=claro] .etq.ahora{background:#dcfce7;color:#15803d}
+html[data-tema=claro] .etq.of{background:#fef3c7;color:#92400e}
+html[data-tema=claro] .ah-d a{color:#1d4ed8}
+html[data-tema=claro] .ah-rayo{background:linear-gradient(90deg,rgba(250,204,21,.28),transparent 70%),#fff}
+`;
+  document.head.appendChild(css);
+
+  // ---------- rayos cerca de la persona ----------
+  function rayosCerca(v) {
+    const R = AH && AH.rayos;
+    if (!R || !v || v.lat == null || !R.celdas) return null;
+    if ((ahoraMs() - msLocal(R.t)) / 6e4 > 25) return null;           // dato viejo: no es "ahora"
+    const radio = R.radio_km || 25;
+    let n20 = 0, n30 = 0, cerca = null;
+    for (const [la, lo, a, b] of R.celdas) {
+      const d = km(v.lat, v.lon, la, lo);
+      if (d > radio) continue;
+      n20 += a; n30 += b;
+      if (a > 0 && (!cerca || d < cerca.d)) cerca = {d, la, lo};
+    }
+    return {n20, n30, cerca, radio, t: R.t};
+  }
+  function nivelRayos(n) { return n >= 20 ? 'Actividad eléctrica intensa' : n >= 5 ? 'Tormenta eléctrica activa' : n >= 1 ? 'Actividad eléctrica cercana' : null; }
+
+  // ---------- aviso oficial ----------
+  function provDe(v) {
+    if (estado.vista !== 'ubic') return PROV_CIUDAD[v.nombre] || PROV_CIUDAD[v.ref] || null;
+    const k = 'cc_prov_' + v.lat.toFixed(1) + ',' + v.lon.toFixed(1);
+    if (k in provCache) return provCache[k];
+    const g = leer(k); if (g) return (provCache[k] = g);
+    provCache[k] = null;
+    fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${v.lat.toFixed(3)}&lon=${v.lon.toFixed(3)}&zoom=5&accept-language=es`)
+      .then(r => r.json()).then(j => {
+        const s = norm((j.address && (j.address.state || j.address.county)) || ''), t = PROVINCIAS.find(p => s.includes(p));
+        if (t) { guardar(k, t); provCache[k] = t; montar(); }
+      }).catch(() => {});
+    return null;
+  }
+  const fechaCorta = (iso, hoy) => `${nombreDia(iso.slice(0, 10), hoy).toLowerCase()} ${iso.slice(11, 16)}`;
+  const nivelTxt = n => String(n || '').toLowerCase().replace(/muy alto/, 'muy alta').replace(/\balto\b/, 'alta')
+    .replace(/medio/, 'media').replace(/bajo/, 'baja').replace(/\s*[–-]\s*/, ' a ');
+  function oficialPara(v) {
+    const o = AH && AH.oficial;
+    if (!o || !o.desde || !o.hasta) return null;
+    const ahora = ahoraMin();
+    let estadoO;
+    if (ahora > o.hasta) return null;                                           // vencido
+    if (ahora < o.desde) { if ((msLocal(o.desde) - ahoraMs()) / 36e5 > 24) return null; estadoO = 'proximo'; }
+    else estadoO = 'vigente';
+    const region = REGION_DE_ZONA[zonaDe(v)], zonas = o.zonas || {};
+    if (Object.keys(zonas).length && !zonas[region]) return null;               // no aplica a esta región
+    return {o, estado: estadoO, region, texto: zonas[region] || ''};
+  }
+  function htmlOficial(x, hoy, v) {
+    const {o, estado: st, region, texto} = x, prov = provDe(v), tp = norm(texto);
+    let hit = '', textoHtml = esc(texto);
+    if (prov && tp.includes(prov)) {
+      const i = tp.indexOf(prov), interior = /interior de[^,.]*$/.test(tp.slice(Math.max(0, i - 30), i));
+      const mayor = /mayor intensidad/.test(tp);
+      const cita = interior ? (texto.match(/interior de[^.,]*/i) || [''])[0] : '';
+      hit = `<p class="ah-hit">📍 Tu provincia (<b>${esc(titulo(prov))}</b>) aparece en el aviso${mayor ? ' entre las de mayor intensidad' : ''}.` +
+            `${cita ? ` El boletín dice «${esc(cita)}».` : ''}</p>`;
+      const re = new RegExp(prov.split(' ').join('\\s+'), 'i');
+      textoHtml = esc(texto).replace(re, m => `<mark>${m}</mark>`);
+    }
+    const mm = (o.lluvia_mm || {})[region];
+    const fen = o.fenomeno ? cap(o.fenomeno.toLowerCase()) : '';
+    const sub = `${fen} · ` + (st === 'vigente' ? `vigente hasta ${fechaCorta(o.hasta, hoy)}` : `desde ${fechaCorta(o.desde, hoy)} hasta ${fechaCorta(o.hasta, hoy)}`);
+    const abierto = !!estado.ofAbierto;
+    const detalle = `<div class="ah-d"${abierto ? '' : ' hidden'}>` +
+      `<p><b>Región ${NOMBRE_REGION[region]}:</b> ${textoHtml}</p>${hit}` +
+      (mm && mm.length ? `<p><b>Lluvia esperada por día (mm):</b> ${mm.map(([n, r]) => `${esc(n)} ${esc(r)}`).join(' · ')}</p>` : '') +
+      ((o.que_puede_pasar || []).length ? `<p><b>Qué puede pasar</b></p><ul>${o.que_puede_pasar.map(t => `<li>${esc(t)}</li>`).join('')}</ul>` : '') +
+      (o.recomienda ? `<p>${esc(o.recomienda)}.</p>` : '') +
+      `<p><a href="${esc(o.url)}" target="_blank" rel="noopener">Boletín completo (PDF)</a> · <a href="${esc(o.pagina)}" target="_blank" rel="noopener">Alertas del INAMHI</a>` +
+      `${o.emitido ? ` · emitido ${esc(fechaCorta(o.emitido, hoy))}` : ''}</p></div>`;
+    return `<div class="ah-b ah-of n-${(o.nivel_max || 'medio').replace(' ', '')}" role="region" aria-label="Aviso oficial del INAMHI">` +
+      `<button class="ah-sum" id="ah-sum" aria-expanded="${abierto}"><span class="etq of">Oficial · INAMHI</span>` +
+      `<span class="ah-t"><b>${esc(o.estatus || 'Aviso')} · boletín ${esc(o.id)} · amenaza ${esc(nivelTxt(o.nivel))}</b><small>${esc(sub)}</small></span></button>${detalle}</div>`;
+  }
+
+  // ---------- montar sobre la página ----------
+  function montar() {
+    const v = ctx && ctx.v, cab = document.querySelector('.cab');
+    if (!v || !cab) return;
+    document.querySelectorAll('.ah-b').forEach(e => e.remove());
+    const hoy = ctx.hoy, piezas = [];
+    const ry = rayosCerca(v);
+    if (ry && ry.n20 >= 1) {
+      const chips = document.querySelector('.chips');
+      if (chips) chips.insertAdjacentHTML('afterbegin', `<span class="chip ts">⚡ <b>${ry.n20}</b> ${ry.n20 === 1 ? 'rayo' : 'rayos'} · 20 min</span>`);
+    }
+    if (ry && ry.n20 >= 5) {
+      const donde = ry.cerca ? ` · lo más cercano al ${rumbo(v.lat, v.lon, ry.cerca.la, ry.cerca.lo)}, a ${Math.round(ry.cerca.d)} km` : '';
+      piezas.push(`<div class="ah-b ah-rayo" role="alert"><span class="etq ahora"><i></i>Ahora</span>` +
+        `<span><b>⚡ ${nivelRayos(ry.n20)}</b> · ${ry.n20} rayos en 20 min (${ry.n30} en 30)${esc(donde)}</span></div>`);
+      const tit = document.querySelector('.tit'), sub = document.querySelector('.sub'), ic = document.querySelector('.hero .ic');
+      const lugar = estado.vista === 'ubic' ? 'ti' : v.nombre;
+      if (tit) tit.textContent = `${ry.n20 >= 20 ? 'Tormenta eléctrica intensa' : 'Tormenta eléctrica activa'} cerca de ${lugar}`;
+      if (sub) sub.textContent = `${ry.n20} rayos en los últimos 20 min a menos de ${ry.radio} km. Si oyes truenos, busca refugio bajo techo.`;
+      if (ic) ic.innerHTML = icono('tormenta', 64);
+    }
+    const of = oficialPara(v);
+    if (of) piezas.push(htmlOficial(of, hoy, v));
+    if (piezas.length) cab.insertAdjacentHTML('afterbegin', piezas.join(''));
+    const bt = document.getElementById('ah-sum');
+    if (bt) bt.onclick = () => { estado.ofAbierto = !estado.ofAbierto; bt.setAttribute('aria-expanded', estado.ofAbierto);
+      const d = bt.parentNode.querySelector('.ah-d'); if (d) d.hidden = !estado.ofAbierto; tocar(); };
+    // etiqueta "Pronóstico" para separar lo que ya pasó o está pasando de lo que se espera
+    document.querySelectorAll('#vista .card h3').forEach(h => {
+      if (h.querySelector('.etq.pron')) return;
+      const t = h.textContent.trim();
+      if (/^Próximas 24 horas/.test(t)) h.insertAdjacentHTML('beforeend', '<span class="etq pron">Pronóstico</span>');
+      else if (/^Próximos 7 días/.test(t)) { h.classList.add('ah-h3'); const s = h.querySelector('.sub'); (s ? s : h).insertAdjacentHTML(s ? 'beforebegin' : 'beforeend', '<span class="etq pron">Pronóstico</span>'); }
+    });
+  }
+
+  // ---------- datos: ahora.json (se actualiza cada 10 minutos) ----------
+  function aplicarLluvia() {
+    if (AH && AH.lluvia && (!D.ahora || (D.ahora.t || '') < AH.lluvia.t)) { D.ahora = AH.lluvia; SAT = null; }
+  }
+  async function cargar() {
+    if (!RAW) return;
+    try {
+      const r = await fetch(RAW, {cache: 'no-store'});
+      if (!r.ok) return;
+      const j = await r.json(), f = JSON.stringify([j.generado, j.rayos && j.rayos.t, j.oficial && j.oficial.id, j.lluvia && j.lluvia.t]);
+      if (f === firma) return;
+      firma = f; AH = j; D.rayos = j.rayos; D.oficial = j.oficial;
+      if (ctx && $('#sheet').hidden) render(); else montar();
+    } catch (e) {}
+  }
+
+  // ---------- enganches ----------
+  const _render = render, _pie = pie;
+  render = function () { try { aplicarLluvia(); } catch (e) {} _render(); try { montar(); } catch (e) { console.error('ahora', e); } };
+  const FUENTES = '<b>Fuentes oficiales:</b> <a href="https://servicios.inamhi.gob.ec/alertas/" target="_blank" rel="noopener">INAMHI</a> · ' +
+    '<a href="https://alertasecuador.gob.ec/" target="_blank" rel="noopener">Alertas Ecuador</a> (Gestión de Riesgos) · ' +
+    '<a href="https://www.inocar.mil.ec/web/index.php/productos/tabla-mareas" target="_blank" rel="noopener">INOCAR (mareas)</a> · ' +
+    'Emergencias: <b>911</b>. ClearSky es informativo: ante una emergencia sigue siempre a las autoridades.<br>';
+  pie = function () {
+    _pie();
+    try {
+      const p = $('#pie'); if (!p) return;
+      p.innerHTML = p.innerHTML.replace(/Para emergencias sigue siempre[^<]*(?:<br\s*\/?>)?/, FUENTES)
+        .replace('Satélite y lluvia observada: NOAA (GOES, Enterprise Rain Rate)', 'Satélite, lluvia observada y rayos: NOAA (GOES-19, Enterprise Rain Rate, GLM)');
+    } catch (e) {}
+  };
+
+  // rayos sobre el mapa de lluvia
+  setInterval(() => {
+    try {
+      const R = AH && AH.rayos;
+      if (typeof mapa === 'undefined' || !mapa || !window.L || !R || !R.celdas) return;
+      if (mapa._ahR === R) return;
+      if (mapa._ahCapa) mapa.removeLayer(mapa._ahCapa);
+      const g = L.layerGroup();
+      for (const [la, lo, a, b] of R.celdas) {
+        if (!b) continue;
+        L.circleMarker([la, lo], {radius: Math.min(9, 3 + Math.sqrt(b)), color: '#fde047', weight: 1, fillColor: a ? '#facc15' : '#a16207', fillOpacity: a ? 0.9 : 0.55})
+          .bindTooltip(`⚡ ${a} en 20 min · ${b} en 30 min`).addTo(g);
+      }
+      g.addTo(mapa); mapa._ahCapa = g; mapa._ahR = R;
+      const ley = document.querySelector('#panel-mapa .mapley');
+      if (ley && !document.querySelector('.ah-ley')) ley.insertAdjacentHTML('afterend', '<div class="ah-ley">⚡ Rayos de los últimos 30 min (más brillantes: últimos 20). GOES-19 GLM.</div>');
+    } catch (e) {}
+  }, 1500);
+
+  cargar();
+  setInterval(cargar, 5 * 60 * 1000);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') cargar(); });
+})();
+
 inicio().catch(e => { console.error(e); $('#vista').innerHTML = '<div class="vacio">No pudimos mostrar el pronóstico. Vuelve a cargar la página.</div>'; });
 """
 
