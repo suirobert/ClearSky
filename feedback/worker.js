@@ -1,8 +1,11 @@
 // Required Notice: Copyright (c) 2026 Robert Alejandro Figueroa Pazmiño (https://github.com/suirobert/ClearSky)
 // Licencia: PolyForm Noncommercial 1.0.0 (ver el archivo LICENSE). Uso no comercial.
-// ClearSky · servicio de reportes, avisos y vigilancia (Cloudflare Workers + D1, plan gratuito) · v19
-// POST /reporte     {lat, lon, tipo}            -> guarda un reporte (máx. 1 cada 30 min por persona y zona)
-// GET  /resumen?lat=&lon=                       -> reportes de la última hora a ~10 km (público)
+// ClearSky · servicio de reportes, avisos y vigilancia (Cloudflare Workers + D1, plan gratuito) · v20
+// POST /reporte     {lat, lon, tipo}            -> guarda un reporte. Tipos de clima (1 cada 30 min por persona y zona), "truenos" y "inundado"
+//                                                  (1 cada 10 min por persona y zona; cada categoría tiene su propio límite)
+// GET  /resumen?lat=&lon=                       -> reportes de CLIMA de la última hora a ~10 km (público). No cuenta truenos ni inundación.
+// GET  /alertas?lat=&lon=                       -> truenos (30 min, 10 km) e inundación (3 h, 2 km) reportados por la gente. Solo cuentan
+//                                                  cuando coinciden al menos 2 PERSONAS distintas (3 reportes si todavía no existe la columna "h").
 // GET  /export?despues=<id>                     -> reportes nuevos para el script (requiere TOKEN)
 // GET  /vapid                                   -> clave pública para los avisos
 // POST /suscribir   {sub, lat, lon, nombre, prefs?, admin?} -> activa avisos. prefs: 1 = lluvia, 2 = tormentas, 4 = oficiales
@@ -17,7 +20,13 @@
 //   OFICIAL  (4): un boletín del INAMHI que afecta su región (desde 3 h antes de su inicio y mientras esté vigente). Una vez por boletín.
 //   VIGILANCIA: si la página o la capa "ahora" llevan horas sin actualizarse, relanza el workflow de GitHub (si hay GH_TOKEN)
 //                 y avisa a los suscriptores administradores.
-const TIPOS = ['soleado', 'despejado', 'nublado', 'llovizna', 'lluvia', 'lluvia_fuerte', 'tormenta'];
+const CLIMA = ['soleado', 'despejado', 'nublado', 'llovizna', 'lluvia', 'lluvia_fuerte', 'tormenta'];
+const EXTRA = ['truenos', 'inundado'];                    // no cuentan como lluvia ni como seco
+const TIPOS = [...CLIMA, ...EXTRA];
+const LIMITE_S = { clima: 1800, truenos: 600, inundado: 600 };            // segundos entre reportes de la misma categoría
+const VENTANA_S = { truenos: 1800, inundado: 3 * 3600 };                  // cuánto dura cada tipo de aviso
+const RADIO_KM = { truenos: 10, inundado: 2 };
+const MIN_PERSONAS = 2, MIN_REPORTES_SIN_H = 3;           // sin la columna "h" no se pueden distinguir personas: se exige más
 const SITIO = 'https://suirobert.github.io/ClearSky';
 const AHORA_URL = 'https://raw.githubusercontent.com/suirobert/ClearSky/ahora/ahora.json';
 const REPO = 'suirobert/ClearSky';
@@ -29,6 +38,7 @@ const esCronAhora = (c) => /^\*\/10\s/.test(String(c || '').trim());      // cro
 const enEcuador = (lat, lon) => lat >= -6 && lat <= 2.5 && lon >= -92.5 && lon <= -75;
 const REGION_DE_ZONA = { costa: 'litoral', sierra: 'interandina', oriente: 'amazonia', galapagos: 'insular' };
 const pref = (s) => (s.pref == null ? 7 : s.pref);
+const SIN_COLUMNA = /no such column|no column named|has no column/i;
 
 export default {
   async fetch(req, env) {
@@ -56,14 +66,27 @@ export default {
         if (!TIPOS.includes(tipo)) return json({ error: 'datos' }, 400);
         if (!enEcuador(lat, lon)) return json({ error: 'fuera' }, 400);
         const ip = req.headers.get('CF-Connecting-IP') || '';
-        const h = await sha(`${ip}|${env.SAL}|${lat.toFixed(1)},${lon.toFixed(1)}`);   // irreversible, sin IP
+        const cat = EXTRA.includes(tipo) ? tipo : 'clima';                                 // cada categoría tiene su propio límite
+        const h = await sha(`${ip}|${env.SAL}|${lat.toFixed(1)},${lon.toFixed(1)}` + (cat === 'clima' ? '' : '|' + cat));   // irreversible, sin IP
         const prev = await env.DB.prepare('SELECT ts FROM lim WHERE h = ?').bind(h).first();
-        if (prev && ahora - prev.ts < 1800) return json({ error: 'espera' }, 429);
-        await env.DB.batch([
-          env.DB.prepare('INSERT INTO rep (ts, lat, lon, tipo) VALUES (?, ?, ?, ?)').bind(ahora, lat, lon, tipo),
+        if (prev && ahora - prev.ts < LIMITE_S[cat]) return json({ error: 'espera' }, 429);
+        // código irreversible de la persona (no de la zona): sirve para contar PERSONAS distintas en truenos e inundación.
+        // Solo se guarda en esos dos tipos y se borra a las 24 h. Nunca sale del servicio (/export no lo incluye).
+        const persona = cat === 'clima' ? null : (await sha(`${ip}|${env.SAL}|persona`)).slice(0, 16);
+        const comunes = [
           env.DB.prepare('INSERT INTO lim (h, ts) VALUES (?, ?) ON CONFLICT(h) DO UPDATE SET ts = excluded.ts').bind(h, ahora),
           env.DB.prepare('DELETE FROM lim WHERE ts < ?').bind(ahora - 172800),            // se borra a las 48 h
-        ]);
+        ];
+        try {
+          await env.DB.batch([
+            env.DB.prepare('INSERT INTO rep (ts, lat, lon, tipo, h) VALUES (?, ?, ?, ?, ?)').bind(ahora, lat, lon, tipo, persona),
+            env.DB.prepare('UPDATE rep SET h = NULL WHERE h IS NOT NULL AND ts < ?').bind(ahora - 86400),
+            ...comunes,
+          ]);
+        } catch (e) {
+          if (!SIN_COLUMNA.test(String((e && e.message) || e))) throw e;                  // todavía no se ejecutó el ALTER TABLE rep ADD COLUMN h
+          await env.DB.batch([env.DB.prepare('INSERT INTO rep (ts, lat, lon, tipo) VALUES (?, ?, ?, ?)').bind(ahora, lat, lon, tipo), ...comunes]);
+        }
         return json({ ok: true });
       }
 
@@ -71,6 +94,12 @@ export default {
         const lat = Number(url.searchParams.get('lat')), lon = Number(url.searchParams.get('lon'));
         if (!isFinite(lat) || !isFinite(lon)) return json({ error: 'datos' }, 400);
         return json(await resumen(env, lat, lon, ahora), 200, { 'Cache-Control': 'public, max-age=60' });
+      }
+
+      if (url.pathname === '/alertas' && req.method === 'GET') {
+        const lat = Number(url.searchParams.get('lat')), lon = Number(url.searchParams.get('lon'));
+        if (!isFinite(lat) || !isFinite(lon) || !enEcuador(lat, lon)) return json({ error: 'datos' }, 400);
+        return json(await alertasGente(env, lat, lon, ahora), 200, { 'Cache-Control': 'public, max-age=60' });
       }
 
       if (url.pathname === '/export' && req.method === 'GET') {
@@ -107,7 +136,7 @@ export default {
         const admin = b.admin != null && env.TOKEN && String(b.admin) === env.TOKEN ? 1 : 0;
         if (b.admin != null && !admin) return json({ error: 'clave de administrador incorrecta' }, 403);
         const nombre = String((b && b.nombre) || 'tu zona').slice(0, 60);
-        const prefs = Math.max(1, Math.min(7, parseInt(b.prefs, 10) || 7));
+        const pp = parseInt(b.prefs, 10), prefs = pp >= 1 && pp <= 7 ? pp : 7;
         try {
           await env.DB.prepare(
             'INSERT INTO sub (endpoint, p256dh, auth, lat, lon, nombre, creado, aviso, admin, pref) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?) ' +
@@ -154,11 +183,51 @@ export default {
 
 async function resumen(env, lat, lon, ahora) {
   const r = await env.DB.prepare(
-    'SELECT tipo, COUNT(*) AS n FROM rep WHERE ts > ? AND lat BETWEEN ? AND ? AND lon BETWEEN ? AND ? GROUP BY tipo'
+    "SELECT tipo, COUNT(*) AS n FROM rep WHERE ts > ? AND lat BETWEEN ? AND ? AND lon BETWEEN ? AND ? AND tipo NOT IN ('truenos', 'inundado') GROUP BY tipo"
   ).bind(ahora - 3600, lat - 0.1, lat + 0.1, lon - 0.1, lon + 0.1).all();
   const o = { total: 0 };
   for (const x of r.results) { o[x.tipo] = x.n; o.total += x.n; }
   return o;
+}
+
+// =================== TRUENOS E INUNDACIÓN REPORTADOS POR LA GENTE ===================
+// Un solo reporte NO se muestra: hacen falta al menos MIN_PERSONAS personas distintas cerca (y recientes). Todo es "no verificado".
+async function filasExtra(env, tipo, lat, lon, ahora, caja, limite) {
+  const args = [tipo, ahora - VENTANA_S[tipo], lat - caja, lat + caja, lon - caja, lon + caja, limite];
+  let conH = true, r;
+  try {
+    r = await env.DB.prepare('SELECT lat, lon, ts, h FROM rep WHERE tipo = ? AND ts > ? AND lat BETWEEN ? AND ? AND lon BETWEEN ? AND ? ORDER BY ts DESC LIMIT ?').bind(...args).all();
+  } catch (e) {
+    if (!SIN_COLUMNA.test(String((e && e.message) || e))) throw e;
+    conH = false;
+    r = await env.DB.prepare('SELECT lat, lon, ts FROM rep WHERE tipo = ? AND ts > ? AND lat BETWEEN ? AND ? AND lon BETWEEN ? AND ? ORDER BY ts DESC LIMIT ?').bind(...args).all();
+  }
+  return { filas: r.results || [], conH };
+}
+function resumenCerca(filas, conH, lat, lon, radio) {
+  const cerca = filas.filter(f => km(lat, lon, f.lat, f.lon) <= radio);
+  const personas = conH ? new Set(cerca.map(f => f.h).filter(Boolean)).size + cerca.filter(f => !f.h).length : null;   // un reporte sin código cuenta como persona aparte
+  const n = cerca.length;
+  const ok = personas != null ? personas >= MIN_PERSONAS : n >= MIN_REPORTES_SIN_H;
+  return { n, personas, ok, ts: cerca.reduce((m, f) => Math.max(m, f.ts), 0) || null };
+}
+async function alertasGente(env, lat, lon, ahora) {
+  const tr = await filasExtra(env, 'truenos', lat, lon, ahora, 0.12, 300);
+  const inu = await filasExtra(env, 'inundado', lat, lon, ahora, 0.3, 400);
+  const truenos = resumenCerca(tr.filas, tr.conH, lat, lon, RADIO_KM.truenos);
+  const inundado = resumenCerca(inu.filas.filter(f => Math.abs(f.lat - lat) <= 0.05 && Math.abs(f.lon - lon) <= 0.05), inu.conH, lat, lon, RADIO_KM.inundado);
+  // puntos para el mapa: cada reporte cuyo vecindario de 2 km reúne a suficientes personas; se juntan los que están a menos de 1 km
+  const puntos = [];
+  for (const f of inu.filas) {
+    const vec = inu.filas.filter(g => km(f.lat, f.lon, g.lat, g.lon) <= RADIO_KM.inundado);
+    const r = resumenCerca(vec, inu.conH, f.lat, f.lon, RADIO_KM.inundado);
+    if (!r.ok) continue;
+    const previo = puntos.findIndex(p => km(p.lat, p.lon, f.lat, f.lon) < 1);
+    const p = { lat: f.lat, lon: f.lon, personas: r.personas, n: r.n, ts: r.ts };
+    if (previo < 0) puntos.push(p); else if ((p.personas ?? p.n) > (puntos[previo].personas ?? puntos[previo].n)) puntos[previo] = p;
+  }
+  return { truenos, inundado, puntos: puntos.slice(0, 40), minimo: { personas: MIN_PERSONAS, sin_codigo: MIN_REPORTES_SIN_H },
+           vigencia_min: { truenos: VENTANA_S.truenos / 60, inundado: VENTANA_S.inundado / 60 }, radio_km: RADIO_KM, codigo_persona: tr.conH && inu.conH };
 }
 
 // =================== LA CAPA "AHORA" (ahora.json, cada 10 min desde GitHub Actions) ===================

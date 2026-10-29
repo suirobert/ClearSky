@@ -1,0 +1,81 @@
+name: Pruebas
+
+# Corre las pruebas cada vez que cambia el código (los commits del bot que guardan datos no cuentan) y una vez por semana,
+# para detectar cambios en las librerías o en GitHub que rompan algo sin que nadie haya tocado el código.
+# Si algo falla, GitHub te avisa por correo y el commit aparece con una ✗ roja.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "clima_consenso.py"
+      - "ahora.py"
+      - "feedback/**"
+      - "tests/**"
+      - ".github/workflows/pruebas.yml"
+  pull_request:
+    paths:
+      - "clima_consenso.py"
+      - "ahora.py"
+      - "feedback/**"
+      - "tests/**"
+      - ".github/workflows/pruebas.yml"
+  schedule:
+    - cron: "17 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pruebas-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rapidas:
+    name: Rápidas (Python y servicio de Cloudflare)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Instalar dependencias
+        run: python -m pip install --quiet -r tests/requirements.txt
+
+      - name: Python (compilación, funciones y reglas)
+        run: python -m pytest tests/rapidas -q
+
+      - name: Servicio de Cloudflare (reportes, avisos, cifrado)
+        run: node --test
+
+  completas:
+    name: Completas (script entero y navegador)
+    needs: rapidas
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Instalar dependencias
+        run: python -m pip install --quiet -r tests/requirements.txt
+
+      - name: Instalar el navegador de las pruebas
+        run: python -m playwright install --with-deps chromium
+
+      - name: Script completo con datos simulados y página en un navegador
+        run: python -m pytest tests/completas -q

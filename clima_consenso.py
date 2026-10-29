@@ -24,6 +24,7 @@ Página (index.html, generada aquí y dibujada con JavaScript):
   - Tormentas verificadas con los rayos del satélite (GLM) y ciudades sin aeropuerto verificadas con la lluvia
     satelital, ambas solo cuando hay suficientes días acumulados y pasan el examen (datos/observado/).
   - Tablero público de aciertos día por día (tarjeta "Cómo nos fue esta semana") y selector de rango 24 h / 3 días / 7 días.
+  - Reportes de la gente de truenos e inundación: solo se muestran si coinciden 2 o más personas cerca (siempre "no verificado").
   - "Lluvia en camino" con verificación propia (ahora.py): solo se muestra como verificada si acierta; mapa que se reproduce solo.
   - Calor: sensación térmica (índice de calor NOAA), alerta desde 32° y onda de calor frente a lo normal
     de los últimos 30 días; humedad, viento y UV por hora. Botón para instalar como app.
@@ -138,6 +139,7 @@ ARCHIVO_ERR   = os.path.join(DATOS, "errores.log")
 FEEDBACK_URL  = (os.environ.get("CC_FEEDBACK_URL") or "").strip().rstrip("/")
 FEEDBACK_TOKEN = (os.environ.get("CC_FEEDBACK_TOKEN") or "").strip()   # para descargar los reportes
 TIPOS_REPORTE = {"soleado": 0, "despejado": 0, "nublado": 0, "llovizna": 0, "lluvia": 1, "lluvia_fuerte": 1, "tormenta": 1}  # 1 = llueve
+TIPOS_EXTRA = ("truenos", "inundado")   # se archivan, pero NO cuentan como lluvia ni como seco al comparar con el pronóstico
 RADIO_REPORTES_KM = 30
 MIN_REPORTES  = 30           # reportes comparables necesarios para mostrar resultados
 REPO_URL      = "https://github.com/suirobert/ClearSky"
@@ -1504,7 +1506,7 @@ def descargar_reportes():
             break
         por_mes = {}
         for f in filas:
-            if f.get("tipo") in TIPOS_REPORTE:
+            if f.get("tipo") in TIPOS_REPORTE or f.get("tipo") in TIPOS_EXTRA:
                 ts = int(f["ts"])
                 por_mes.setdefault(hora_local_ts(ts).strftime("%Y-%m"), []).append(
                     [ts, round(round(float(f["lat"]) * 20) / 20, 2), round(round(float(f["lon"]) * 20) / 20, 2), f["tipo"]])
@@ -1540,7 +1542,7 @@ def leer_reportes(dias):
 def verificar_reportes(ciudad, reportes):
     """Compara lo que publicó la página (24 h antes) con lo que reportó la gente cerca de la ciudad."""
     o = CIUDADES[ciudad]
-    cerca = [r for r in reportes if distancia_km(o["lat"], o["lon"], r[1], r[2]) <= RADIO_REPORTES_KM]
+    cerca = [r for r in reportes if r[3] in TIPOS_REPORTE and distancia_km(o["lat"], o["lon"], r[1], r[2]) <= RADIO_REPORTES_KM]
     pub = leer_pronosticos_publicados(ciudad)
     pares = []
     for ts, _, _, tipo in cerca:
@@ -2560,6 +2562,18 @@ html[data-tema=claro] .chip.uv-e{background:#f3e8ff;color:#6b21a8}html[data-tema
 .lq{flex:none;width:40px;height:40px;border:0;background:none;color:var(--tx3);font-size:15px;cursor:pointer;border-radius:50%}
 .lq:active,.lq:hover{background:var(--card2)}
 .lgrd{margin:8px 4px 2px;width:calc(100% - 8px)}
+/* ---------- v20: truenos e inundación reportados por la gente ---------- */
+.fbh{margin:16px 4px 6px;font-size:12px;color:var(--tx3);text-transform:uppercase;letter-spacing:.6px;font-weight:600}
+.fbx{grid-template-columns:repeat(2,minmax(0,1fr))}
+.rep-b{display:flex;flex-direction:column;gap:6px;align-items:flex-start;margin-top:12px;border-radius:14px;padding:10px 12px;border:1px solid var(--line);background:var(--card);color:var(--tx);font-size:13.5px;line-height:1.45}
+.rep-b small{display:block;font-size:11.5px;color:var(--tx2);margin-top:2px}
+.rep-inund{border-left:4px solid #0ea5e9;background:linear-gradient(90deg,rgba(14,165,233,.13),transparent 70%),var(--card)}
+.etq.rep{background:rgba(14,165,233,.14);color:#38bdf8}
+.chip.tru{background:#3b1f3f;color:#f5d0fe}.chip.tru b{color:#fff}
+.rep-ley{font-size:12px;color:var(--tx2);margin-top:8px}
+html[data-tema=claro] .etq.rep{background:#e0f2fe;color:#075985}
+html[data-tema=claro] .rep-inund{background:linear-gradient(90deg,rgba(14,165,233,.2),transparent 70%),#fff}
+html[data-tema=claro] .chip.tru{background:#fae8ff;color:#86198f}html[data-tema=claro] .chip.tru b{color:#701a75}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 """
 
@@ -3272,6 +3286,7 @@ function activarMapa(v) {
     sl.addEventListener('input', () => { detener(true); mostrar(+sl.value); });          // tocar la barra pausa la animación
     play.onclick = () => { if (tm) detener(true); else { manual = false; arrancar(); } };
     mapa = map;
+    pintarInundaciones(map);
     mapaAnim = {pausar: () => detener(false), reanudar: () => { if (!manual && !reducido) arrancar(); }};
     const cambiarModo = m => {
       detener(false); manual = false; modo = m;
@@ -3378,13 +3393,18 @@ function activarSatelite(v) {
 
 // ---------- reportes de usuarios ----------
 const TIPOS_REP = [['soleado', '☀️', 'Soleado'], ['despejado', '🔆', 'Despejado'], ['nublado', '☁️', 'Nublado'], ['llovizna', '🌦️', 'Llovizna'],
-                   ['lluvia', '🌧️', 'Lluvia'], ['lluvia_fuerte', '🌊', 'Aguacero'], ['tormenta', '⛈️', 'Tormenta']];
+                   ['lluvia', '🌧️', 'Lluvia'], ['lluvia_fuerte', '☔', 'Aguacero'], ['tormenta', '⛈️', 'Tormenta']];
+const TIPOS_EXTRA = [['truenos', '🔊', 'Escucho truenos'], ['inundado', '🌊', 'Calle inundada']];
 const NOMBRE_REP = Object.fromEntries(TIPOS_REP.map(([t, , n]) => [t, n.toLowerCase()]));
 function htmlFeedback() {
+  const noche = esNoche(ahoraISO(D.offset));
+  const btn = ([t, e, n]) => `<button data-t="${t}"><span class="fbe" aria-hidden="true">${t === 'despejado' && noche ? '🌙' : e}</span>${n}</button>`;
   return `<div class="grab"></div><h2>¿Cómo está el clima donde estás?</h2><div class="fbb">` +
-    TIPOS_REP.filter(([t]) => !(t === 'soleado' && esNoche(ahoraISO(D.offset)))).map(([t, e, n]) => `<button data-t="${t}"><span class="fbe" aria-hidden="true">${t === 'despejado' && esNoche(ahoraISO(D.offset)) ? '🌙' : e}</span>${n}</button>`).join('') +
-    `</div><div class="fbres" id="fbres" aria-live="polite"></div><div class="fbres" id="fbsum"></div><p class="nota">Tu reporte nos ayuda a comprobar el pronóstico en tu barrio. ` +
-    `Solo guardamos la hora, lo que reportas y tu ubicación aproximada; nunca datos personales.</p>`;
+    TIPOS_REP.filter(([t]) => !(t === 'soleado' && noche)).map(btn).join('') +
+    `</div><h3 class="fbh">¿Algo más?</h3><div class="fbb fbx">${TIPOS_EXTRA.map(btn).join('')}</div>` +
+    `<div class="fbres" id="fbres" aria-live="polite"></div><div class="fbres" id="fbsum"></div><p class="nota">Tu reporte nos ayuda a comprobar el pronóstico en tu barrio. ` +
+    `Solo guardamos la hora, lo que reportas y tu ubicación aproximada; nunca datos personales. ` +
+    `Los truenos y las inundaciones solo se muestran cuando coinciden al menos 2 personas cerca, y siempre como «no verificado».</p>`;
 }
 function abrirReporte() { abrirHoja(htmlFeedback(), 'Reportar el clima', () => { activarFeedback(); resumenFeedback(); }); }
 const enEcuador = p => p && p.lat >= -6 && p.lat <= 2.5 && p.lon >= -92.5 && p.lon <= -75;
@@ -3400,6 +3420,7 @@ function obtenerPos(forzar) {
 async function resumenFeedback() {
   const box = $('#fbsum'), v = ctx && ctx.v; if (!D.feedback_url || !v) return;
   const clave = claveRep(v);
+  if (await cargarAlertasRep(v) && ctx && ctx.v === v) { render(); return; }
   try {
     let j;
     if (estado.rep && estado.rep.clave === clave && Date.now() - estado.rep.t < 5 * 60 * 1000) j = estado.rep.j;
@@ -3418,27 +3439,83 @@ async function resumenFeedback() {
       }
   } catch (e) {}
 }
+// cada categoría tiene su propio tiempo de espera (el servicio aplica los mismos): clima 30 min; truenos e inundación 10 min
+const CAT_REP = t => t === 'truenos' || t === 'inundado' ? t : 'clima';
+const CLAVE_FB = {clima: 'cc_fb_ts', truenos: 'cc_fb_ts_truenos', inundado: 'cc_fb_ts_inundado'}, ESPERA_FB = {clima: 30, truenos: 10, inundado: 10};
+const GRACIAS_FB = {
+  truenos: '¡Gracias! Si otra persona cerca también oye truenos, lo mostraremos como aviso (siempre como no verificado).',
+  inundado: '¡Gracias! Para que se muestre, otra persona cerca debe confirmarlo: así evitamos falsas alarmas. Si hay peligro, llama al 911.'};
 function activarFeedback() {
   $$('.fbb button').forEach(b => b.addEventListener('click', async () => {
-    const box = $('#fbres'), ult = +(leer('cc_fb_ts') || 0);
-    if (Date.now() - ult < 30 * 60 * 1000) { box.textContent = 'Ya registramos tu reporte hace poco. ¡Gracias! Puedes volver a reportar en 30 minutos.'; return; }
+    const t = b.dataset.t, cat = CAT_REP(t), box = $('#fbres'), ult = +(leer(CLAVE_FB[cat]) || 0), espera = ESPERA_FB[cat];
+    if (Date.now() - ult < espera * 60 * 1000) { box.textContent = `Ya registramos tu reporte hace poco. ¡Gracias! Puedes volver a reportar ${cat === 'clima' ? 'el clima' : t === 'truenos' ? 'truenos' : 'una inundación'} en ${espera} minutos.`; return; }
     box.textContent = 'Obteniendo tu ubicación aproximada…';
     let pos; try { pos = await obtenerPos(); } catch (e) { box.textContent = 'Para reportar necesitamos tu ubicación. Revisa el permiso del navegador.'; return; }
     if (!enEcuador(pos)) { box.textContent = TXT_FUERA; return; }
     $$('.fbb button').forEach(x => x.disabled = true);
     try {
-      const enviarRep = t => fetch(`${D.feedback_url}/reporte`, {method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({lat: +pos.lat.toFixed(2), lon: +pos.lon.toFixed(2), tipo: t})});
-      let r = await enviarRep(b.dataset.t);
-      if (r.status === 400 && b.dataset.t === 'despejado') { const e = await r.clone().json().catch(() => ({})); if (e.error === 'datos') r = await enviarRep('soleado'); }
+      const enviarRep = tt => fetch(`${D.feedback_url}/reporte`, {method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({lat: +pos.lat.toFixed(2), lon: +pos.lon.toFixed(2), tipo: tt})});
+      let r = await enviarRep(t);
+      if (r.status === 400 && t === 'despejado') { const e = await r.clone().json().catch(() => ({})); if (e.error === 'datos') r = await enviarRep('soleado'); }
+      if (r.status === 400 && cat !== 'clima') { const e = await r.clone().json().catch(() => ({}));            // servicio sin actualizar: no se guarda como otra cosa
+        if (e.error === 'datos') { box.textContent = 'Este tipo de reporte todavía no está disponible. Inténtalo más tarde.'; return; } }
       if (r.status === 429) box.textContent = 'Ya registramos tu reporte hace poco. ¡Gracias!';
       else if (r.status === 400) box.textContent = TXT_FUERA;
       else if (!r.ok) throw new Error(r.status);
-      else { box.textContent = `¡Gracias! Registramos «${NOMBRE_REP[b.dataset.t]}» en tu zona.`; guardar('cc_fb_ts', Date.now());
-             $$('.fbb button').forEach(x => x.classList.toggle('elegido', x === b)); tocar(); resumenFeedback(); }
+      else {
+        box.textContent = GRACIAS_FB[t] || `¡Gracias! Registramos «${NOMBRE_REP[t]}» en tu zona.`; guardar(CLAVE_FB[cat], Date.now());
+        b.parentNode.querySelectorAll('button').forEach(x => x.classList.toggle('elegido', x === b)); tocar();
+        resumenFeedback();
+        if (cat !== 'clima' && ctx) cargarAlertasRep(ctx.v, true).then(cambio => { if (cambio && ctx) render(); });
+      }
     } catch (e) { box.textContent = 'No pudimos enviar tu reporte. Inténtalo más tarde.'; }
     finally { $$('.fbb button').forEach(x => x.disabled = false); }
   }));
+}
+
+// ---------- lo que reporta la gente: truenos e inundación (solo se muestran si coinciden varias personas) ----------
+const minutosDesde = ts => Math.max(0, Math.round((Date.now() / 1000 - ts) / 60));
+const haceMin = m => m < 2 ? 'hace un momento' : m < 90 ? `hace ${m} min` : `hace ${Math.round(m / 60)} h`;
+function repGente(v) {
+  const a = estado.ar, j = a && a.j && v && v.lat != null && a.clave === claveRep(v) && enEcuador(v) ? a.j : null;
+  if (!j) return {};
+  const vig = j.vigencia_min || {truenos: 30, inundado: 180}, vivo = (x, m) => x && x.ok && x.ts && minutosDesde(x.ts) <= m ? x : null;
+  return {truenos: vivo(j.truenos, vig.truenos), inundado: vivo(j.inundado, vig.inundado),
+          puntos: (j.puntos || []).filter(p => minutosDesde(p.ts) <= vig.inundado), vig};
+}
+async function cargarAlertasRep(v, forzar) {              // devuelve true si cambió lo que hay que mostrar
+  if (!D.feedback_url || !v || v.lat == null || !enEcuador(v)) return false;
+  const clave = claveRep(v);
+  if (!forzar && estado.ar && estado.ar.clave === clave && Date.now() - estado.ar.t < 3 * 60 * 1000) return false;
+  const antes = JSON.stringify(repGente(v));
+  try {
+    const r = await fetch(`${D.feedback_url}/alertas?lat=${v.lat.toFixed(2)}&lon=${v.lon.toFixed(2)}`);
+    if (!r.ok) throw new Error(r.status);
+    estado.ar = {clave, j: await r.json(), t: Date.now()};
+  } catch (e) { estado.ar = {clave, j: null, t: Date.now()}; }
+  return JSON.stringify(repGente(v)) !== antes;
+}
+function htmlRepGente(v) {
+  const g = repGente(v), quien = x => x.personas != null ? `${x.personas} personas` : `${x.n} reportes`;
+  if (!g.inundado) return '';
+  const donde = estado.vista === 'ubic' ? ' de ti' : ' de ' + esc(v.nombre);
+  return `<div class="rep-b rep-inund" role="alert"><span class="etq rep">Reportado por usuarios</span><span><b>🌊 Reportan calles inundadas cerca${donde}</b> · ${quien(g.inundado)}, el último ${haceMin(minutosDesde(g.inundado.ts))}` +
+    `<small>No está verificado por las autoridades. No cruces calles inundadas: el agua puede ser más profunda y fuerte de lo que parece. Emergencias: 911.</small></span></div>`;
+}
+function chipTruenos(v) {
+  const t = repGente(v).truenos; if (!t) return '';
+  return `<span class="chip tru" title="Reportado por usuarios, no verificado">🔊 Escuchan truenos cerca · <b>${t.personas != null ? t.personas + ' personas' : t.n + ' reportes'}</b></span>`;
+}
+function pintarInundaciones(map) {                        // marcas en el mapa: solo donde coinciden varias personas
+  const pts = (repGente(ctx.v).puntos || []);
+  if (!pts.length || !window.L) return;
+  const g = L.layerGroup();
+  for (const p of pts) L.circleMarker([p.lat, p.lon], {radius: 9, color: '#fff', weight: 2, fillColor: '#0ea5e9', fillOpacity: .95})
+    .bindTooltip(`🌊 ${p.personas != null ? p.personas + ' personas' : p.n + ' reportes'} reportan inundación · ${haceMin(minutosDesde(p.ts))} · no verificado`).addTo(g);
+  g.addTo(map);
+  const ley = document.querySelector('#panel-mapa .mapley');
+  if (ley && !document.querySelector('.rep-ley')) ley.insertAdjacentHTML('afterend', '<div class="rep-ley">🌊 Reportes de inundación de la gente (últimas 3 h, no verificados)</div>');
 }
 
 // ---------- mi ubicación (la vista principal) ----------
@@ -3658,8 +3735,9 @@ function pintarGrafica() {
   const {ahora, hoy, dias, prox} = ctx;
   const rg = estado.rango || leer('cc_rango') || '72', NR = +rg || 72;
   const filasG = estado.dia ? dias[estado.dia] : prox.slice(0, NR);
-  $('#titg').textContent = estado.dia ? `Hora por hora · ${nombreDia(estado.dia, hoy)}` : `Hora por hora · ${rg === '24' ? '24 horas' : rg === '168' ? '7 días' : '3 días'}`;
-  $('#todo').hidden = !estado.dia;
+  // el título solo aparece cuando eliges un día concreto; si no, los botones 24 h / 3 días / 7 días ya dicen qué estás viendo
+  $('#titg').textContent = estado.dia ? `${nombreDia(estado.dia, hoy)} · hora por hora` : '';
+  $('#gtit').hidden = !estado.dia;
   const rs = $('#rsel'); rs.hidden = !!estado.dia;
   rs.innerHTML = [['24', '24 h'], ['72', '3 días'], ['168', '7 días']].map(([k, n]) => `<button class="rb${k === rg ? ' on' : ''}" data-r="${k}" aria-pressed="${k === rg}">${n}</button>`).join('');
   $$('#rsel .rb').forEach(b => b.onclick = () => { tocar(); estado.rango = b.dataset.r; guardar('cc_rango', estado.rango); pintarGrafica(); });
@@ -3677,7 +3755,7 @@ function pintarDias() {
       const s = document.querySelector('.drow.sel'); if (s) s.scrollIntoView({block: 'nearest', behavior: 'smooth'}); };
     d.onclick = f; d.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); f(); } }; });
 }
-const TABS = [['graf', 'Por hora'], ['mapa', 'Mapa'], ['sat', 'Satélite']];
+const TABS = [['graf', 'Gráficas'], ['mapa', 'Mapa'], ['sat', 'Satélite']];
 function mostrarTab(t, foco) {
   estado.tab = t; guardar('cc_tab', t);
   $$('.tab').forEach(b => { const on = b.dataset.t === t; b.classList.toggle('on', on); b.setAttribute('aria-selected', on); b.tabIndex = on ? 0 : -1; if (on && foco) b.focus(); });
@@ -3730,7 +3808,7 @@ function render() {
   const rf = prox.slice(0, 12).filter(r => r.rafaga != null).map(r => r.rafaga), rfMax = rf.length ? Math.max(...rf) : null;
   const tmax = hoyF.length ? Math.round(Math.max(...hoyF.map(r => r.temp))) : null, tmin = hoyF.length ? Math.round(Math.min(...hoyF.map(r => r.temp))) : null;
   const sAhora = sens(act), uvPico = uvs.length ? horaPico(hoyF.filter(r => r.uv != null), r => r.uv) : null;
-  const chips = [`<span class="chip">Próxima hora: <b>${tprox}</b></span>`,
+  const chips = [chipTruenos(v), `<span class="chip">Próxima hora: <b>${tprox}</b></span>`,
     sMax != null && sMax >= UMBRAL_CALOR ? `<span class="chip hot">🌡️ Sensación <b>${Math.round(sMax)}°</b> ${franja(sPico.hora)}</span>` : '',
     act.hum != null ? `<span class="chip hum">Humedad <b>${act.hum}%</b></span>` : '',
     act.viento != null && act.viento >= 15 ? `<span class="chip vto">Viento <b>${act.viento} km/h</b></span>` : '',
@@ -3745,7 +3823,8 @@ function render() {
     (fuera ? `<div class="aviso-top fuera" role="alert"><p>📍 <b>Tu navegador te ubica fuera de Ecuador</b> (¿VPN activa?). Mostramos el pronóstico de ese punto, pero los avisos oficiales, los rayos y la lluvia en camino solo cubren Ecuador, y este pronóstico no está verificado allí.</p><button class="btn" id="elegirec">Elegir una ciudad de Ecuador</button></div>` : '') +
     (onda ? `<div class="alerta calor" role="alert">🔥 <b>Onda de calor:</b> ${onda.dias.length} días seguidos con máximas de hasta ${onda.max}°, más de lo normal para esta época (${onda.normal}°). Hidrátate, usa protector solar y evita el sol de 11:00 a 15:00.</div>` : '') +
     (al ? `<div class="alerta" role="alert">${al.tormenta ? '⛈️' : '🌧️'} <b>El pronóstico cambió:</b> ${al.prob}% de lluvia hacia las ${al.hora.slice(11, 16)} (antes ${al.antes}%).</div>` : '') +
-    `</section><section class="col1" aria-label="Pronóstico">` +
+    htmlRepGente(v) +
+      `</section><section class="col1" aria-label="Pronóstico">` +
     `<div class="cabA"><div class="hero"><div class="ic">${icono(ic, 64)}</div><div class="ht"><div class="t">${act.temp != null ? Math.round(act.temp) : '-'}<sup>°</sup></div>` +
     `<div class="hs">${sAhora != null && sAhora - act.temp >= 1.5 ? `Se siente <b>${Math.round(sAhora)}°</b> · ` : ''}${tmax != null ? `Máx ${tmax}° · Mín ${tmin}°` : ''}</div>` + `</div></div>` +
     `<h1 class="tit">${tit}</h1><p class="sub">${sub}</p>` +
@@ -3758,7 +3837,7 @@ function render() {
     `</section><section class="col2" aria-label="Gráfica, mapa y satélite">` +
     `<div class="card cmulti"><div class="tabs" role="tablist" aria-label="Vistas">` +
     TABS.map(([t, n]) => `<button class="tab" role="tab" id="tab-${t}" data-t="${t}" aria-controls="panel-${t}">${n}</button>`).join('') + `</div>` +
-    `<div class="panel" data-t="graf" id="panel-graf" role="tabpanel" aria-labelledby="tab-graf"><h3><span id="titg"></span><button id="todo" hidden>Ver todo</button></h3><div class="gsel" id="gsel" role="group" aria-label="Qué mostrar"></div><div class="rsel" id="rsel" role="group" aria-label="Cuánto tiempo mostrar"></div><div id="graf" style="position:relative"></div><div class="ley" id="leyg"></div></div>` +
+    `<div class="panel" data-t="graf" id="panel-graf" role="tabpanel" aria-labelledby="tab-graf"><h3 id="gtit" hidden><span id="titg"></span><button id="todo">Ver todo</button></h3><div class="gsel" id="gsel" role="group" aria-label="Qué mostrar"></div><div class="rsel" id="rsel" role="group" aria-label="Cuánto tiempo mostrar"></div><div id="graf" style="position:relative"></div><div class="ley" id="leyg"></div></div>` +
     `<div class="panel" data-t="mapa" id="panel-mapa" role="tabpanel" aria-labelledby="tab-mapa" hidden>${htmlMapa()}</div>` +
     `<div class="panel" data-t="sat" id="panel-sat" role="tabpanel" aria-labelledby="tab-sat" hidden>${htmlSatelite()}</div></div>` +
     `<details><summary>Qué dice cada modelo meteorológico</summary>${tablaModelos(prox.slice(0, 72), v.cfg, hoy)}</details>` +
@@ -3866,6 +3945,7 @@ function htmlComo() {
     ['👀', 'Corrige con lo que pasa ahora', 'Si el satélite o varias personas cerca de ti ven lluvia, las próximas horas se corrigen al instante.'],
     ['🧭', 'Lluvia en camino', 'Seguimos el movimiento de la lluvia en las imágenes del satélite de la última hora y lo extendemos hacia adelante. Solo lo mostramos donde ese movimiento demostró funcionar con datos reales de los últimos 30 minutos, y además comprobamos cada predicción: si la lluvia llegó a la hora prevista (±20 min). Mientras no tenga 30 casos comprobados aparece como "en pruebas" y no cambia el titular ni envía avisos; si acierta menos de la mitad de las veces, se oculta. Sirve para la próxima hora, no más.'],
     ['📊', 'Tablero de aciertos', 'En la tarjeta "Cómo nos fue esta semana" mostramos, día por día, lo que dijimos y lo que pasó, incluidos los fallos. Así puedes juzgar por ti mismo si ClearSky acierta.'],
+    ['📣', 'Lo que reporta la gente', 'Cuando varias personas cerca de ti reportan truenos o una calle inundada, te lo mostramos. Para evitar falsas alarmas, un solo reporte no se muestra: hacen falta al menos 2 personas distintas cerca (truenos: 10 km y 30 minutos; inundación: 2 km y 3 horas). Siempre lo marcamos como "no verificado" y, ante peligro, pedimos llamar al 911. Todavía no sirven para calcular los porcentajes del pronóstico.'],
     ['🌡️', 'Calor', 'Comparamos cada hora la temperatura y la humedad con las del aeropuerto y corregimos el error típico de los modelos. Con esos valores calculamos la sensación térmica (índice de calor de la NOAA). Desde 32° hay que tomar precauciones. Hay onda de calor cuando se esperan 3 días o más con máximas 2° por encima de lo normal del último mes en tu zona.'],
   ];
   return '<div class="como">' + pasos.map(([e, t, x], i) => `<div class="paso"><div class="pn" aria-hidden="true">${e}</div><div><b>${i + 1}. ${t}</b><p>${x}</p></div></div>`).join('') +
@@ -4274,9 +4354,10 @@ html[data-tema=claro] .ah-rayo{background:linear-gradient(90deg,rgba(250,204,21,
       if (chips) chips.insertAdjacentHTML('afterbegin', `<span class="chip ts">⚡ <b>${ry.n20}</b> ${ry.n20 === 1 ? 'rayo' : 'rayos'} · 20 min</span>`);
     }
     if (ry && ry.n20 >= 5) {
+      const trG = repGente(v).truenos, trTxt = trG ? ` · ${trG.personas != null ? trG.personas + ' personas' : trG.n + ' reportes'} también escuchan truenos` : '';
       const donde = ry.cerca ? ` · lo más cercano al ${rumbo(v.lat, v.lon, ry.cerca.la, ry.cerca.lo)}, a ${Math.round(ry.cerca.d)} km` : '';
       piezas.push(`<div class="ah-b ah-rayo" role="alert"><span class="etq ahora"><i></i>Ahora</span>` +
-        `<span><b>⚡ ${nivelRayos(ry.n20)}</b> · ${ry.n20} rayos en 20 min (${ry.n30} en 30)${esc(donde)}</span></div>`);
+        `<span><b>⚡ ${nivelRayos(ry.n20)}</b> · ${ry.n20} rayos en 20 min (${ry.n30} en 30)${esc(donde)}${trTxt}</span></div>`);
       const tit = document.querySelector('.tit'), sub = document.querySelector('.sub'), ic = document.querySelector('.hero .ic');
       const lugar = estado.vista === 'ubic' ? 'ti' : v.nombre;
       if (tit) tit.textContent = `${ry.n20 >= 20 ? 'Tormenta eléctrica intensa' : 'Tormenta eléctrica activa'} cerca de ${lugar}`;

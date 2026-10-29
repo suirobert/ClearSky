@@ -6,3 +6,6 @@ dashboard.html
 sitio/
 feedback/node_modules/
 feedback/.wrangler/
+
+__pycache__/
+.pytest_cache/
