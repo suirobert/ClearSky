@@ -1738,6 +1738,8 @@ function htmlFeedback() {
     `</div><div class="fbres" id="fbres"></div><div class="fbres" id="fbsum"></div><p class="nota">Tu reporte nos ayuda a comprobar el pronóstico en tu barrio. ` +
     `Solo guardamos la hora, lo que reportas y tu ubicación aproximada; nunca datos personales.</p></div>`;
 }
+const enEcuador = p => p && p.lat >= -6 && p.lat <= 2.5 && p.lon >= -92.5 && p.lon <= -75;
+const TXT_FUERA = 'Tu navegador te ubica fuera de Ecuador. Si usas una VPN o la red de una empresa, desactívala para esta página o reporta desde el celular con datos móviles.';
 function obtenerPos(forzar) {
   return new Promise((ok, mal) => {
     if (estado.pos && !forzar) return ok(estado.pos);
@@ -1763,11 +1765,13 @@ function activarFeedback() {
     if (Date.now() - ult < 30 * 60 * 1000) { box.textContent = 'Ya registramos tu reporte hace poco. ¡Gracias! Puedes volver a reportar en 30 minutos.'; return; }
     box.textContent = 'Obteniendo tu ubicación aproximada…';
     let pos; try { pos = await obtenerPos(); } catch (e) { box.textContent = 'Para reportar necesitamos tu ubicación. Revisa el permiso del navegador.'; return; }
+    if (!enEcuador(pos)) { box.textContent = TXT_FUERA; return; }
     $$('.fbb button').forEach(x => x.disabled = true);
     try {
       const r = await fetch(`${D.feedback_url}/reporte`, {method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({lat: +pos.lat.toFixed(2), lon: +pos.lon.toFixed(2), tipo: b.dataset.t})});
       if (r.status === 429) box.textContent = 'Ya registramos tu reporte hace poco. ¡Gracias!';
+      else if (r.status === 400) box.textContent = TXT_FUERA;
       else if (!r.ok) throw new Error(r.status);
       else { box.textContent = `¡Gracias! Registramos «${NOMBRE_REP[b.dataset.t]}» en tu zona.`; guardar('cc_fb_ts', Date.now());
              $$('.fbb button').forEach(x => x.classList.toggle('elegido', x === b)); tocar(); resumenFeedback(); }
@@ -1800,7 +1804,7 @@ function construirUbic(c) {
     : `Pronóstico de tu ubicación exacta, ajustado con lo aprendido en ${ref.nombre} (${dist} km).`;
   const off = om.utc_offset_seconds ?? D.offset;
   return {nombre: nombre || 'Tu ubicación', lat, lon, filas: filasDesdeOM(om.hourly, ref.cfg, lat, lon, off), cfg: ref.cfg, offset: off,
-    nivel: ref.nivel + (aprox ? ' (aprox.)' : ''), lugar: nota, t: c.t, verif_html: `<p class="aviso">${esc(nota)}</p>` + ref.verif_html};
+    nivel: ref.nivel + (aprox ? ' (aprox.)' : ''), lugar: enEcuador({lat, lon}) ? nota : 'Tu navegador te ubica fuera de Ecuador (¿VPN activa?). ClearSky solo cubre Ecuador: elige una ciudad en el botón de arriba.', t: c.t, verif_html: `<p class="aviso">${esc(nota)}</p>` + ref.verif_html};
 }
 async function cargarUbicacion(opc = {}) {
   if (estado.buscando) return; estado.buscando = true;
