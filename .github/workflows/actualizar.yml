@@ -30,6 +30,7 @@ jobs:
     env:
       CC_DATOS: datos
       CC_HTML: sitio/index.html
+      CC_FEEDBACK_TOKEN: ${{ secrets.FEEDBACK_TOKEN }}
       CC_FEEDBACK_URL: ${{ vars.FEEDBACK_URL }}
     steps:
       - uses: actions/checkout@v4

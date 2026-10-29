@@ -3,12 +3,9 @@ main = "worker.js"
 compatibility_date = "2026-10-01"
 
 [vars]
-ORIGENES = "https://suirobert.github.io"
+ORIGEN = "https://suirobert.github.io"
 
 [[d1_databases]]
 binding = "DB"
 database_name = "clearsky"
-database_id = "PEGA_AQUI_EL_ID"
-
-[triggers]
-crons = ["17 * * * *"]
+database_id = "PEGA_AQUI_EL_DATABASE_ID"

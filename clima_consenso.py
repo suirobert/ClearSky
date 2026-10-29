@@ -14,6 +14,7 @@ Página (index.html, generada aquí y dibujada con JavaScript):
     configuración aprendida en la ciudad verificada más parecida); las ciudades van en una lista aparte.
   - Ícono del cielo según el sol que llega de verdad (las nubes altas finas ya no dan "nublado").
   - Modo claro y oscuro automático según el dispositivo, con botón para elegirlo a mano.
+  - 7 días (del 4 al 7 orientativos) y reportes de usuarios verificados contra lo publicado.
   - Mapa de lluvia por horas, satélite GOES, íconos animados Meteocons, gráfica y barra que se
     pueden arrastrar con el dedo, instalable como app (PWA) y con uso sin conexión.
 
@@ -67,7 +68,8 @@ MODELOS = {
 UMBRAL_LLOVIZNA     = 0.2
 UMBRAL_DEFECTO      = 1.0
 UMBRALES_CANDIDATOS = [0.2, 0.5, 1.0, 2.0]
-DIAS_PRONOSTICO     = 3
+DIAS_PRONOSTICO     = 7          # días que muestra la página (los días 4-7 son orientativos)
+DIAS_MAPA           = 3
 DIAS_VERIFICACION   = 45
 HORAS_ENTRE_VERIF   = 24
 MIN_HORAS_LLUVIA    = 5
@@ -98,6 +100,10 @@ ARCHIVO_PESOS = os.path.join(DATOS, "pesos.json")
 ARCHIVO_HTML  = os.path.abspath(os.environ.get("CC_HTML") or os.path.join(BASE, "dashboard.html"))
 ARCHIVO_ERR   = os.path.join(DATOS, "errores.log")
 FEEDBACK_URL  = (os.environ.get("CC_FEEDBACK_URL") or "").strip().rstrip("/")
+FEEDBACK_TOKEN = (os.environ.get("CC_FEEDBACK_TOKEN") or "").strip()   # para descargar los reportes
+TIPOS_REPORTE = {"soleado": 0, "nublado": 0, "llovizna": 0, "lluvia": 1, "lluvia_fuerte": 1, "tormenta": 1}  # 1 = llueve
+RADIO_REPORTES_KM = 30
+MIN_REPORTES  = 30           # reportes comparables necesarios para mostrar resultados
 REPO_URL      = "https://github.com/suirobert/ClearSky"
 HORAS_LOG     = 30
 DIAS_HISTORIAL_LECTURA = DIAS_VERIFICACION + 5
@@ -624,11 +630,20 @@ def verificar(p):
         except Exception as e:
             log_error(f"verificación {c}: {e} (se mantiene la configuración anterior)")
     guardar_archivo_obs(arch)
+    try:
+        reps = leer_reportes(DIAS_VERIFICACION)
+    except Exception as e:
+        log_error(f"lectura de reportes: {e}")
+        reps = []
     for c in CIUDADES:
         try:
             p["ciudades"][c]["real"] = seguimiento_real(c, arch.get(c, {}))
         except Exception as e:
             log_error(f"seguimiento real {c}: {e}")
+        try:
+            p["ciudades"][c]["reportes"] = verificar_reportes(c, reps)
+        except Exception as e:
+            log_error(f"verificación con reportes {c}: {e}")
     p["actualizado"] = datetime.now().isoformat(timespec="seconds")
     p["version"] = VERSION
     guardar_pesos(p)
@@ -714,7 +729,7 @@ def consenso(data, cfg, lat=None, lon=None, offset_s=OFFSET_S):
             "rafaga": round(mediana(raf)) if raf else None,
             "uv": round(mediana(uv), 1) if uv else None,
             "conf": "Alta" if acuerdo >= 80 else "Media" if acuerdo >= 60 else "Baja",
-            "detalle": {MODELOS[m]: round(v, 1) for m, v in lluvia.items()},
+            "detalle": {MODELOS[m]: round(v, 1) for m, v in lluvia.items()}, "n": len(lluvia),
         })
     return filas
 
@@ -856,6 +871,7 @@ def datos_ciudad(p, ciudad, filas):
     propia = bool(p["ciudades"].get(ciudad, {}).get("verificado"))
     verif = html_verificacion(cfg, ref) if ref else html_verificacion(cfg, ciudad)
     verif += html_tormenta(cfg.get("tormenta"), ref or ciudad)
+    verif += html_reportes(p["ciudades"].get(ciudad, {}).get("reportes"))
     verif += ("<p class='nota'>Niebla, ráfagas de viento e índice UV vienen de los modelos y todavía "
               "<b>no</b> se verifican; tómalos como referencia.</p>")
     if ref and ref != ciudad:
@@ -867,7 +883,112 @@ def datos_ciudad(p, ciudad, filas):
             "cfg": {"umbral": cfg.get("umbral", UMBRAL_DEFECTO), "pesos": cfg.get("pesos", {}),
                     "tabla_lluvia": cfg.get("tabla_lluvia") or [], "tabla_llovizna": cfg.get("tabla_llovizna") or [],
                     "tabla_tormenta": (cfg.get("tormenta") or {}).get("tabla") or []},
-            "filas": filas, "verif_html": verif}
+            "filas": [f if i < 96 else dict(f, detalle={}) for i, f in enumerate(filas)], "verif_html": verif}
+
+
+# ----------------------- REPORTES DE USUARIOS -----------------------
+def archivo_rep(mes):
+    return os.path.join(DATOS, "reportes", f"{mes}.json")
+
+
+def hora_local_ts(ts):
+    return datetime(1970, 1, 1) + timedelta(seconds=ts + OFFSET_S)
+
+
+def descargar_reportes():
+    """Trae los reportes nuevos del servicio y los guarda por mes. En el repositorio (público) la
+       ubicación se guarda redondeada a 0,05° (~5 km), suficiente para comparar con cada ciudad."""
+    if not (FEEDBACK_URL and FEEDBACK_TOKEN):
+        return 0
+    carpeta = os.path.join(DATOS, "reportes")
+    os.makedirs(carpeta, exist_ok=True)
+    marca = os.path.join(carpeta, "ultimo_id.txt")
+    ultimo = int(open(marca, encoding="utf-8").read().strip() or 0) if os.path.exists(marca) else 0
+    total = 0
+    for _ in range(20):                                      # hasta 100 000 reportes por ejecución
+        req = urllib.request.Request(f"{FEEDBACK_URL}/export?despues={ultimo}",
+                                     headers={"Authorization": f"Bearer {FEEDBACK_TOKEN}", "User-Agent": f"ClearSky (+{REPO_URL})"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            filas = json.loads(r.read().decode("utf-8"))
+        if not filas:
+            break
+        por_mes = {}
+        for f in filas:
+            if f.get("tipo") in TIPOS_REPORTE:
+                ts = int(f["ts"])
+                por_mes.setdefault(hora_local_ts(ts).strftime("%Y-%m"), []).append(
+                    [ts, round(round(float(f["lat"]) * 20) / 20, 2), round(round(float(f["lon"]) * 20) / 20, 2), f["tipo"]])
+        for mes, nuevos in por_mes.items():
+            ruta = archivo_rep(mes)
+            act = json.load(open(ruta, encoding="utf-8")) if os.path.exists(ruta) else []
+            act = sorted(act + nuevos)
+            tmp = ruta + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(act, fh, separators=(",", ":"))
+            os.replace(tmp, ruta)
+        ultimo = max(int(f["id"]) for f in filas)
+        with open(marca, "w", encoding="utf-8") as fh:
+            fh.write(str(ultimo))
+        total += len(filas)
+        if len(filas) < 5000:
+            break
+    return total
+
+
+def leer_reportes(dias):
+    hoy = date.today()
+    meses = sorted({(hoy - timedelta(days=d)).strftime("%Y-%m") for d in range(dias + 1)})
+    limite = time.time() - dias * 86400
+    out = []
+    for m in meses:
+        ruta = archivo_rep(m)
+        if os.path.exists(ruta):
+            out += [r for r in json.load(open(ruta, encoding="utf-8")) if r[0] >= limite]
+    return out
+
+
+def verificar_reportes(ciudad, reportes):
+    """Compara lo que publicó la página (24 h antes) con lo que reportó la gente cerca de la ciudad."""
+    o = CIUDADES[ciudad]
+    cerca = [r for r in reportes if distancia_km(o["lat"], o["lon"], r[1], r[2]) <= RADIO_REPORTES_KM]
+    pub = leer_pronosticos_publicados(ciudad)
+    pares = []
+    for ts, _, _, tipo in cerca:
+        k = hora_local_ts(ts).strftime("%Y-%m-%dT%H:00")
+        if k in pub and tipo in TIPOS_REPORTE:
+            pares.append((pub[k], TIPOS_REPORTE[tipo]))
+    res = {"reportes": len(cerca), "comparables": len(pares)}
+    if len(pares) < MIN_REPORTES:
+        return res
+    llueve = [p for p, x in pares if x]
+    seco = [p for p, x in pares if not x]
+    anuncios = [x for p, x in pares if p >= 40]
+    res.update(con_lluvia=len(llueve),
+               prob_media_lluvia=round(statistics.mean(llueve)) if llueve else None,
+               prob_media_seco=round(statistics.mean(seco)) if seco else None,
+               anuncios=len(anuncios), anuncios_acertados=sum(anuncios),
+               brier=brier([p for p, _ in pares], [x for _, x in pares]))
+    return res
+
+
+def html_reportes(r):
+    if not FEEDBACK_URL:
+        return ""
+    out = "<h4>Reportes de las personas</h4>"
+    if not r or r.get("comparables", 0) < MIN_REPORTES:
+        n = (r or {}).get("reportes", 0)
+        return out + (f"<p class='nota'>Llevamos {n} reportes cerca de esta ciudad. Con {MIN_REPORTES} o más que coincidan "
+                      "con un pronóstico publicado mostraremos aquí cuánto acierta según lo que ve la gente. "
+                      "¡Reporta desde <b>¿Cómo está el clima donde estás?</b>!</p>")
+    li = [f"<li>Comparamos el pronóstico con <b>{r['comparables']} reportes</b> de personas a menos de {RADIO_REPORTES_KM} km.</li>"]
+    if r.get("prob_media_lluvia") is not None and r.get("prob_media_seco") is not None:
+        li.append(f"<li>Cuando la gente reportó lluvia, habíamos dado en promedio <b>{r['prob_media_lluvia']}%</b>; "
+                  f"cuando reportó que no llovía, <b>{r['prob_media_seco']}%</b>.</li>")
+    if r.get("anuncios", 0) >= 5:
+        li.append(f"<li>Cuando dijimos 40% o más, la gente vio lluvia <b>{round(r['anuncios_acertados'] / r['anuncios'] * 10)} de cada 10 veces</b>.</li>")
+    return (out + "<ul class='lst'>" + "".join(li) + "</ul><p class='nota'>Por ahora los reportes sirven para comprobar "
+            "el pronóstico en los barrios; todavía no cambian los porcentajes, porque necesitamos muchos para que sean "
+            "fiables y no se puedan manipular.</p>")
 
 
 # ----------------------- MAPA DE LLUVIA -----------------------
@@ -890,7 +1011,7 @@ def generar_mapa(p):
     """Probabilidad calibrada de lluvia en una cuadrícula sobre Ecuador, hora por hora."""
     pts = [(la, lo) for la in MAPA_LATS for lo in MAPA_LONS]
     params = {"latitude": ",".join(str(a) for a, _ in pts), "longitude": ",".join(str(b) for _, b in pts),
-              "hourly": "precipitation", "models": ",".join(MODELOS), "timezone": ZONA, "forecast_days": DIAS_PRONOSTICO}
+              "hourly": "precipitation", "models": ",".join(MODELOS), "timezone": ZONA, "forecast_days": DIAS_MAPA}
     resp = json.loads(http_get(URL_FORECAST, params))
     if isinstance(resp, dict):
         resp = [resp]
@@ -1108,7 +1229,7 @@ button{font:inherit;color:inherit}
 .drow:first-child{border-top:0}
 .drow:active{background:#182133}.drow.sel{background:#16213a}
 @media(hover:hover){.drow:hover{background:#151d2b}}
-.dn{font-weight:500}.pp{color:#60a5fa;font-size:13px;font-weight:600}.pp.off{color:#4b5563}
+.dn{font-weight:500}.dn small{display:block;font-size:10.5px;color:var(--tx3);font-weight:400;margin-top:1px}.pp{color:#60a5fa;font-size:13px;font-weight:600}.pp.off{color:#4b5563}
 .dmm{color:var(--tx3);font-size:12px}.tmin{color:var(--tx2);text-align:right}.tmax{text-align:left}
 .trng{position:relative;height:6px;background:#1f2937;border-radius:3px}
 .trng div{position:absolute;top:0;height:6px;border-radius:3px;background:linear-gradient(90deg,#60a5fa,#fbbf24)}
@@ -1135,8 +1256,9 @@ h4{font-size:12px;color:var(--tx2);font-weight:600;margin:14px 0 6px}
 .calib em{color:var(--tx2);font-style:normal}
 .plano{font-size:16px;margin:6px 0}.lst{font-size:14px;line-height:1.7;padding-left:18px;margin:6px 0}
 details.tec{background:#0d121b;margin-top:14px}
-.fbb{display:flex;gap:8px;flex-wrap:wrap}
-.fbb button{flex:1;min-width:96px;min-height:48px;background:#1f2937;border:1px solid #334155;border-radius:14px;padding:10px;cursor:pointer;font-size:14px;transition:transform .12s}
+.fbb{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.fbb button.elegido{outline:2px solid var(--acc)}.fbe{font-size:22px;line-height:1}
+.fbb button{min-width:0;min-height:60px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;background:#1f2937;border:1px solid #334155;border-radius:14px;padding:10px;cursor:pointer;font-size:14px;transition:transform .12s}
 .fbb button:active{transform:scale(.96)}.fbb button:disabled{opacity:.5;cursor:default}
 .fbres{font-size:13px;color:#cbd5e1;margin-top:8px}
 .vacio{padding:40px 10px;text-align:center;color:var(--tx2)}
@@ -1144,6 +1266,7 @@ details.tec{background:#0d121b;margin-top:14px}
 .btn{background:var(--acc2);border:0;color:#fff;border-radius:999px;padding:11px 18px;font-size:15px;cursor:pointer;min-height:44px;transition:transform .12s}
 .btn:active{transform:scale(.96)}.btn.sec{background:#1f2937;color:#cbd5e1}
 #mapa{position:relative;z-index:0;isolation:isolate;height:340px;border-radius:12px;overflow:hidden;background:#0d121b}
+html:not([data-tema=claro]) #mapa .leaflet-tile-pane{filter:invert(1) hue-rotate(180deg) brightness(.85) contrast(.9) saturate(.6)}
 .mapctl{display:flex;align-items:center;gap:10px;margin-top:12px}
 .mapctl button{flex:none;width:44px;height:44px;border-radius:50%;border:0;background:#1f2937;font-size:16px;cursor:pointer}
 .mapctl input{flex:1;height:44px;accent-color:#3b82f6}
@@ -1311,7 +1434,7 @@ function filasDesdeOM(h, cfg, lat, lon, off) {
       prob_ts: cods.length ? Math.round(calibrarProb(pts, cfg.tabla_tormenta)) : 0,
       niebla: cods.length ? Math.round(cods.filter(c => c === 45 || c === 48).length / cods.length * 100) : 0,
       rafaga: raf.length ? Math.round(mediana(raf)) : null, uv: uv.length ? r1(mediana(uv)) : null,
-      conf: ac >= 80 ? 'Alta' : ac >= 60 ? 'Media' : 'Baja', detalle: det});
+      conf: ac >= 80 ? 'Alta' : ac >= 60 ? 'Media' : 'Baja', detalle: det, n: Object.keys(ll).length});
   });
   return filas;
 }
@@ -1493,7 +1616,8 @@ function porDia(filas, ahora) { const d = {}; for (const r of filas) if (r.hora 
 function htmlDias(dias, filas, ahora, hoy) {
   const ts = filas.filter(r => r.temp != null).map(r => r.temp);
   const tmn = Math.min(...ts), tmx = Math.max(...ts), rng = Math.max(tmx - tmn, 1);
-  return Object.entries(dias).map(([d, rs]) => {
+  return Object.entries(dias).map(([d, rs], k) => {
+    const lejano = k >= 3;
     const top = rs.reduce((a, b) => (b.prob > a.prob || (b.prob === a.prob && b.mm > a.mm)) ? b : a);
     const tsTop = rs.reduce((a, b) => (b.prob_ts || 0) > (a.prob_ts || 0) ? b : a);
     const t = rs.filter(r => r.temp != null).map(r => r.temp), mn = Math.min(...t), mx = Math.max(...t);
@@ -1506,7 +1630,7 @@ function htmlDias(dias, filas, ahora, hoy) {
     ic = {luna: 'sol', parcial_noche: 'parcial_dia'}[ic] || ic;
     const pct = top.prob >= 10 ? `<span class="pp">${top.prob}%</span>` : '<span class="pp off">–</span>';
     const sel = estado.dia === d;
-    let html = `<div class="drow${sel ? ' sel' : ''}" data-dia="${d}" role="button" tabindex="0" aria-expanded="${sel}"><div class="dn">${nombreDia(d, hoy)}</div><div class="ic">${icono(ic, 28)}</div>${pct}` +
+    let html = `<div class="drow${sel ? ' sel' : ''}" data-dia="${d}" role="button" tabindex="0" aria-expanded="${sel}"><div class="dn">${nombreDia(d, hoy)}${lejano ? '<small>orientativo</small>' : ''}</div><div class="ic">${icono(ic, 28)}</div>${pct}` +
       `<div class="dmm">${(tsTop.prob_ts || 0) >= 30 ? 'Tormenta' : top.prob >= 20 ? 'Lluvia ' + intensidad(top.mm) : ''}</div><div class="tmin">${Math.round(mn)}°</div>` +
       `<div class="trng"><div style="left:${(mn - tmn) / rng * 100}%;width:${Math.max((mx - mn) / rng * 100, 3)}%"></div></div><div class="tmax">${Math.round(mx)}°</div></div>`;
     if (sel) {
@@ -1517,7 +1641,7 @@ function htmlDias(dias, filas, ahora, hoy) {
       const extra = [(tsTop.prob_ts || 0) >= 10 ? `Tormenta eléctrica: hasta ${tsTop.prob_ts}% ${franja(tsTop.hora)}.` : '',
         uvMax != null && uvMax >= 3 ? `Índice UV máximo ${Math.round(uvMax)} (${nivelUV(uvMax)}).` : '',
         rfMax != null && rfMax >= 40 ? `Ráfagas de hasta ${rfMax} km/h.` : ''].filter(Boolean).join(' ');
-      html += `<div class="dexp"><p><b>${tt}.</b> ${sub} Temperatura entre ${Math.round(mn)}° y ${Math.round(mx)}°. ${extra}</p>${lineaTiempo(rs, ahora)}</div>`;
+      html += `<div class="dexp"><p><b>${tt}.</b> ${sub} Temperatura entre ${Math.round(mn)}° y ${Math.round(mx)}°. ${extra}${lejano ? ' <i>A más de 3 días el pronóstico es menos preciso y todavía no se verifica; tómalo como orientativo.</i>' : ''}</p>${lineaTiempo(rs, ahora)}</div>`;
     }
     return html;
   }).join('');
@@ -1564,8 +1688,8 @@ function activarMapa(v) {
     $('#mapa').innerHTML = '';
     const map = L.map('mapa', {zoomControl: !tactil, dragging: !tactil, tap: false, scrollWheelZoom: false, attributionControl: true})
       .setView([v.lat ?? -1.6, v.lon ?? -78.6], 6.4);
-    L.tileLayer(`https://{s}.basemaps.cartocdn.com/${claro() ? 'light_all' : 'dark_all'}/{z}/{x}/{y}{r}.png`, {maxZoom: 10, subdomains: 'abcd',
-      attribution: '&copy; OpenStreetMap &copy; CARTO'}).addTo(map);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 10,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'}).addTo(map);
     const rects = [], d = M.paso / 2;
     M.lats.forEach(la => M.lons.forEach(lo => rects.push(L.rectangle([[la - d, lo - d], [la + d, lo + d]], {weight: 0, fillOpacity: 0, interactive: true}).addTo(map))));
     if (v.lat != null) L.circleMarker([v.lat, v.lon], {radius: 6, color: '#fff', weight: 2, fillColor: '#f59e0b', fillOpacity: 1}).addTo(map);
@@ -1604,12 +1728,15 @@ function activarSatelite() {
 }
 
 // ---------- reportes de usuarios ----------
+const TIPOS_REP = [['soleado', '☀️', 'Soleado'], ['nublado', '☁️', 'Nublado'], ['llovizna', '🌦️', 'Llovizna'],
+                   ['lluvia', '🌧️', 'Lluvia'], ['lluvia_fuerte', '🌊', 'Aguacero'], ['tormenta', '⛈️', 'Tormenta']];
+const NOMBRE_REP = Object.fromEntries(TIPOS_REP.map(([t, , n]) => [t, n.toLowerCase()]));
 function htmlFeedback() {
   if (!D.feedback_url) return '';
-  return `<div class="card"><h3>¿Está lloviendo donde estás?</h3><div class="fbb">` +
-    `<button data-t="lluvia">🌧️ Llueve</button><button data-t="llovizna">🌦️ Llovizna</button><button data-t="seca">🌤️ No llueve</button></div>` +
-    `<div class="fbres" id="fbres"></div><div class="fbres" id="fbsum"></div><p class="nota">Tu reporte nos ayuda a comprobar el pronóstico en tu barrio. ` +
-    `Solo guardamos la hora y tu ubicación aproximada (~1 km), nunca datos personales.</p></div>`;
+  return `<div class="card" id="cfb"><h3>¿Cómo está el clima donde estás?</h3><div class="fbb">` +
+    TIPOS_REP.map(([t, e, n]) => `<button data-t="${t}"><span class="fbe">${e}</span>${n}</button>`).join('') +
+    `</div><div class="fbres" id="fbres"></div><div class="fbres" id="fbsum"></div><p class="nota">Tu reporte nos ayuda a comprobar el pronóstico en tu barrio. ` +
+    `Solo guardamos la hora, lo que reportas y tu ubicación aproximada; nunca datos personales.</p></div>`;
 }
 function obtenerPos(forzar) {
   return new Promise((ok, mal) => {
@@ -1624,10 +1751,9 @@ async function resumenFeedback() {
   try {
     const r = await fetch(`${D.feedback_url}/resumen?lat=${estado.pos.lat.toFixed(2)}&lon=${estado.pos.lon.toFixed(2)}`);
     const j = await r.json();
-    if (j.total >= 2) {
-      const partes = [];
-      if (j.lluvia) partes.push(`${j.lluvia} reportan lluvia`); if (j.llovizna) partes.push(`${j.llovizna} llovizna`); if (j.seca) partes.push(`${j.seca} sin lluvia`);
-      box.innerHTML = `En la última hora, cerca de ti: ${partes.join(', ')}.`;
+    if (j.total >= 1) {
+      const partes = TIPOS_REP.filter(([t]) => j[t]).map(([t, e]) => `${e} ${j[t]} ${NOMBRE_REP[t]}`);
+      box.innerHTML = `En la última hora, cerca de ti (≈10 km): ${partes.join(' · ')}.`;
     }
   } catch (e) {}
 }
@@ -1643,7 +1769,8 @@ function activarFeedback() {
         body: JSON.stringify({lat: +pos.lat.toFixed(2), lon: +pos.lon.toFixed(2), tipo: b.dataset.t})});
       if (r.status === 429) box.textContent = 'Ya registramos tu reporte hace poco. ¡Gracias!';
       else if (!r.ok) throw new Error(r.status);
-      else { box.textContent = '¡Gracias! Tu reporte quedó registrado.'; guardar('cc_fb_ts', Date.now()); tocar(); resumenFeedback(); }
+      else { box.textContent = `¡Gracias! Registramos «${NOMBRE_REP[b.dataset.t]}» en tu zona.`; guardar('cc_fb_ts', Date.now());
+             $$('.fbb button').forEach(x => x.classList.toggle('elegido', x === b)); tocar(); resumenFeedback(); }
     } catch (e) { box.textContent = 'No pudimos enviar tu reporte. Inténtalo más tarde.'; }
     finally { $$('.fbb button').forEach(x => x.disabled = false); }
   }));
@@ -1693,7 +1820,7 @@ async function cargarUbicacion(opc = {}) {
   if (!silencioso) $('#vista').innerHTML = '<div class="vacio"><span class="cargando"></span>Calculando el pronóstico para tu ubicación…</div>';
   try {
     const lat = +pos.lat.toFixed(2), lon = +pos.lon.toFixed(2);
-    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=${D.vars.join(',')}&models=${KEYS.join(',')}&timezone=auto&forecast_days=3`;
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=${D.vars.join(',')}&models=${KEYS.join(',')}&timezone=auto&forecast_days=7`;
     const [om, nombre] = await Promise.all([fetch(url).then(r => r.json()), nombreLugar(lat, lon)]);
     if (!om.hourly) throw new Error(om.reason || 'sin datos');
     const cache = {lat, lon, om, nombre, t: Date.now()};
@@ -1784,7 +1911,7 @@ function leyenda(hayTs) {
 let ctx = null;
 function pintarGrafica() {
   const {v, ahora, hoy, dias, prox} = ctx;
-  const filasG = estado.dia ? dias[estado.dia] : prox;
+  const filasG = estado.dia ? dias[estado.dia] : prox.slice(0, 72);
   $('#titg').textContent = estado.dia ? `Probabilidad de lluvia · ${nombreDia(estado.dia, hoy)}` : 'Probabilidad de lluvia · próximos 3 días';
   $('#todo').hidden = !estado.dia;
   grafica($('#graf'), filasG, ahora, hoy);
@@ -1822,11 +1949,11 @@ function render() {
   $('#vista').innerHTML =
     `<div class="hero"><div class="ic">${icono(ic, 72)}</div><div><div class="t">${act.temp != null ? Math.round(act.temp) : '-'}<sup>°</sup></div></div><div><h1>${tit}</h1><p>${sub}</p></div></div>` +
     (v.lugar ? `<div class="lugar">📍 ${esc(v.lugar)}</div>` : '') + `<div class="chips">${chips}</div>` +
-    `<div class="card" id="c24"><h3>Próximas 24 horas</h3>${lineaTiempo(p24, ahora)}</div>` +
+    `<div class="card" id="c24"><h3>Próximas 24 horas</h3>${lineaTiempo(p24, ahora)}</div>` + htmlFeedback() +
     `<div class="card"><h3><span id="titg"></span><button id="todo" hidden>Ver 3 días</button></h3><div id="graf" style="position:relative"></div><div class="ley" id="leyg"></div></div>` +
-    `<div class="card"><h3>Próximos días <span class="sub">Toca un día para ver el detalle</span></h3><div id="dias"></div></div>` +
-    htmlMapa() + htmlFeedback() + htmlSatelite() +
-    `<details><summary>Qué dice cada modelo meteorológico</summary>${tablaModelos(prox, v.cfg, hoy)}</details>` +
+    `<div class="card"><h3>Próximos 7 días <span class="sub">Toca un día para ver el detalle</span></h3><div id="dias"></div></div>` +
+    htmlMapa() + htmlSatelite() +
+    `<details><summary>Qué dice cada modelo meteorológico</summary>${tablaModelos(prox.slice(0, 72), v.cfg, hoy)}</details>` +
     `<details><summary>¿Qué tan confiable es este pronóstico?</summary>${v.verif_html}</details>`;
   activarLinea($('#c24'), p24);
   pintarGrafica(); pintarDias();
@@ -1954,6 +2081,12 @@ def main():
     if not resultados:
         log_error("no se pudo descargar ningún pronóstico; se conserva la página anterior")
         sys.exit(1)
+    try:
+        n = descargar_reportes()
+        if n:
+            print(f"Reportes de usuarios nuevos: {n}")
+    except Exception as e:
+        log_error(f"reportes de usuarios: {e}")
     mapa = None
     try:
         mapa = generar_mapa(p)
