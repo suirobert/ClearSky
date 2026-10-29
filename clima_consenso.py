@@ -18,6 +18,7 @@ Página (index.html, generada aquí y dibujada con JavaScript):
   - Modo claro y oscuro automático según el dispositivo, con botón para elegirlo a mano.
   - 7 días (del 4 al 7 orientativos) y reportes de usuarios verificados contra lo publicado.
   - Diseño compacto (dos columnas en PC), barrio por OpenStreetMap, avisos en el teléfono y compartir.
+  - Temperatura y humedad verificadas cada hora contra el aeropuerto y corregidas (solo si mejora en el examen).
   - Calor: sensación térmica (índice de calor NOAA), alerta desde 32° y onda de calor frente a lo normal
     de los últimos 30 días; humedad, viento y UV por hora. Botón para instalar como app.
   - Mapa de lluvia por horas, satélite GOES, íconos animados Meteocons, gráfica y barra que se
@@ -102,7 +103,7 @@ DIAS_PRUEBA         = 10         # últimos días reservados para el examen (no 
 DIAS_RECIENTES      = 21         # días de la calibración que se adapta a la temporada
 MIN_MODELOS         = 3
 MIN_HORAS_REALES    = 72
-VERSION             = 9          # versión de la lógica de datos (si cambia, se re-verifica)
+VERSION             = 10         # versión de la lógica de datos (si cambia, se re-verifica)
 PLAZOS              = [1, 2, 3, 4, 5, 6, 7]   # días de anticipación que se verifican
 FRANJAS             = {"madrugada": (0, 6), "mañana": (6, 12), "tarde": (12, 18), "noche": (18, 24)}
 ALERTA_MIN          = 60         # % a partir del cual un salto se considera alerta
@@ -248,18 +249,18 @@ def hora_clave(dt):
     return dt.strftime("%Y-%m-%dT%H:00")
 
 
-def descargar_obs(icao, dias):
+def descargar_obs(icao, dias, temps=None):
     fin = date.today() + timedelta(days=1)
     ini = fin - timedelta(days=dias + 1)
-    params = [("station", icao), ("data", "wxcodes"),
+    params = [("station", icao), ("data", "wxcodes"), ("data", "tmpf"), ("data", "relh"),
               ("year1", ini.year), ("month1", ini.month), ("day1", ini.day),
               ("year2", fin.year), ("month2", fin.month), ("day2", fin.day),
               ("tz", ZONA), ("format", "onlycomma"), ("latlon", "no"),
               ("missing", "M"), ("direct", "no"), ("report_type", "3"), ("report_type", "4")]
-    return parsear_obs(http_get(URL_IEM, params))
+    return parsear_obs(http_get(URL_IEM, params), temps)
 
 
-def parsear_obs(texto):
+def parsear_obs(texto, temps=None):
     obs = {}
     for row in csv.DictReader(io.StringIO(texto)):
         try:
@@ -275,6 +276,17 @@ def parsear_obs(texto):
         k = hora_clave(dt)
         a, b, t = (list(obs.get(k, (0, 0, 0))) + [0])[:3]
         obs[k] = (max(a, lluvia), max(b, llovizna), max(t, tormenta))
+        if temps is not None:                                    # temperatura (°C) y humedad (%) medidas
+            try:
+                tc = round((float(row.get("tmpf")) - 32) * 5 / 9, 1)
+            except (TypeError, ValueError):
+                continue
+            try:
+                hr = float(row.get("relh"))
+            except (TypeError, ValueError):
+                hr = None
+            if -10 <= tc <= 50:
+                temps[k] = (tc, hr if hr is not None and 0 <= hr <= 100 else None)
     return obs
 
 
@@ -285,7 +297,8 @@ def descargar_previos(lat, lon, dias):
             "past_days": dias, "forecast_days": 1}
     h, plazos = None, None
     for intento in (PLAZOS, [1, 2, 3], [1]):
-        vars_ = [f"precipitation_previous_day{d}" for d in intento] + ["weather_code_previous_day1"]
+        vars_ = [f"precipitation_previous_day{d}" for d in intento] + ["weather_code_previous_day1",
+                 "temperature_2m_previous_day1", "relative_humidity_2m_previous_day1"]
         try:
             h = json.loads(http_get(URL_PREVIOUS, dict(base, hourly=",".join(vars_)), intentos=2))["hourly"]
             plazos = intento
@@ -308,7 +321,13 @@ def descargar_previos(lat, lon, dias):
         sc = serie_modelo(h, "weather_code_previous_day1", m)
         if sc and any(v is not None for v in sc):
             cods[m] = {t: v for t, v in zip(h["time"], sc) if v is not None}
-    return prev, cods
+    tprev = {"t": {}, "h": {}}
+    for clave, var in (("t", "temperature_2m_previous_day1"), ("h", "relative_humidity_2m_previous_day1")):
+        for m in MODELOS:
+            sv = serie_modelo(h, var, m)
+            if sv and any(v is not None for v in sv):
+                tprev[clave][m] = {t: v for t, v in zip(h["time"], sv) if v is not None}
+    return prev, cods, tprev
 
 
 # ----------------------- MÉTRICAS -----------------------
@@ -613,6 +632,65 @@ def plazo_de(hora, ahora):
     return max(1, min(7, math.ceil(horas / 24)))
 
 
+# ----------------------- TEMPERATURA Y HUMEDAD -----------------------
+def calibrar_temp(obs_t, tprev):
+    """Compara cada hora la temperatura y la humedad pronosticadas 24 h antes con las del aeropuerto.
+       Aprende el error típico de los modelos (por franja horaria) y solo lo corrige si en el examen
+       sin trampa (últimos días no usados para aprender) acierta más."""
+    ahora = datetime.now().strftime("%Y-%m-%dT%H:00")
+    mt, mh = tprev.get("t") or {}, tprev.get("h") or {}
+    filas = []
+    for k, (to, ho) in obs_t.items():
+        if k >= ahora:
+            continue
+        vt = [mt[m][k] for m in mt if k in mt[m]]
+        if len(vt) < 3:
+            continue
+        vh = [mh[m][k] for m in mh if k in mh[m]]
+        filas.append((k, statistics.mean(vt), to, statistics.mean(vh) if len(vh) >= 3 else None, ho))
+    if len(filas) < 24 * 7:
+        return {"verificado": False, "activa": False, "horas": len(filas)}
+    filas.sort()
+    ent, pru = separar_examen([f[0] for f in filas])
+    ent, pru = set(ent), set(pru)
+    f_ent = [f for f in filas if f[0] in ent]
+    f_pru = [f for f in filas if f[0] in pru]
+    if len(f_ent) < 24 * 5 or len(f_pru) < 24 * 2:
+        return {"verificado": False, "activa": False, "horas": len(filas)}
+
+    def sesgos(fs):
+        s = {}
+        for fr in FRANJAS:
+            e = [p - o for k, p, o, _, _ in fs if franja_de(k) == fr]
+            s[fr] = round(statistics.mean(e), 2) if len(e) >= 12 else 0.0
+        eh = [ph - oh for _, _, _, ph, oh in fs if ph is not None and oh is not None]
+        return s, (round(statistics.mean(eh), 1) if len(eh) >= 24 else 0.0)
+
+    def mae_t(fs, s):
+        return statistics.mean(abs(p - s.get(franja_de(k), 0) - o) for k, p, o, _, _ in fs)
+
+    def mae_h(fs, sh):
+        e = [abs(min(100, max(0, ph - sh)) - oh) for _, _, _, ph, oh in fs if ph is not None and oh is not None]
+        return statistics.mean(e) if len(e) >= 24 else None
+
+    s_ent, h_ent = sesgos(f_ent)
+    t_crudo, t_corr = mae_t(f_pru, {}), mae_t(f_pru, s_ent)
+    h_crudo, h_corr = mae_h(f_pru, 0), mae_h(f_pru, h_ent)
+    usar_t = t_corr < t_crudo - 0.05
+    usar_h = h_corr is not None and h_crudo is not None and h_corr < h_crudo - 0.5
+    s_all, h_all = sesgos(filas)
+    return {"verificado": True, "activa": usar_t, "horas": len(filas),
+            "sesgo": s_all if usar_t else {fr: 0.0 for fr in FRANJAS},
+            "sesgo_hum": h_all if usar_h else 0.0,
+            "mae": round(t_corr if usar_t else t_crudo, 1), "mae_crudo": round(t_crudo, 1),
+            "mae_hum": round(h_corr if usar_h else h_crudo) if h_crudo is not None else None}
+
+
+def correccion_temp(cfg, hora):
+    tc = cfg.get("temp") or {}
+    return ((tc.get("sesgo") or {}).get(franja_de(hora), 0) if tc.get("activa") else 0), (tc.get("sesgo_hum") or 0)
+
+
 # ----------------------- TORMENTAS ELÉCTRICAS -----------------------
 def es_tormenta(codigo):
     return codigo is not None and codigo >= 95
@@ -740,7 +818,8 @@ def verificar(p):
         if not cfg.get("metar"):
             continue
         try:
-            obs = descargar_obs(cfg["metar"], DIAS_VERIFICACION)
+            temps = {}
+            obs = descargar_obs(cfg["metar"], DIAS_VERIFICACION, temps)
             time.sleep(1)
             cobertura = len(obs) / (DIAS_VERIFICACION * 24)
             arch.setdefault(c, {}).update({k: list(v) for k, v in obs.items()})
@@ -748,7 +827,7 @@ def verificar(p):
                 log_error(f"{c}: el aeropuerto solo reportó {cobertura:.0%} de las horas "
                           f"(mínimo {cfg['cob_min']:.0%}); se mantiene la configuración anterior")
                 continue
-            previos, cods = descargar_previos(cfg["est"][0], cfg["est"][1], DIAS_VERIFICACION)
+            previos, cods, tprev = descargar_previos(cfg["est"][0], cfg["est"][1], DIAS_VERIFICACION)
             prev = previos.get(1, {})
             if len(prev) < MIN_MODELOS:
                 log_error(f"{c}: solo {len(prev)} modelos con historial; se mantiene la configuración anterior")
@@ -771,6 +850,11 @@ def verificar(p):
             except Exception as e:
                 log_error(f"tormentas {c}: {e}")
                 r["tormenta"] = (p["ciudades"].get(c) or {}).get("tormenta") or {"verificado": False}
+            try:
+                r["temp"] = calibrar_temp(temps, tprev)
+            except Exception as e:
+                log_error(f"temperatura {c}: {e}")
+                r["temp"] = (p["ciudades"].get(c) or {}).get("temp") or {"verificado": False}
             p["ciudades"][c] = r
             ex = r.get("examen") or {}
             print(f"  {c}: {r['horas']} h, {r['horas_lluvia']} con lluvia, umbral {r['umbral']} mm/h, "
@@ -865,6 +949,7 @@ def consenso(data, cfg, lat=None, lon=None, offset_s=OFFSET_S):
             if v is not None: vto.append(v)
         if not lluvia:
             continue
+        corr_t, corr_h = correccion_temp(cfg, t)
         claro = radiacion_despejado(lat, lon, t, offset_s)
         sol = round(min(mediana(rad) / claro, 1.2), 2) if claro > 0 and len(rad) >= 2 else None
         bruta = prob_consenso(lluvia, pesos, umbral)
@@ -877,7 +962,7 @@ def consenso(data, cfg, lat=None, lon=None, offset_s=OFFSET_S):
             "hora": t, "prob": round(prob), "prob_dz": round(prob_dz), "prob_bruta": round(bruta),
             "mm": round(mediana_ponderada(lluvia, pesos), 1),
             "min": round(min(lluvia.values()), 1), "max": round(max(lluvia.values()), 1),
-            "temp": round(statistics.mean(temp.values()), 1) if temp else None,
+            "temp": round(statistics.mean(temp.values()) - corr_t, 1) if temp else None,
             "nubes": round(statistics.mean(nubes.values())) if nubes else None,
             "nubes_bm": round(statistics.mean(nbm)) if nbm else None,
             "sol": sol,
@@ -885,7 +970,7 @@ def consenso(data, cfg, lat=None, lon=None, offset_s=OFFSET_S):
             "niebla": round(sum(c in (45, 48) for c in cods.values()) / len(cods) * 100) if cods else 0,
             "rafaga": round(mediana(raf)) if raf else None,
             "uv": round(mediana(uv), 1) if uv else None,
-            "hum": round(mediana(hum)) if hum else None,
+            "hum": round(min(100, max(0, mediana(hum) - corr_h))) if hum else None,
             "viento": round(mediana(vto)) if vto else None,
             "conf": "Alta" if acuerdo >= 80 else "Media" if acuerdo >= 60 else "Baja",
             "detalle": {MODELOS[m]: round(v, 1) for m, v in lluvia.items()}, "n": len(lluvia), "plazo": plazo,
@@ -1030,6 +1115,22 @@ def html_plazos(cfg):
     return out
 
 
+def html_temp(t, ciudad):
+    out = "<h4>Temperatura, humedad y sensación térmica</h4>"
+    if not t or not t.get("verificado"):
+        return out + ("<p class='nota'>Todavía estamos reuniendo datos del aeropuerto para comprobar la temperatura "
+                      "aquí. Mientras tanto la sensación térmica es orientativa.</p>")
+    aero = AEROPUERTOS.get(CIUDADES[ciudad]["metar"], "aeropuerto")
+    g = lambda x: f"{x:.1f}".replace(".", ",")
+    li = [f"<li>Comparamos cada hora la temperatura y la humedad con las que mide el {aero}.</li>",
+          f"<li>La temperatura acierta <b>±{g(t['mae'])}°</b> en promedio"
+          + (f" (los modelos sin corregir: ±{g(t['mae_crudo'])}°)" if t.get("activa") else "") + ".</li>"]
+    if t.get("mae_hum") is not None:
+        li.append(f"<li>La humedad acierta <b>±{t['mae_hum']}%</b>.</li>")
+    return (out + "<ul class='lst'>" + "".join(li) + "</ul><p class='nota'>Con esa temperatura y esa humedad "
+            "calculamos la sensación térmica (índice de calor de la NOAA).</p>")
+
+
 def html_tormenta(t, ciudad):
     aero = AEROPUERTOS.get(CIUDADES[ciudad]["metar"], "aeropuerto")
     out = "<h4>Tormentas eléctricas</h4>"
@@ -1057,6 +1158,7 @@ def datos_ciudad(p, ciudad, filas, normal=None):
     verif = html_verificacion(cfg, ref) if ref else html_verificacion(cfg, ciudad)
     verif += html_plazos(cfg)
     verif += html_tormenta(cfg.get("tormenta"), ref or ciudad)
+    verif += html_temp(cfg.get("temp"), ref or ciudad)
     verif += html_reportes(p["ciudades"].get(ciudad, {}).get("reportes"))
     verif += ("<p class='nota'>Niebla, ráfagas de viento e índice UV vienen de los modelos y todavía "
               "<b>no</b> se verifican; tómalos como referencia.</p>")
@@ -1072,8 +1174,9 @@ def datos_ciudad(p, ciudad, filas, normal=None):
                     "franjas": cfg.get("franjas") if (cfg.get("franjas") or {}).get("activa") else None,
                     "plazos": {d: {"verificado": z.get("verificado", False), "tabla": z.get("tabla") or [],
                                    "mejora": z.get("mejora_vs_clima_pct")}
-                               for d, z in (cfg.get("plazos") or {}).items()}},
-            "normal_max": normal,
+                                 for d, z in (cfg.get("plazos") or {}).items()},
+                    "temp": {k: (cfg.get("temp") or {}).get(k) for k in ("activa", "sesgo", "sesgo_hum")}},
+            "normal_max": None if normal is None else round(normal - correccion_temp(cfg, "2000-01-01T15:00")[0], 1),
             "filas": [f if i < 96 else dict(f, detalle={}) for i, f in enumerate(filas)], "verif_html": verif}
 
 
@@ -1324,7 +1427,7 @@ def s3_listar(prefijo):
 
 
 # Satélites geoestacionarios que ven Ecuador, en orden de preferencia (GOES-Este está justo encima)
-SAT_PREFERIDOS = ["GOES-19", "GOES-East", "GOES-16", "GOES-18", "GOES-West", "GOES-17"]
+SAT_PREFERIDOS = ["G19", "GOES-19", "BLEND", "G16", "GOES-16", "G18", "GOES-18"]   # carpetas reales: G19, BLEND, G16, G18
 
 
 def err_ultimo():
@@ -1333,9 +1436,9 @@ def err_ultimo():
     nombre = lambda c: c.rstrip("/").rsplit("/", 1)[-1]
     raices = [c for p in SAT_PREFERIDOS for c in carpetas if nombre(c).upper().startswith(p.upper())]
     if not raices:
-        raise RuntimeError("no hay carpeta de GOES en NOAA; carpetas: " + ", ".join(nombre(c) for c in carpetas))
+        raise RuntimeError("no hay carpeta de GOES/BLEND en NOAA; carpetas: " + ", ".join(nombre(c) for c in carpetas))
     errores = []
-    for raiz in raices[:2]:
+    for raiz in raices[:3]:
         pref, recorrido = raiz, [nombre(raiz)]
         try:
             for _ in range(8):
@@ -2030,6 +2133,26 @@ html[data-tema=claro] .hc.cal .hh,html[data-tema=claro] .hot,html[data-tema=clar
 html[data-tema=claro] .chip.hot{background:#fee2e2;color:#991b1b}html[data-tema=claro] .chip.hot b{color:#7f1d1d}
 html[data-tema=claro] .alerta.calor{background:linear-gradient(90deg,#ea580c,#dc2626)}
 @media(min-width:980px){.horas{margin:4px 0 0;padding:0 0 4px}}
+/* ---------- v14: tarjetas de detalle, gráfica por variable ---------- */
+.hc .ht{font-size:15px;font-weight:500;margin-top:2px}
+.tline{margin-top:0}
+.tldet{margin-top:10px}
+.dhead{display:flex;gap:8px;align-items:baseline;font-size:14px;margin-bottom:8px}
+.dhead span{color:var(--tx2)}
+.dcards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+.dc{background:var(--card2);border-radius:12px;padding:8px 10px;min-width:0}
+.dc span{display:block;font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx3)}
+.dc b{display:block;font-size:17px;font-weight:600;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dc small{display:block;font-size:11.5px;color:var(--tx2);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dc.agua b{color:#60a5fa}.dc.ts b{color:#a78bfa}.dc.hot b{color:#f87171}
+.dexp .dcards{margin:4px 0 6px}
+.gsel{display:flex;gap:6px;margin:-2px 0 10px;overflow-x:auto;scrollbar-width:none}
+.gsel::-webkit-scrollbar{display:none}
+.gb{flex:none;border:1px solid var(--line);background:none;border-radius:999px;padding:6px 13px;font-size:13px;color:var(--tx2);cursor:pointer;min-height:34px}
+.gb.on{background:var(--card2);border-color:var(--card2);color:var(--tx);font-weight:600}
+.ley .lg{cursor:default}
+html[data-tema=claro] .dc.agua b{color:#2563eb}html[data-tema=claro] .dc.ts b{color:#7c3aed}html[data-tema=claro] .dc.hot b{color:#dc2626}
+@media(min-width:980px){.dcards{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 """
 
@@ -2127,6 +2250,7 @@ function filasDesdeOM(h, cfg, lat, lon, off) {
     }
     if (!Object.keys(ll).length) return;
     const bruta = probConsenso(ll, cfg.pesos, cfg.umbral), brutaDz = probConsenso(ll, cfg.pesos, D.umbral_llovizna);
+    const tc = cfg.temp && cfg.temp.activa ? (cfg.temp.sesgo || {})[franjaDe(t)] || 0 : 0, hc = (cfg.temp && cfg.temp.sesgo_hum) || 0;
     const plazo = plazoDe(t, off), prob = calibrarProb(bruta, tablaPara(cfg, plazo, t)), probDz = Math.max(calibrarProb(brutaDz, cfg.tabla_llovizna), prob);
     const ac = Math.max(bruta, 100 - bruta), vals = Object.values(ll), det = {};
     for (const m in ll) det[D.modelos[m]] = r1(ll[m]);
@@ -2134,13 +2258,13 @@ function filasDesdeOM(h, cfg, lat, lon, off) {
     const pts = cods.length ? cods.filter(c => c >= 95).length / cods.length * 100 : 0;
     filas.push({hora: t, prob: Math.round(prob), prob_dz: Math.round(probDz), prob_bruta: Math.round(bruta),
       mm: r1(medianaPond(ll, cfg.pesos)), min: r1(Math.min(...vals)), max: r1(Math.max(...vals)),
-      temp: te.length ? r1(media(te)) : null, nubes: nu.length ? Math.round(media(nu)) : null,
+      temp: te.length ? r1(media(te) - tc) : null, nubes: nu.length ? Math.round(media(nu)) : null,
       nubes_bm: nbm.length ? Math.round(media(nbm)) : null,
       sol: claro > 0 && rad.length >= 2 ? Math.round(Math.min(mediana(rad) / claro, 1.2) * 100) / 100 : null,
       prob_ts: cods.length ? Math.round(calibrarProb(pts, cfg.tabla_tormenta)) : 0,
       niebla: cods.length ? Math.round(cods.filter(c => c === 45 || c === 48).length / cods.length * 100) : 0,
       rafaga: raf.length ? Math.round(mediana(raf)) : null, uv: uv.length ? r1(mediana(uv)) : null,
-      hum: hu.length ? Math.round(mediana(hu)) : null, viento: vi.length ? Math.round(mediana(vi)) : null,
+      hum: hu.length ? Math.round(Math.min(100, Math.max(0, mediana(hu) - hc))) : null, viento: vi.length ? Math.round(mediana(vi)) : null,
       conf: ac >= 80 ? 'Alta' : ac >= 60 ? 'Media' : 'Baja', detalle: det, n: Object.keys(ll).length, plazo});
   });
   return filas;
@@ -2296,33 +2420,36 @@ function nivelUV(u) { return u < 3 ? 'bajo' : u < 6 ? 'moderado' : u < 8 ? 'alto
 const ANCHO_HORA = 54;
 function lineaTiempo(rows, ahora) {
   const n = rows.length; if (!n) return '';
-  const temps = rows.map(r => r.temp), validas = temps.filter(t => t != null);
+  const validas = rows.filter(r => r.temp != null).map(r => r.temp);
   const tmin = Math.min(...validas), tmax = Math.max(...validas), rng = Math.max(tmax - tmin, 2);
-  const W = n * ANCHO_HORA, H = 46, Y = t => 30 - (t - tmin) / rng * 18;
+  const W = n * ANCHO_HORA, H = 22, Y = t => 17 - (t - tmin) / rng * 12;
   const pts = rows.map((r, i) => r.temp == null ? null : [i * ANCHO_HORA + ANCHO_HORA / 2, Y(r.temp)]).filter(Boolean);
-  const k = claro(), col = k ? '#f59e0b' : '#fbbf24';
-  const linea = pts.length > 1 ? `<path d="${curvaSuave(pts)}" fill="none" stroke="${col}" stroke-width="2" stroke-linecap="round" opacity=".9"/>` : '';
-  const marcas = rows.map((r, i) => r.temp == null ? '' :
-    `<circle cx="${i * ANCHO_HORA + ANCHO_HORA / 2}" cy="${Y(r.temp)}" r="2.6" fill="${col}"/>` +
-    `<text x="${i * ANCHO_HORA + ANCHO_HORA / 2}" y="${Y(r.temp) - 7}" text-anchor="middle" class="tt">${Math.round(r.temp)}°</text>`).join('');
-  const horas = rows.map((r, i) => { const c = condicion(r), s = sens(r), cal = s >= 32 && !esNoche(r.hora);
+  const col = claro() ? '#f59e0b' : '#fbbf24';
+  const linea = pts.length > 1 ? `<path d="${curvaSuave(pts)}" fill="none" stroke="${col}" stroke-width="2" stroke-linecap="round" opacity=".85"/>` : '';
+  const puntos = pts.map(([x, y]) => `<circle cx="${x}" cy="${y}" r="2.4" fill="${col}"/>`).join('');
+  const horas = rows.map((r, i) => { const c = condicion(r), s = sens(r), cal = s >= UMBRAL_CALOR && !esNoche(r.hora);
     const pr = (r.prob_ts || 0) >= 30 ? `<span class="hp ts">⚡${r.prob_ts}%</span>` : r.prob >= 10 ? `<span class="hp">${r.prob}%</span>` : '<span class="hp"></span>';
     return `<button class="hc${estado.tlSel === r.hora ? ' sel' : ''}${cal ? ' cal' : ''}" data-i="${i}" aria-label="${r.hora.slice(11, 16)}: ${c[1]}, ${r.temp != null ? Math.round(r.temp) + ' grados' : ''}, lluvia ${r.prob}%">` +
-      `<span class="hh">${r.hora === ahora ? 'Ahora' : +r.hora.slice(11, 13) + 'h'}</span><span class="hi">${icono(c[0], 28)}</span>${pr}</button>`; }).join('');
+      `<span class="hh">${r.hora === ahora ? 'Ahora' : +r.hora.slice(11, 13) + 'h'}</span><span class="hi">${icono(c[0], 28)}</span>${pr}` +
+      `<span class="ht">${r.temp != null ? Math.round(r.temp) + '°' : '–'}</span></button>`; }).join('');
   return `<div class="tl"><div class="horas" role="list"><div class="hfila" style="width:${W}px">${horas}</div>` +
-    `<svg class="tline" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" aria-hidden="true">${linea}${marcas}</svg></div>` +
+    `<svg class="tline" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" aria-hidden="true">${linea}${puntos}</svg></div>` +
     `<div class="tldet" aria-live="polite"></div></div>`;
 }
+// tarjetas de detalle: etiqueta pequeña arriba, valor grande abajo; lo importante primero
+function tarjetas(items) {
+  return '<div class="dcards">' + items.filter(Boolean).map(([l, v, c, sub]) => `<div class="dc${c ? ' ' + c : ''}"><span>${l}</span><b>${v}</b>${sub ? `<small>${sub}</small>` : ''}</div>`).join('') + '</div>';
+}
 function detalleHora(r) {
-  const c = condicion(r), s = sens(r), partes = [];
-  if (r.temp != null) partes.push(`${Math.round(r.temp)}°` + (s - r.temp >= 2 ? ` (se siente ${Math.round(s)}°)` : ''));
-  partes.push(c[1]);
-  partes.push(r.prob >= 10 ? `lluvia ${r.prob}%${r.prob >= 20 ? ', ' + intensidad(r.mm) : ''}` : 'sin lluvia');
-  if ((r.prob_ts || 0) >= 10) partes.push(`tormenta eléctrica ${r.prob_ts}%`);
-  if (r.hum != null) partes.push(`humedad ${r.hum}%`);
-  if (r.viento != null) partes.push(`viento ${r.viento} km/h` + ((r.rafaga || 0) >= 40 ? ` (ráfagas ${r.rafaga})` : ''));
-  if (r.uv != null && r.uv >= 3) partes.push(`UV ${Math.round(r.uv)}`);
-  return `<b>${r.hora.slice(11, 16)}</b> · ` + partes.join(' · ');
+  const c = condicion(r), s = sens(r), llueve = r.prob >= 20 || (r.prob_ts || 0) >= 10 || r.prob_dz >= 50;
+  const lluvia = ['Lluvia', r.prob >= 10 ? `${r.prob}%` : 'No', r.prob >= 40 ? 'agua' : '', r.prob >= 20 ? intensidad(r.mm) : r.prob >= 10 ? 'poco probable' : 'prevista'];
+  const ts = (r.prob_ts || 0) >= 10 ? ['Tormenta', `${r.prob_ts}%`, 'ts', 'eléctrica'] : null;
+  const se = r.temp != null ? ['Se siente', `${Math.round(s)}°`, s >= UMBRAL_CALOR ? 'hot' : '', s >= UMBRAL_CALOR ? nivelCalor(s)[0].toLowerCase() : ''] : null;
+  const uv = !esNoche(r.hora) && r.uv != null && r.uv >= 1 ? ['Índice UV', `${Math.round(r.uv)}`, r.uv >= 8 ? 'hot' : '', nivelUV(r.uv)] : null;
+  const hu = r.hum != null ? ['Humedad', `${r.hum}%`] : null;
+  const vi = r.viento != null ? ['Viento', `${r.viento} km/h`, '', (r.rafaga || 0) >= 30 ? `ráfagas ${r.rafaga}` : ''] : null;
+  return `<div class="dhead"><b>${r.hora.slice(11, 16)}</b><span>${c[1]}${r.temp != null ? ' · ' + Math.round(r.temp) + '°' : ''}</span></div>` +
+    tarjetas(llueve ? [lluvia, ts, se, hu, vi, uv] : [se, uv, hu, vi, lluvia, ts]);
 }
 function activarLinea(cont, rows) {
   const tira = cont.querySelector('.horas'), det = cont.querySelector('.tldet'); if (!tira) return;
@@ -2357,98 +2484,115 @@ function curvaSuave(pts) {
     d += ` C${(pts[i][0] + h).toFixed(1)},${(pts[i][1] + t[i] * h).toFixed(1)} ${(pts[i + 1][0] - h).toFixed(1)},${(pts[i + 1][1] - t[i + 1] * h).toFixed(1)} ${pts[i + 1][0].toFixed(1)},${pts[i + 1][1].toFixed(1)}`; }
   return d;
 }
-function grafica(cont, filas, ahora, hoy) {
-  const k = claro(), oc = estado.ocultas, n = filas.length, W = Math.max(cont.clientWidth, 280);
+function grafica(cont, filas, ahora, hoy, vr) {
+  const k = claro(), n = filas.length, W = Math.max(cont.clientWidth, 280);
   const C = k ? {txt: '#64748b', fuerte: '#334155', grid: '#e5e7eb', noche: 'rgba(15,23,42,.05)', banda1: 'rgba(37,99,235,.07)', banda2: 'rgba(37,99,235,.035)',
-                 linea: '#2563eb', area: '#3b82f6', dz: '#94a3b8', ts: '#7c3aed', pico: '#0f172a', fondo: '#ffffff'}
+                 linea: '#2563eb', area: '#3b82f6', ts: '#7c3aed', pico: '#0f172a', fondo: '#ffffff', temp: '#f59e0b', sens: '#dc2626', vto: '#0d9488', calor: 'rgba(239,68,68,.07)'}
                : {txt: '#7c8696', fuerte: '#cbd5e1', grid: '#1c2433', noche: 'rgba(255,255,255,.03)', banda1: 'rgba(96,165,250,.08)', banda2: 'rgba(96,165,250,.035)',
-                 linea: '#60a5fa', area: '#3b82f6', dz: '#94a3b8', ts: '#a78bfa', pico: '#ffffff', fondo: '#111723'};
-  const hayMm = !oc.has('mm') && filas.some(r => r.mm >= 0.1);
-  const hayT = !oc.has('temp') && filas.some(r => r.temp != null);
-  const pl = 34, pr = 10, pt = 30, h1 = W < 500 ? 130 : 160, gap = hayMm ? 22 : 0, h2 = hayMm ? 46 : 0, gap3 = hayT ? 24 : 0, h3 = hayT ? 70 : 0, pb = 24;
-  const hT = h1 + gap + h2 + gap3 + h3;
-  const H = pt + hT + pb, w = W - pl - pr, dx = w / Math.max(n - 1, 1);
-  const X = i => pl + i * dx, Y = p => pt + h1 - h1 * Math.max(0, Math.min(100, p)) / 100;
-  const y2 = pt + h1 + gap, mmTope = Math.max(5, ...filas.map(r => r.mm)), Ym = v => y2 + h2 - h2 * Math.min(v, mmTope) / mmTope;
+                 linea: '#60a5fa', area: '#3b82f6', ts: '#a78bfa', pico: '#ffffff', fondo: '#111723', temp: '#fbbf24', sens: '#f87171', vto: '#5eead4', calor: 'rgba(239,68,68,.09)'};
+  const pl = 36, pr = 12, pt = 30, h = W < 500 ? 170 : 210, pb = 24, H = pt + h + pb, w = W - pl - pr, dx = w / Math.max(n - 1, 1);
+  const X = i => pl + i * dx;
+  const val = (r, c) => r[c] == null ? null : r[c];
+  // escala de cada variable
+  let lo = 0, hi = 100, ticks = [0, 20, 50, 100], fy = v => v + '%', principal = 'prob';
+  if (vr === 'temp') {
+    const vs = filas.flatMap(r => r.temp == null ? [] : [r.temp, sens(r)]);
+    lo = Math.floor(Math.min(...vs)) - 1; hi = Math.ceil(Math.max(...vs)) + 1;
+    ticks = [lo + 1, Math.round((lo + hi) / 2), hi - 1]; fy = v => v + '°'; principal = 'temp';
+  } else if (vr === 'viento') {
+    const vs = filas.flatMap(r => [r.viento, r.rafaga].filter(x => x != null));
+    hi = Math.max(30, Math.ceil(Math.max(...vs, 0) / 10) * 10); ticks = [0, hi / 2, hi]; fy = v => v; principal = 'viento';
+  } else if (vr === 'uv') {
+    hi = Math.max(13, Math.ceil(Math.max(...filas.map(r => r.uv || 0))) + 2); ticks = [0, 3, 6, 8, 11]; fy = v => v; principal = 'uv';
+  }
+  const Y = v => pt + h - h * (Math.max(lo, Math.min(hi, v)) - lo) / (hi - lo);
   const xa = i => Math.max(pl, X(i) - dx / 2), xb = i => Math.min(W - pr, X(i) + dx / 2);
   const paso = n > 30 ? (W < 500 ? 12 : 6) : 3;
-  let s = `<svg class="graf" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="Probabilidad de lluvia por hora">`;
-  s += `<defs><linearGradient id="gl" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${C.area}" stop-opacity=".55"/><stop offset="1" stop-color="${C.area}" stop-opacity=".04"/></linearGradient></defs>`;
-  // noches sombreadas: ayudan a ubicar el día y la noche de un vistazo
+  let s = `<svg class="graf" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="Gráfica hora por hora">`;
+  s += `<defs><linearGradient id="gl" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${C.area}" stop-opacity=".55"/><stop offset="1" stop-color="${C.area}" stop-opacity=".04"/></linearGradient>` +
+       `<linearGradient id="gv" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${C.vto}" stop-opacity=".35"/><stop offset="1" stop-color="${C.vto}" stop-opacity=".03"/></linearGradient></defs>`;
   for (let i = 0; i < n;) { if (!esNoche(filas[i].hora)) { i++; continue; } let j = i; while (j + 1 < n && esNoche(filas[j + 1].hora)) j++;
-    s += `<rect x="${xa(i)}" y="${pt}" width="${xb(j) - xa(i)}" height="${hT}" fill="${C.noche}"/>`; i = j + 1; }
-  // zonas: probable (50-100) y posible (20-50), con su nombre a la derecha
-  s += `<rect x="${pl}" y="${Y(100)}" width="${w}" height="${Y(50) - Y(100)}" fill="${C.banda1}"/><rect x="${pl}" y="${Y(50)}" width="${w}" height="${Y(20) - Y(50)}" fill="${C.banda2}"/>`;
-  s += `<text x="${W - pr - 4}" y="${Y(100) + 13}" text-anchor="end" font-size="10.5" fill="${C.txt}" letter-spacing=".4">PROBABLE</text>` +
-       `<text x="${W - pr - 4}" y="${Y(50) + 13}" text-anchor="end" font-size="10.5" fill="${C.txt}" letter-spacing=".4">POSIBLE</text>`;
-  for (const p of [0, 20, 50, 100]) s += `<line x1="${pl}" x2="${W - pr}" y1="${Y(p)}" y2="${Y(p)}" stroke="${C.grid}" stroke-width="1"/><text x="${pl - 6}" y="${Y(p) + 4}" text-anchor="end" font-size="10.5" fill="${C.txt}">${p}%</text>`;
-  // días: separador y nombre arriba
+    s += `<rect x="${xa(i)}" y="${pt}" width="${xb(j) - xa(i)}" height="${h}" fill="${C.noche}"/>`; i = j + 1; }
+  const banda = (v0, v1, color, txt) => { const y0 = Y(v1), y1 = Y(v0);
+    s += `<rect x="${pl}" y="${y0}" width="${w}" height="${Math.max(y1 - y0, 0)}" fill="${color}"/>`;
+    if (txt) s += `<text x="${W - pr - 4}" y="${y0 + 13}" text-anchor="end" font-size="10.5" fill="${C.txt}" letter-spacing=".4">${txt}</text>`; };
+  if (vr === 'lluvia') { banda(50, 100, C.banda1, 'PROBABLE'); banda(20, 50, C.banda2, 'POSIBLE'); }
+  if (vr === 'temp' && hi > UMBRAL_CALOR) banda(Math.max(UMBRAL_CALOR, lo), hi, C.calor, 'CALOR INTENSO');
+  if (vr === 'viento' && hi > 40) banda(40, hi, C.calor, 'RÁFAGAS FUERTES');
+  for (const v of ticks) s += `<line x1="${pl}" x2="${W - pr}" y1="${Y(v)}" y2="${Y(v)}" stroke="${C.grid}" stroke-width="1"${v === lo ? '' : ' stroke-dasharray="2 4"'}/><text x="${pl - 6}" y="${Y(v) + 4}" text-anchor="end" font-size="10.5" fill="${C.txt}">${fy(v)}</text>`;
+  if (vr === 'viento') s += `<text x="${pl}" y="${pt - 14}" font-size="10" fill="${C.txt}">km/h</text>`;
   const inicios = filas.map((r, i) => i === 0 || r.hora.slice(11, 13) === '00' ? i : -1).filter(i => i >= 0);
   inicios.forEach((i, q) => { const fin = q + 1 < inicios.length ? inicios[q + 1] : n, ancho = X(fin - 1) - X(i);
-    if (i) s += `<line x1="${X(i)}" x2="${X(i)}" y1="${pt - 18}" y2="${pt + hT}" stroke="${C.grid}" stroke-width="1"/>`;
-    if (ancho > 38) s += `<text x="${X(i) + 5}" y="${pt - 10}" font-size="11.5" font-weight="600" fill="${C.fuerte}">${nombreDia(filas[i].hora.slice(0, 10), hoy)}</text>`; });
-  // horas abajo
+    if (i) s += `<line x1="${X(i)}" x2="${X(i)}" y1="${pt - 18}" y2="${pt + h}" stroke="${C.grid}" stroke-width="1"/>`;
+    if (ancho > 38) s += `<text x="${X(i) + 5}" y="${pt - 12}" font-size="11.5" font-weight="600" fill="${C.fuerte}">${nombreDia(filas[i].hora.slice(0, 10), hoy)}</text>`; });
   filas.forEach((r, i) => { const hh = +r.hora.slice(11, 13); if (hh % paso === 0 && X(i) > pl + 8 && X(i) < W - pr - 8)
-    s += `<text x="${X(i)}" y="${H - 7}" text-anchor="middle" font-size="10.5" fill="${C.txt}">${hh === 0 ? '0h' : hh + 'h'}</text>`; });
-  const pts = (campo, min = 0) => filas.map((r, i) => [X(i), Y((r[campo] || 0) >= min ? r[campo] : 0)]);
-  if (!oc.has('llovizna')) s += `<path d="${curvaSuave(pts('prob_dz'))}" fill="none" stroke="${C.dz}" stroke-width="1.3" stroke-dasharray="4 4" opacity=".8"/>`;
-  if (!oc.has('lluvia')) { const d = curvaSuave(pts('prob'));
-    s += `<path d="${d} L${X(n - 1)},${Y(0)} L${X(0)},${Y(0)} Z" fill="url(#gl)"/><path d="${d}" fill="none" stroke="${C.linea}" stroke-width="2.4" stroke-linejoin="round"/>`; }
-  if (!oc.has('tormenta') && filas.some(r => (r.prob_ts || 0) >= 10)) {
-    s += `<path d="${curvaSuave(pts('prob_ts', 15))}" fill="none" stroke="${C.ts}" stroke-width="1.5" stroke-dasharray="1.5 3.5" stroke-linecap="round"/>`;
-    filas.forEach((r, i) => { if ((r.prob_ts || 0) >= 30 && (i === 0 || (filas[i - 1].prob_ts || 0) < 30))
-      s += `<text x="${X(i)}" y="${Y(r.prob_ts) - 6}" text-anchor="middle" font-size="13">⚡</text>`; });
-  }
-  // pico de cada día con su porcentaje y hora
-  if (!oc.has('lluvia')) inicios.forEach((i, q) => { const fin = q + 1 < inicios.length ? inicios[q + 1] : n; let b = i;
-    for (let j = i; j < fin; j++) if (filas[j].prob > filas[b].prob) b = j;
-    if (filas[b].prob < 20 || fin - i < 4) return;
-    const x = Math.max(pl + 22, Math.min(W - pr - 60, X(b))), y = Math.max(pt + 12, Y(filas[b].prob) - 9);
-    s += `<circle cx="${X(b)}" cy="${Y(filas[b].prob)}" r="3.5" fill="${C.linea}" stroke="${C.fondo}" stroke-width="1.5"/>` +
-         `<text x="${x}" y="${y}" text-anchor="middle" font-size="11.5" font-weight="700" fill="${C.pico}" paint-order="stroke" stroke="${C.fondo}" stroke-width="3">${filas[b].prob}%<tspan font-weight="400" fill="${C.txt}"> ${filas[b].hora.slice(11, 13)}h</tspan></text>`; });
-  // cantidad: panel propio, con color según la intensidad
-  if (hayMm) {
-    s += `<text x="${pl}" y="${y2 - 6}" font-size="10.5" fill="${C.txt}">Cantidad si llueve (mm/h)</text>` +
-         `<line x1="${pl}" x2="${W - pr}" y1="${y2 + h2}" y2="${y2 + h2}" stroke="${C.grid}"/>`;
-    for (const v of [2, 5]) if (v <= mmTope) s += `<line x1="${pl}" x2="${W - pr}" y1="${Ym(v)}" y2="${Ym(v)}" stroke="${C.grid}" stroke-dasharray="2 4"/><text x="${pl - 6}" y="${Ym(v) + 4}" text-anchor="end" font-size="10" fill="${C.txt}">${v}</text>`;
-    filas.forEach((r, i) => { if (r.mm < 0.1) return; const c = r.mm < 2 ? (k ? '#93c5fd' : '#38bdf8') : r.mm < 5 ? (k ? '#2563eb' : '#3b82f6') : '#a855f7';
-      const x0 = Math.max(pl, X(i) - dx * 0.38), x1 = Math.min(W - pr, X(i) + dx * 0.38);
-      s += `<rect x="${x0}" y="${Ym(r.mm)}" width="${Math.max(x1 - x0, 1)}" height="${y2 + h2 - Ym(r.mm)}" rx="1.5" fill="${c}" opacity="${Math.max(0.35, r.prob / 100)}"/>`; });
-  }
-  // temperatura y sensación térmica (índice de calor)
-  if (hayT) {
-    const y3 = pt + h1 + gap + h2 + gap3, ts = filas.filter(r => r.temp != null), ss = ts.map(sens);
-    const lo = Math.floor(Math.min(...ts.map(r => r.temp))) - 1, hi = Math.ceil(Math.max(...ss, ...ts.map(r => r.temp))) + 1;
-    const Yt = v => y3 + h3 - h3 * (v - lo) / Math.max(hi - lo, 1);
-    s += `<text x="${pl}" y="${y3 - 8}" font-size="10.5" fill="${C.txt}">Temperatura y sensación térmica (°C)</text>`;
-    for (const v of [lo + 1, Math.round((lo + hi) / 2), hi - 1]) s += `<line x1="${pl}" x2="${W - pr}" y1="${Yt(v)}" y2="${Yt(v)}" stroke="${C.grid}" stroke-dasharray="2 4"/><text x="${pl - 6}" y="${Yt(v) + 4}" text-anchor="end" font-size="10" fill="${C.txt}">${v}°</text>`;
-    if (hi > UMBRAL_CALOR && lo < hi) { const yu = Yt(Math.max(UMBRAL_CALOR, lo));
-      s += `<rect x="${pl}" y="${y3}" width="${w}" height="${Math.max(yu - y3, 0)}" fill="${k ? 'rgba(239,68,68,.07)' : 'rgba(239,68,68,.09)'}"/>` +
-           `<text x="${W - pr - 4}" y="${y3 + 11}" text-anchor="end" font-size="10" fill="${k ? '#dc2626' : '#f87171'}" letter-spacing=".4">CALOR INTENSO</text>`; }
-    const pT = filas.map((r, i) => r.temp == null ? null : [X(i), Yt(r.temp)]).filter(Boolean);
-    const pS = filas.map((r, i) => r.temp == null ? null : [X(i), Yt(sens(r))]).filter(Boolean);
-    if (ss.some((v, i) => v - ts[i].temp >= 1)) s += `<path d="${curvaSuave(pS)}" fill="none" stroke="${k ? '#dc2626' : '#f87171'}" stroke-width="1.5" stroke-dasharray="4 3"/>`;
-    s += `<path d="${curvaSuave(pT)}" fill="none" stroke="${k ? '#f59e0b' : '#fbbf24'}" stroke-width="2"/>`;
+    s += `<text x="${X(i)}" y="${H - 7}" text-anchor="middle" font-size="10.5" fill="${C.txt}">${hh}h</text>`; });
+  const serie = (f, min = -Infinity) => filas.map((r, i) => { const v = f(r); return v == null ? null : [X(i), Y(v >= min ? v : lo)]; }).filter(Boolean);
+  const etiqueta = (x0, y0, txt, sub) => { const x = Math.max(pl + 22, Math.min(W - pr - 40, x0)), y = Math.max(pt + 12, y0 - 9);
+    s += `<text x="${x}" y="${y}" text-anchor="middle" font-size="11.5" font-weight="700" fill="${C.pico}" paint-order="stroke" stroke="${C.fondo}" stroke-width="3">${txt}${sub ? `<tspan font-weight="400" fill="${C.txt}"> ${sub}</tspan>` : ''}</text>`; };
+  const picoDia = f => inicios.map((i, q) => { const fin = q + 1 < inicios.length ? inicios[q + 1] : n; let b = i;
+    for (let j = i; j < fin; j++) if ((f(filas[j]) ?? -1e9) > (f(filas[b]) ?? -1e9)) b = j; return fin - i >= 4 ? b : -1; }).filter(b => b >= 0);
+  let leyenda = [];
+  if (vr === 'lluvia') {
+    const d = curvaSuave(serie(r => r.prob));
+    s += `<path d="${d} L${X(n - 1)},${Y(0)} L${X(0)},${Y(0)} Z" fill="url(#gl)"/><path d="${d}" fill="none" stroke="${C.linea}" stroke-width="2.4" stroke-linejoin="round"/>`;
+    leyenda.push([C.linea, 'Probabilidad de lluvia', '']);
+    if (filas.some(r => (r.prob_ts || 0) >= 15)) {
+      s += `<path d="${curvaSuave(serie(r => r.prob_ts || 0, 15))}" fill="none" stroke="${C.ts}" stroke-width="1.6" stroke-dasharray="1.5 3.5" stroke-linecap="round"/>`;
+      filas.forEach((r, i) => { if ((r.prob_ts || 0) >= 30 && (i === 0 || (filas[i - 1].prob_ts || 0) < 30)) s += `<text x="${X(i)}" y="${Y(r.prob_ts) - 6}" text-anchor="middle" font-size="13">⚡</text>`; });
+      leyenda.push([C.ts, 'Tormenta eléctrica', 'pt']);
+    }
+    picoDia(r => r.prob).forEach(b => { if (filas[b].prob >= 20) { s += `<circle cx="${X(b)}" cy="${Y(filas[b].prob)}" r="3.5" fill="${C.linea}" stroke="${C.fondo}" stroke-width="1.5"/>`;
+      etiqueta(X(b), Y(filas[b].prob), filas[b].prob + '%', filas[b].hora.slice(11, 13) + 'h'); } });
+    if (filas.every(r => r.prob < 10)) s += `<text x="${pl + w / 2}" y="${pt + h / 2}" text-anchor="middle" font-size="13" fill="${C.txt}">Sin lluvia prevista</text>`;
+  } else if (vr === 'temp') {
+    if (filas.some(r => r.temp != null && sens(r) - r.temp >= 1)) {
+      s += `<path d="${curvaSuave(serie(sens))}" fill="none" stroke="${C.sens}" stroke-width="1.6" stroke-dasharray="4 3"/>`;
+      leyenda.push([C.sens, 'Se siente', 'dash']);
+    }
+    s += `<path d="${curvaSuave(serie(r => r.temp))}" fill="none" stroke="${C.temp}" stroke-width="2.4"/>`;
+    leyenda.unshift([C.temp, 'Temperatura', '']);
+    picoDia(r => r.temp).forEach(b => { s += `<circle cx="${X(b)}" cy="${Y(filas[b].temp)}" r="3.5" fill="${C.temp}" stroke="${C.fondo}" stroke-width="1.5"/>`;
+      etiqueta(X(b), Y(filas[b].temp), Math.round(filas[b].temp) + '°', filas[b].hora.slice(11, 13) + 'h'); });
+  } else if (vr === 'viento') {
+    const d = curvaSuave(serie(r => r.viento));
+    if (filas.some(r => r.rafaga != null)) { s += `<path d="${curvaSuave(serie(r => r.rafaga))}" fill="none" stroke="${C.vto}" stroke-width="1.4" stroke-dasharray="4 3" opacity=".8"/>`; }
+    s += `<path d="${d} L${X(n - 1)},${Y(0)} L${X(0)},${Y(0)} Z" fill="url(#gv)"/><path d="${d}" fill="none" stroke="${C.vto}" stroke-width="2.4"/>`;
+    leyenda.push([C.vto, 'Viento', ''], [C.vto, 'Ráfagas', 'dash']);
+    picoDia(r => r.rafaga ?? r.viento).forEach(b => { const v = filas[b].rafaga ?? filas[b].viento; etiqueta(X(b), Y(v), Math.round(v), filas[b].hora.slice(11, 13) + 'h'); });
+  } else {
+    const colUV = u => u < 3 ? '#4ade80' : u < 6 ? '#facc15' : u < 8 ? '#fb923c' : u < 11 ? '#ef4444' : '#a855f7';
+    filas.forEach((r, i) => { if (!(r.uv > 0.4)) return; const x0 = Math.max(pl, X(i) - dx * 0.38), x1 = Math.min(W - pr, X(i) + dx * 0.38);
+      s += `<rect x="${x0}" y="${Y(r.uv)}" width="${Math.max(x1 - x0, 1)}" height="${Y(0) - Y(r.uv)}" rx="1.5" fill="${colUV(r.uv)}" opacity=".85"/>`; });
+    picoDia(r => r.uv).forEach(b => { if ((filas[b].uv || 0) >= 1) etiqueta(X(b), Y(filas[b].uv), Math.round(filas[b].uv), filas[b].hora.slice(11, 13) + 'h'); });
+    leyenda = [['#4ade80', 'Bajo', 'sq'], ['#facc15', 'Moderado', 'sq'], ['#fb923c', 'Alto', 'sq'], ['#ef4444', 'Muy alto', 'sq'], ['#a855f7', 'Extremo', 'sq']];
+    if (filas.every(r => !(r.uv > 0.4))) s += `<text x="${pl + w / 2}" y="${pt + h / 2}" text-anchor="middle" font-size="13" fill="${C.txt}">Sin sol en estas horas</text>`;
   }
   const ia = filas.findIndex(r => r.hora === ahora);
-  if (ia >= 0) s += `<line x1="${X(ia)}" x2="${X(ia)}" y1="${pt - 18}" y2="${pt + hT}" stroke="${C.fuerte}" stroke-width="1.5" stroke-dasharray="3 3"/>`;
-  s += `<line class="cursor" y1="${pt}" y2="${pt + hT}" visibility="hidden" stroke="${C.fuerte}" stroke-width="1"/><circle class="punto" r="5" visibility="hidden" fill="${C.linea}" stroke="${C.fondo}" stroke-width="2"/></svg><div class="tip" hidden></div>`;
+  if (ia >= 0) s += `<line x1="${X(ia)}" x2="${X(ia)}" y1="${pt - 18}" y2="${pt + h}" stroke="${C.fuerte}" stroke-width="1.5" stroke-dasharray="3 3"/>`;
+  s += `<line class="cursor" y1="${pt}" y2="${pt + h}" visibility="hidden" stroke="${C.fuerte}" stroke-width="1"/><circle class="punto" r="5" visibility="hidden" fill="${vr === 'temp' ? C.temp : vr === 'viento' ? C.vto : C.linea}" stroke="${C.fondo}" stroke-width="2"/></svg><div class="tip" hidden></div>`;
   cont.innerHTML = s;
+  cont._leyenda = leyenda;
   const svg = cont.querySelector('svg'), tip = cont.querySelector('.tip'), cur = svg.querySelector('.cursor'), pto = svg.querySelector('.punto');
   let ult = -1, activo = false;
+  const texto = r => {
+    const cab = `<b>${nombreDia(r.hora.slice(0, 10), hoy)} ${r.hora.slice(11, 16)}</b>`;
+    if (vr === 'lluvia') return cab + `<br>Lluvia: <b>${r.prob}%</b> (${r.prob >= 50 ? 'probable' : r.prob >= 20 ? 'posible' : 'poco probable'})` +
+      (r.prob >= 10 ? `<br>Si llueve: ${intensidad(r.mm)}${r.mm >= 0.1 ? ` · ${r.mm} mm/h` : ''}` : '') +
+      ((r.prob_ts || 0) >= 5 ? `<br>Tormenta eléctrica: <b>${r.prob_ts}%</b>` : '') + (r.prob_dz > r.prob + 5 ? `<br>Llovizna: ${r.prob_dz}%` : '');
+    if (vr === 'temp') return cab + `<br>Temperatura: <b>${Math.round(r.temp)}°</b>` + (sens(r) - r.temp >= 1 ? `<br>Se siente: <b>${Math.round(sens(r))}°</b>` : '') +
+      (r.hum != null ? `<br>Humedad: ${r.hum}%` : '');
+    if (vr === 'viento') return cab + `<br>Viento: <b>${r.viento ?? '–'} km/h</b>` + (r.rafaga != null ? `<br>Ráfagas: ${r.rafaga} km/h` : '');
+    return cab + (r.uv > 0.4 ? `<br>Índice UV: <b>${Math.round(r.uv)}</b> (${nivelUV(r.uv)})` + (r.uv >= 6 ? '<br>Usa protector solar y sombrero.' : '') : '<br>Sin radiación UV');
+  };
   const mostrar = ev => {
     const rc = svg.getBoundingClientRect(), i = Math.max(0, Math.min(n - 1, Math.round((ev.clientX - rc.left - pl) / dx))), r = filas[i];
     if (i !== ult && ev.pointerType === 'touch') tocar();
     ult = i;
+    const v = principal === 'temp' ? r.temp : r[principal];
     cur.setAttribute('x1', X(i)); cur.setAttribute('x2', X(i)); cur.setAttribute('visibility', 'visible');
-    pto.setAttribute('cx', X(i)); pto.setAttribute('cy', Y(r.prob)); pto.setAttribute('visibility', oc.has('lluvia') ? 'hidden' : 'visible');
-    const nivel = r.prob >= 50 ? 'probable' : r.prob >= 20 ? 'posible' : 'poco probable';
-    tip.innerHTML = `<b>${nombreDia(r.hora.slice(0, 10), hoy)} ${r.hora.slice(11, 16)}</b><br>Lluvia: <b>${r.prob}%</b> (${nivel})` +
-      (r.prob_dz > r.prob + 5 ? `<br>Llovizna: ${r.prob_dz}%` : '') +
-      ((r.prob_ts || 0) >= 5 ? `<br>Tormenta eléctrica: <b>${r.prob_ts}%</b>` : '') +
-      `<br>${r.prob >= 10 ? 'Si llueve: ' + intensidad(r.mm) + (r.mm >= 0.1 ? ` (${r.mm} mm/h)` : '') : 'Sin lluvia prevista'}` +
-      `<br>${r.temp != null ? Math.round(r.temp) + '°C' + (sens(r) - r.temp >= 1 ? ` · se siente ${Math.round(sens(r))}°` : '') + ' · ' : ''}${condicion(r)[1]}`;
-    tip.hidden = false;
+    pto.setAttribute('cx', X(i)); pto.setAttribute('cy', Y(v ?? lo)); pto.setAttribute('visibility', v == null || vr === 'uv' ? 'hidden' : 'visible');
+    tip.innerHTML = texto(r); tip.hidden = false;
     const tw = tip.offsetWidth, th = tip.offsetHeight;
     tip.style.left = Math.max(0, Math.min(W - tw, X(i) - tw / 2)) + 'px';
     const cab = ($('.top') || {}).offsetHeight || 60, arribaLibre = rc.top - th - 8 > cab + 4;
@@ -2496,13 +2640,16 @@ function htmlDias(dias, filas, ahora, hoy, cfg, off, onda) {
       const rfs = rs.filter(r => r.rafaga != null).map(r => r.rafaga), rfMax = rfs.length ? Math.max(...rfs) : null;
       const uvPico = horaPico(rs, r => r.uv), hums = rs.filter(r => r.hum != null).map(r => r.hum);
       const vts = rs.filter(r => r.viento != null).map(r => r.viento), nc = nivelCalor(sMax);
-      const extra = [(tsTop.prob_ts || 0) >= 10 ? `Tormenta eléctrica: hasta ${tsTop.prob_ts}% ${franja(tsTop.hora)}.` : '',
-        sMax != null && sMax - mx >= 1 ? `Sensación térmica de hasta ${Math.round(sMax)}° cerca de las ${sPico.hora.slice(11, 16)}.` : '',
-        nc && sMax >= UMBRAL_CALOR ? `<b class="hot">${nc[0]}:</b> ${nc[1]}` : '',
-        uvMax != null && uvMax >= 3 ? `Índice UV máximo ${Math.round(uvMax)} (${nivelUV(uvMax)}) hacia las ${uvPico.hora.slice(11, 16)}.` : '',
-        hums.length ? `Humedad ${Math.min(...hums)}–${Math.max(...hums)}%.` : '',
-        vts.length ? `Viento hasta ${Math.max(...vts)} km/h${rfMax != null && rfMax >= 40 ? `, ráfagas de ${rfMax}` : ''}.` : ''].filter(Boolean).join(' ');
-      html += `<div class="dexp"><p><b>${tt}.</b> ${sub} Temperatura entre ${Math.round(mn)}° y ${Math.round(mx)}°. ${extra}${lejano ? ' <i>Pronóstico lejano: puede cambiar.</i>' : ''}</p>${lineaTiempo(rs, ahora)}</div>`;
+      const llueve = top.prob >= 20 || (tsTop.prob_ts || 0) >= 10;
+      const cLluvia = ['Lluvia', top.prob >= 10 ? `${top.prob}%` : 'No', top.prob >= 40 ? 'agua' : '', top.prob >= 10 ? `hacia las ${top.hora.slice(11, 13)}h` : 'prevista'];
+      const cTs = (tsTop.prob_ts || 0) >= 10 ? ['Tormenta', `${tsTop.prob_ts}%`, 'ts', `hacia las ${tsTop.hora.slice(11, 13)}h`] : null;
+      const cSe = sMax != null ? ['Se siente', `${Math.round(sMax)}°`, sMax >= UMBRAL_CALOR ? 'hot' : '', `hacia las ${sPico.hora.slice(11, 13)}h`] : null;
+      const cUv = uvMax != null && uvMax >= 1 ? ['Índice UV', `${Math.round(uvMax)}`, uvMax >= 8 ? 'hot' : '', `${nivelUV(uvMax)} · ${uvPico.hora.slice(11, 13)}h`] : null;
+      const cHu = hums.length ? ['Humedad', `${Math.min(...hums)}–${Math.max(...hums)}%`] : null;
+      const cVi = vts.length ? ['Viento', `${Math.max(...vts)} km/h`, '', rfMax != null && rfMax >= 30 ? `ráfagas ${rfMax}` : 'máximo'] : null;
+      const consejo = nc && sMax >= UMBRAL_CALOR ? ` <b class="hot">${nc[0]}:</b> ${nc[1]}` : '';
+      html += `<div class="dexp"><p><b>${tt}.</b> ${sub}${consejo}${lejano ? ' <i>Pronóstico lejano: puede cambiar.</i>' : ''}</p>` +
+        tarjetas(llueve ? [cLluvia, cTs, cSe, cHu, cVi, cUv] : [cSe, cUv, cHu, cVi, cLluvia, cTs]) + `${lineaTiempo(rs, ahora)}</div>`;
     }
     return html;
   }).join('');
@@ -2801,6 +2948,22 @@ async function nombreLugar(lat, lon) {
   if (nombre) guardar(k, nombre);
   return nombre;
 }
+// temperatura máxima normal (últimos 30 días) en el punto exacto de la persona, para la onda de calor
+const claveNormal = (lat, lon) => `cc_normal_${lat.toFixed(2)},${lon.toFixed(2)}`;
+function normalGuardada(lat, lon) {
+  try { const g = JSON.parse(leer(claveNormal(lat, lon)) || 'null'); return g && g.d === ahoraISO(D.offset).slice(0, 10) ? g.v : null; } catch (e) { return null; }
+}
+async function normalUbic(lat, lon) {
+  if (normalGuardada(lat, lon) != null) return;
+  try {
+    const j = await (await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&daily=temperature_2m_max&past_days=30&forecast_days=1&timezone=auto`)).json();
+    const hoy = ahoraISO(D.offset).slice(0, 10), vs = j.daily.time.map((t, i) => t < hoy ? j.daily.temperature_2m_max[i] : null).filter(v => v != null);
+    if (vs.length < 15) return;
+    guardar(claveNormal(lat, lon), JSON.stringify({d: hoy, v: Math.round(media(vs) * 10) / 10}));
+    const u = estado.ubic;
+    if (u && u.lat === lat && u.lon === lon) { u.normal_max = normalGuardada(lat, lon) - (u.tarde || 0); if (estado.vista === 'ubic' && ctx) render(); }
+  } catch (e) {}
+}
 function construirUbic(c) {
   const {lat, lon, om, nombre} = c;
   const {ref, dist, aprox} = referencia(lat, lon, om.elevation ?? 0);
@@ -2808,7 +2971,12 @@ function construirUbic(c) {
     ? `Ajuste aproximado: todavía no tenemos una estación verificada cerca de ti. Usamos lo aprendido en ${ref.nombre} (${dist} km).`
     : `Pronóstico de tu ubicación exacta, ajustado con lo aprendido en ${ref.nombre} (${dist} km).`;
   const off = om.utc_offset_seconds ?? D.offset;
-  return {nombre: nombre || 'Tu ubicación', ref: ref.nombre, lat, lon, filas: filasDesdeOM(om.hourly, ref.cfg, lat, lon, off), cfg: ref.cfg, offset: off,
+  // la corrección de temperatura del aeropuerto solo se usa si estás a menos de 60 km
+  const cfgU = dist <= 60 ? ref.cfg : Object.assign({}, ref.cfg, {temp: null});
+  const tarde = cfgU.temp && cfgU.temp.activa ? (cfgU.temp.sesgo || {}).tarde || 0 : 0;
+  const nm = normalGuardada(lat, lon);
+  return {nombre: nombre || 'Tu ubicación', ref: ref.nombre, lat, lon, filas: filasDesdeOM(om.hourly, cfgU, lat, lon, off), cfg: cfgU, offset: off,
+    normal_max: nm == null ? undefined : nm - tarde, tarde,
     nivel: ref.nivel + (aprox ? ' (aprox.)' : ''), lugar: enEcuador({lat, lon}) ? nota : 'Tu navegador te ubica fuera de Ecuador (¿VPN activa?). ClearSky solo cubre Ecuador: elige una ciudad en el botón de arriba.', t: c.t, verif_html: `<p class="aviso">${esc(nota)}</p>` + ref.verif_html};
 }
 async function cargarUbicacion(opc = {}) {
@@ -2835,7 +3003,7 @@ async function cargarUbicacion(opc = {}) {
     const cache = {lat, lon, om, nombre, t: Date.now()};
     guardar('cc_ubic_cache', JSON.stringify(cache));
     estado.ubic = construirUbic(cache);
-    actualizarSuscripcion();
+    actualizarSuscripcion(); normalUbic(lat, lon);
     if (estado.vista === 'ubic' || !silencioso) { estado.vista = 'ubic'; render(); }
   } catch (e) {
     if (!silencioso) alternativa('No pudimos descargar el pronóstico para tu ubicación. Revisa tu conexión.');
@@ -2919,11 +3087,12 @@ function cabecera() {
   const v = estado.vista === 'ubic' ? (estado.ubic ? estado.ubic.nombre.split(',')[0] : 'Tu ubicación') : (D.ciudades[estado.vista] || {}).nombre || 'Elegir lugar';
   $('#lugarnom').textContent = (estado.vista === 'ubic' ? '📍 ' : '') + v;
 }
-function leyenda(hayTs) {
-  const k = claro();
-  return [['lluvia', k ? '#2563eb' : '#60a5fa', 'Lluvia', '3px'], ['llovizna', k ? '#64748b' : '#94a3b8', 'Llovizna', '3px'], ...(hayTs ? [['tormenta', k ? '#7c3aed' : '#a78bfa', 'Tormenta', '3px']] : []), ['mm', k ? '#93c5fd' : '#1e40af', 'Cantidad', '8px'], ['temp', k ? '#f59e0b' : '#fbbf24', 'Temperatura', '3px']]
-    .map(([k, c, t, hh]) => `<button class="lg${estado.ocultas.has(k) ? ' off' : ''}" data-s="${k}" aria-pressed="${!estado.ocultas.has(k)}"><i style="background:${c};height:${hh}"></i>${t}</button>`).join('') +
-    `<span class="lg" style="cursor:default"><i style="background:${k ? '#334155' : '#cbd5e1'};height:2px"></i>Ahora</span>`;
+const VARS_G = [['lluvia', 'Lluvia'], ['temp', 'Temperatura'], ['viento', 'Viento'], ['uv', 'UV']];
+// si va a llover, la gráfica abre en lluvia; si no, en temperatura
+const varAuto = filas => filas.some(r => r.prob >= 20 || (r.prob_ts || 0) >= 30 || r.prob_dz >= 50) ? 'lluvia' : 'temp';
+function leyendaG(items) {
+  return items.map(([c, t, tipo]) => `<span class="lg"><i style="background:${tipo === 'dash' || tipo === 'pt' ? `repeating-linear-gradient(90deg,${c} 0 4px,transparent 4px 7px)` : c};height:${tipo === 'sq' ? '10px' : '3px'};${tipo === 'sq' ? 'width:10px;border-radius:2px' : ''}"></i>${t}</span>`).join('') +
+    `<span class="lg"><i style="background:repeating-linear-gradient(90deg,${claro() ? '#334155' : '#cbd5e1'} 0 3px,transparent 3px 6px);height:2px"></i>Ahora</span>`;
 }
 let ctx = null;
 function pintarGrafica() {
@@ -2932,9 +3101,11 @@ function pintarGrafica() {
   const filasG = estado.dia ? dias[estado.dia] : prox.slice(0, 72);
   $('#titg').textContent = estado.dia ? `Hora por hora · ${nombreDia(estado.dia, hoy)}` : 'Hora por hora · 3 días';
   $('#todo').hidden = !estado.dia;
-  grafica($('#graf'), filasG, ahora, hoy);
-  $('#leyg').innerHTML = leyenda(filasG.some(r => (r.prob_ts || 0) >= 5));
-  $$('#leyg .lg[data-s]').forEach(l => l.onclick = () => { const k = l.dataset.s; estado.ocultas.has(k) ? estado.ocultas.delete(k) : estado.ocultas.add(k); pintarGrafica(); });
+  const vr = estado.gvar || varAuto(filasG);
+  $('#gsel').innerHTML = VARS_G.map(([k, n]) => `<button class="gb${k === vr ? ' on' : ''}" data-v="${k}" aria-pressed="${k === vr}">${n}</button>`).join('');
+  $$('#gsel .gb').forEach(b => b.onclick = () => { tocar(); estado.gvar = b.dataset.v; pintarGrafica(); });
+  grafica($('#graf'), filasG, ahora, hoy, vr);
+  $('#leyg').innerHTML = leyendaG($('#graf')._leyenda || []);
 }
 function pintarDias() {
   const {v, ahora, hoy, dias} = ctx;
@@ -2958,6 +3129,8 @@ function alertaPara(v) {
 }
 function hace(t) { const m = Math.round((Date.now() - t) / 6e4); return m < 2 ? 'ahora' : m < 60 ? `hace ${m} min` : `hace ${Math.round(m / 60)} h`; }
 function render() {
+  // recordar qué secciones desplegables estaban abiertas para dejarlas igual después de actualizar
+  const abiertos = new Set([...document.querySelectorAll('#vista details')].filter(d => d.open).map(d => (d.querySelector('summary') || {}).textContent));
   cabecera();
   const v = vistaActual(); if (!v) return;
   const ahora = ahoraISO(v.offset), hoy = ahora.slice(0, 10), ev = evidencia(v);
@@ -3018,13 +3191,14 @@ function render() {
     `</section><section class="col2" aria-label="Gráfica, mapa y satélite">` +
     `<div class="card cmulti"><div class="tabs" role="tablist" aria-label="Vistas">` +
     TABS.map(([t, n]) => `<button class="tab" role="tab" id="tab-${t}" data-t="${t}" aria-controls="panel-${t}">${n}</button>`).join('') + `</div>` +
-    `<div class="panel" data-t="graf" id="panel-graf" role="tabpanel" aria-labelledby="tab-graf"><h3><span id="titg"></span><button id="todo" hidden>Ver 3 días</button></h3><div id="graf" style="position:relative"></div><div class="ley" id="leyg"></div></div>` +
+    `<div class="panel" data-t="graf" id="panel-graf" role="tabpanel" aria-labelledby="tab-graf"><h3><span id="titg"></span><button id="todo" hidden>Ver 3 días</button></h3><div class="gsel" id="gsel" role="group" aria-label="Qué mostrar"></div><div id="graf" style="position:relative"></div><div class="ley" id="leyg"></div></div>` +
     `<div class="panel" data-t="mapa" id="panel-mapa" role="tabpanel" aria-labelledby="tab-mapa" hidden>${htmlMapa()}</div>` +
     `<div class="panel" data-t="sat" id="panel-sat" role="tabpanel" aria-labelledby="tab-sat" hidden>${htmlSatelite()}</div></div>` +
     `<details><summary>Qué dice cada modelo meteorológico</summary>${tablaModelos(prox.slice(0, 72), v.cfg, hoy)}</details>` +
     `<details><summary>¿Qué tan confiable es este pronóstico?</summary>${v.verif_html}</details>` +
     `<details id="como"><summary>Cómo funciona ClearSky</summary>${htmlComo()}</details>` +
     `</section></div>`;
+  document.querySelectorAll('#vista details').forEach(d => { if (abiertos.has((d.querySelector('summary') || {}).textContent)) d.open = true; });
   activarLinea($('#c24'), p24);
   pintarDias();
   $$('.tab').forEach((b, i, todos) => { b.onclick = () => { tocar(); mostrarTab(b.dataset.t); };
@@ -3048,10 +3222,10 @@ function htmlComo() {
     ['📝', 'Hacemos un examen sin trampa', 'Guardamos los últimos 10 días sin usarlos para aprender y vemos cómo nos habría ido. Solo aceptamos un ajuste si acierta más que antes.'],
     ['🔁', 'Aprende solo', 'Todo se recalcula cada día con los últimos 45 días, así se adapta al invierno y al verano. Lo aprendido se guarda en público en el repositorio.'],
     ['👀', 'Corrige con lo que pasa ahora', 'Si el satélite o varias personas cerca de ti ven lluvia, las próximas horas se corrigen al instante.'],
-    ['🌡️', 'Calor', 'La sensación térmica es el índice de calor (NOAA): combina temperatura y humedad. Desde 32° hay que tomar precauciones. Hablamos de onda de calor cuando se esperan 3 días o más con máximas 2° por encima de lo normal del último mes.'],
+    ['🌡️', 'Calor', 'Comparamos cada hora la temperatura y la humedad con las del aeropuerto y corregimos el error típico de los modelos. Con esos valores calculamos la sensación térmica (índice de calor de la NOAA). Desde 32° hay que tomar precauciones. Hay onda de calor cuando se esperan 3 días o más con máximas 2° por encima de lo normal del último mes en tu zona.'],
   ];
   return '<div class="como">' + pasos.map(([e, t, x], i) => `<div class="paso"><div class="pn" aria-hidden="true">${e}</div><div><b>${i + 1}. ${t}</b><p>${x}</p></div></div>`).join('') +
-    '<p class="nota"><b>¿Qué significa 30%?</b> Que de cada 10 veces que lo decimos, llueve más o menos 3. <b>Lluvia</b> es la que moja las calles; <b>llovizna</b>, gotas finas o garúa. Niebla, viento, UV y humedad vienen de los modelos y todavía no se verifican.</p></div>';
+    '<p class="nota"><b>¿Qué significa 30%?</b> Que de cada 10 veces que lo decimos, llueve más o menos 3. <b>Lluvia</b> es la que moja las calles; <b>llovizna</b>, gotas finas o garúa. Niebla, viento e índice UV vienen de los modelos y todavía no se verifican.</p></div>';
 }
 
 // ---------- instalar como app ----------
@@ -3179,16 +3353,18 @@ async function refrescarDatos(forzar) {
   if (refrescando || document.visibilityState === 'hidden') return;
   refrescando = true;
   try {
+    let cambio = !!forzar;
     if (forzar || Date.now() - generadoMs() > 65 * 60 * 1000) {
       const html = await (await fetch(location.pathname + '?t=' + Date.now(), {cache: 'no-store'})).text();
       const m = html.match(/<script id="datos" type="application\/json">([\s\S]*?)<\/script>/);
       if (m) { const nuevo = JSON.parse(m[1]);
-        if (nuevo.generado > D.generado) { Object.assign(D, nuevo); SAT = null;
+        if (nuevo.generado > D.generado) { Object.assign(D, nuevo); SAT = null; cambio = true;
           if (estado.ubic) { try { const c = JSON.parse(leer('cc_ubic_cache') || 'null'); if (c) estado.ubic = construirUbic(c); } catch (e) {} } } }
     }
     if (estado.ubic && Date.now() - (estado.ubic.t || 0) > 20 * 60 * 1000) { refrescando = false; await cargarUbicacion({silencioso: true}); }
-    if (estado.rep) estado.rep.t = 0;
-    if (ctx && $('#sheet').hidden) render();
+    if (ctx && ctx.ahora !== ahoraISO(ctx.v.offset)) cambio = true;      // pasó la hora: avanzar el pronóstico
+    if (cambio && ctx && $('#sheet').hidden) render();
+    if (estado.rep) { estado.rep.t = 0; resumenFeedback(); }             // solo redibuja si cambia lo que se ve
     pie();
   } catch (e) {} finally { refrescando = false; }
 }
@@ -3248,7 +3424,7 @@ async function inicio() {
   let cache = null;
   try { cache = JSON.parse(leer('cc_ubic_cache') || 'null'); } catch (e) {}
   if (cache && cache.om && Date.now() - cache.t < 24 * 3600 * 1000) {
-    try { estado.ubic = construirUbic(cache); estado.pos = {lat: cache.lat, lon: cache.lon}; estado.vista = 'ubic'; render(); } catch (e) { estado.ubic = null; }
+    try { estado.ubic = construirUbic(cache); estado.pos = {lat: cache.lat, lon: cache.lon}; estado.vista = 'ubic'; render(); normalUbic(cache.lat, cache.lon); } catch (e) { estado.ubic = null; }
   }
   let permiso = 'prompt';
   try { if (navigator.permissions) permiso = (await navigator.permissions.query({name: 'geolocation'})).state; } catch (e) {}
