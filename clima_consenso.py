@@ -25,6 +25,8 @@ Página (index.html, generada aquí y dibujada con JavaScript):
     satelital, ambas solo cuando hay suficientes días acumulados y pasan el examen (datos/observado/).
   - Tablero público de aciertos día por día (tarjeta "Cómo nos fue esta semana") y selector de rango 24 h / 3 días / 7 días.
   - Reportes de la gente de truenos e inundación: solo se muestran si coinciden 2 o más personas cerca (siempre "no verificado").
+  - La ubicación sigue a la persona: se vuelve a leer el GPS al abrir, al volver a la pestaña y cada 5 minutos, y si se movió
+    más de 300 m se recalcula el lugar y el pronóstico (con un botón para forzarlo).
   - "Lluvia en camino" con verificación propia (ahora.py): solo se muestra como verificada si acierta; mapa que se reproduce solo.
   - Calor: sensación térmica (índice de calor NOAA), alerta desde 32° y onda de calor frente a lo normal
     de los últimos 30 días; humedad, viento y UV por hora. Botón para instalar como app.
@@ -3409,12 +3411,17 @@ function htmlFeedback() {
 function abrirReporte() { abrirHoja(htmlFeedback(), 'Reportar el clima', () => { activarFeedback(); resumenFeedback(); }); }
 const enEcuador = p => p && p.lat >= -6 && p.lat <= 2.5 && p.lon >= -92.5 && p.lon <= -75;
 const TXT_FUERA = 'Tu navegador te ubica fuera de Ecuador. Si usas una VPN o la red de una empresa, desactívala para esta página o reporta desde el celular con datos móviles.';
-function obtenerPos(forzar) {
+// La posición que está en memoria solo se reutiliza si tiene menos de un minuto. Antes se reutilizaba siempre, incluso la que venía
+// de la caché de ayer, y por eso el lugar se quedaba fijo aunque la persona se moviera (también salían mal los reportes y los avisos).
+// forzar: exige una lectura nueva del GPS. estricta: si el GPS falla no se devuelve una posición vieja (se usa al actualizar el lugar).
+function obtenerPos(forzar, estricta) {
   return new Promise((ok, mal) => {
-    if (estado.pos && !forzar) return ok(estado.pos);
+    if (estado.pos && !forzar && estado.posT && Date.now() - estado.posT < 60 * 1000) return ok(estado.pos);
     if (!navigator.geolocation) return mal(new Error('sin geolocalización'));
-    navigator.geolocation.getCurrentPosition(p => { estado.pos = {lat: p.coords.latitude, lon: p.coords.longitude}; ok(estado.pos); },
-      mal, {enableHighAccuracy: true, timeout: 15000, maximumAge: 600000});
+    navigator.geolocation.getCurrentPosition(p => { estado.pos = {lat: p.coords.latitude, lon: p.coords.longitude, prec: p.coords.accuracy || 0}; estado.posT = Date.now(); ok(estado.pos); },
+      e => { const viva = estado.pos && estado.posT && Date.now() - estado.posT < 15 * 60 * 1000;           // una lectura real de este mismo rato
+            if (!estricta && viva && !(e && e.code === 1)) ok(estado.pos); else mal(e); },
+      {enableHighAccuracy: true, timeout: 15000, maximumAge: forzar ? 0 : 30000});
   });
 }
 async function resumenFeedback() {
@@ -3578,7 +3585,7 @@ function construirUbic(c) {
   const cfgU = !dentro ? sinCalibrar(ref.cfg) : dist <= 60 ? ref.cfg : Object.assign({}, ref.cfg, {temp: null});
   const tarde = cfgU.temp && cfgU.temp.activa ? (cfgU.temp.sesgo || {}).tarde || 0 : 0;
   const nm = normalGuardada(lat, lon);
-  return {nombre: nombre || 'Tu ubicación', ref: dentro ? ref.nombre : '', lat, lon, filas: filasDesdeOM(om.hourly, cfgU, lat, lon, off), cfg: cfgU, offset: off,
+  return {nombre: nombre || 'Tu ubicación', ref: dentro ? ref.nombre : '', lat, lon, plat: c.plat ?? lat, plon: c.plon ?? lon, filas: filasDesdeOM(om.hourly, cfgU, lat, lon, off), cfg: cfgU, offset: off,
     normal_max: nm == null ? undefined : nm - tarde, tarde,
     nivel: !dentro ? 'No verificado' : ref.nivel + (aprox ? ' (aprox.)' : ''), lugar: dentro ? nota : 'Tu navegador te ubica fuera de Ecuador (¿VPN activa?). ClearSky solo cubre Ecuador: elige una ciudad en el botón de arriba.', t: c.t, verif_html: `<p class="aviso">${esc(nota)}</p>` + (dentro ? ref.verif_html : '')};
 }
@@ -3587,13 +3594,14 @@ async function cargarUbicacion(opc = {}) {
   const silencioso = opc.silencioso && estado.ubic;
   if (!silencioso) { estado.vista = 'ubic'; cabecera(); avisoTop(''); $('#vista').innerHTML = '<div class="vacio"><span class="cargando"></span>Buscando tu ubicación…</div>'; }
   let pos;
-  try { pos = await obtenerPos(opc.forzar); }
+  try { pos = await obtenerPos(opc.forzar, true); }
   catch (e) {
-    estado.buscando = false;
-    if (silencioso) return;
+    estado.buscando = false; estado.actualizandoUbic = false;
+    if (silencioso) { etiquetaUbic(); return; }                              // sin señal: se queda lo que había
     const negado = e && e.code === 1;
     alternativa(negado ? 'Sin permiso de ubicación. Actívalo en la configuración del navegador para ver el pronóstico exacto de donde estás.'
-                       : 'No pudimos obtener tu ubicación. Mientras tanto te mostramos la ciudad más cercana disponible.');
+                       : estado.ubic ? 'No pudimos obtener tu ubicación. Te mostramos la última que tenemos.'
+                                     : 'No pudimos obtener tu ubicación. Mientras tanto te mostramos la ciudad más cercana disponible.');
     return;
   }
   guardar('cc_ubic', '1');
@@ -3603,15 +3611,37 @@ async function cargarUbicacion(opc = {}) {
     const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=${D.vars.join(',')}&models=${KEYS.join(',')}&timezone=auto&forecast_days=7`;
     const [om, nombre] = await Promise.all([fetch(url).then(r => r.json()), nombreLugar(pos.lat, pos.lon)]);
     if (!om.hourly) throw new Error(om.reason || 'sin datos');
-    const cache = {lat, lon, om, nombre, t: Date.now()};
+    const cache = {lat, lon, om, nombre, t: Date.now(), plat: pos.lat, plon: pos.lon};     // plat/plon: la posición exacta (lat/lon van redondeadas)
     guardar('cc_ubic_cache', JSON.stringify(cache));
     estado.ubic = construirUbic(cache);
+    estado.actualizandoUbic = false;
     actualizarSuscripcion(); normalUbic(lat, lon);
     if (estado.vista === 'ubic' || !silencioso) { estado.vista = 'ubic'; render(); }
   } catch (e) {
-    if (!silencioso) alternativa('No pudimos descargar el pronóstico para tu ubicación. Revisa tu conexión.');
+    estado.actualizandoUbic = false;
+    if (!silencioso) alternativa('No pudimos descargar el pronóstico para tu ubicación. Revisa tu conexión.'); else etiquetaUbic();
   } finally { estado.buscando = false; }
 }
+// ---------- la ubicación sigue a la persona ----------
+// Se compara la lectura nueva con la última posición real (sin redondear). El umbral crece con la imprecisión del GPS: así el ruido
+// normal (decenas de metros) no recalcula nada, y un teléfono que dice "estoy a 9 km de error" no provoca saltos.
+const UMBRAL_MOV_KM = 0.3, REVISAR_MOV_MS = 5 * 60 * 1000;
+function etiquetaUbic() {                                // cambia solo los textos del lugar, sin redibujar la página
+  cabecera();
+  const el = document.querySelector('.lugar');
+  if (el && ctx && ctx.v && estado.vista === 'ubic') el.textContent = estado.actualizandoUbic ? '📍 Actualizando tu ubicación…' : '📍 ' + ctx.v.nombre;
+}
+async function revisarMovimiento(espera = 60 * 1000) {
+  if (estado.buscando || !estado.ubic || document.visibilityState === 'hidden') return;
+  if (Date.now() - (estado.ultMov || 0) < espera) return;                                // como mucho una lectura por minuto (menos si lo pide la persona)
+  estado.ultMov = Date.now();
+  let pos; try { pos = await obtenerPos(true, true); } catch (e) { return; }               // sin permiso o sin señal: se queda lo que hay
+  const u = estado.ubic, d = km(pos.lat, pos.lon, u.plat ?? u.lat, u.plon ?? u.lon);
+  if (d < Math.max(UMBRAL_MOV_KM, (pos.prec || 0) / 1000)) return;
+  estado.actualizandoUbic = true; etiquetaUbic();
+  await cargarUbicacion({silencioso: true});                                             // usa la lectura que acaba de hacerse
+}
+setInterval(() => revisarMovimiento(), REVISAR_MOV_MS);
 function ciudadCercana() {
   if (estado.pos) return D.ciudades.reduce((a, b, i) => km(estado.pos.lat, estado.pos.lon, b.lat, b.lon) < km(estado.pos.lat, estado.pos.lon, D.ciudades[a].lat, D.ciudades[a].lon) ? i : a, 0);
   return 0;
@@ -3655,7 +3685,8 @@ function abrirSelector() {
   const tempDe = x => { if (!x || !x.filas.length) return ''; const p = x.filas.find(r => r.hora >= ahoraISO(x.offset)); return p && p.temp != null ? Math.round(p.temp) + '°' : ''; };
   let h = `<div class="grab"></div><h2>Elegir lugar</h2>` +
     `<button class="lit${estado.vista === 'ubic' ? ' on' : ''}" data-v="ubic"><span style="font-size:22px">📍</span><span class="nm">Mi ubicación<small>${u ? esc(u.nombre) + ' · pronóstico exacto de donde estás' : 'Pronóstico exacto de donde estás'}</small></span>` +
-    (u ? `<span class="tt">${tempDe(u)}</span>` : '') + `</button>`;
+    (u ? `<span class="tt">${tempDe(u)}</span>` : '') + `</button>` +
+    `<button class="btn sec lgrd" id="lact">📍 Actualizar mi ubicación</button>`;
   if (u && estado.vista === 'ubic' && lugares.length < MAX_LUGARES && !lugares.some(l => l.id === claveRep(u)))
     h += `<button class="btn sec lgrd" id="lgrd">⭐ Guardar este lugar</button>`;
   if (lugares.length) h += `<div class="sh">Mis lugares</div>` + lugares.map(l => `<div class="lrow"><button class="lit${estado.vista === 'l:' + l.id ? ' on' : ''}" data-v="l:${esc(l.id)}">` +
@@ -3668,7 +3699,7 @@ function abrirSelector() {
     $('#sheet').querySelectorAll('.lit').forEach(b => b.onclick = () => {
       tocar(); cerrarSelector();
       estado.dia = null; estado.tlSel = null;
-      if (b.dataset.v === 'ubic') { estado.ubic ? (estado.vista = 'ubic', avisoTop(''), render()) : cargarUbicacion({forzar: true}); }
+      if (b.dataset.v === 'ubic') { estado.ubic ? (estado.vista = 'ubic', avisoTop(''), render(), revisarMovimiento(0)) : cargarUbicacion({forzar: true}); }
       else if (esLugar(b.dataset.v)) {
         const l = lugaresGuardados().find(x => 'l:' + x.id === b.dataset.v), c = l && estado.lugares[l.id];
         if (l && c && Date.now() - c.t < 20 * 60 * 1000) { estado.vista = b.dataset.v; avisoTop(''); render(); } else if (l) cargarLugar(l);
@@ -3676,6 +3707,7 @@ function abrirSelector() {
       else { estado.vista = +b.dataset.v; render(); }
       window.scrollTo({top: 0, behavior: 'smooth'});
     });
+    const act = $('#lact'); if (act) act.onclick = () => { tocar(); cerrarSelector(); estado.dia = null; estado.tlSel = null; cargarUbicacion({forzar: true}); window.scrollTo({top: 0, behavior: 'smooth'}); };
     const g = $('#lgrd'); if (g) g.onclick = () => { tocar(); const a = lugaresGuardados(); a.push({id: claveRep(u), nombre: u.nombre, lat: u.lat, lon: u.lon}); guardarLugares(a); estado.lugares[claveRep(u)] = u; toast('Lugar guardado. Los avisos del teléfono siguen a tu ubicación actual.'); abrirSelector(); };
     $('#sheet').querySelectorAll('.lq').forEach(b => b.onclick = () => { tocar(); guardarLugares(lugaresGuardados().filter(l => l.id !== b.dataset.q)); delete estado.lugares[b.dataset.q];
       if (estado.vista === 'l:' + b.dataset.q) { estado.vista = estado.ubic ? 'ubic' : ciudadCercana(); render(); } abrirSelector(); });
@@ -3719,7 +3751,7 @@ function vistaActual() {
 }
 function cabecera() {
   const lug = esLugar(estado.vista) ? estado.lugares[estado.vista.slice(2)] : null;
-  const v = lug ? lug.nombre.split(',')[0] : estado.vista === 'ubic' ? (estado.ubic ? estado.ubic.nombre.split(',')[0] : 'Tu ubicación') : (D.ciudades[estado.vista] || {}).nombre || 'Elegir lugar';
+  const v = lug ? lug.nombre.split(',')[0] : estado.vista === 'ubic' ? (estado.actualizandoUbic ? 'Actualizando…' : estado.ubic ? estado.ubic.nombre.split(',')[0] : 'Tu ubicación') : (D.ciudades[estado.vista] || {}).nombre || 'Elegir lugar';
   $('#lugarnom').textContent = (estado.vista === 'ubic' ? '📍 ' : esLugar(estado.vista) ? '⭐ ' : '') + v;
 }
 const VARS_G = [['lluvia', 'Lluvia'], ['temp', 'Temperatura'], ['viento', 'Viento'], ['uv', 'UV']];
@@ -3828,7 +3860,7 @@ function render() {
     `<div class="cabA"><div class="hero"><div class="ic">${icono(ic, 64)}</div><div class="ht"><div class="t">${act.temp != null ? Math.round(act.temp) : '-'}<sup>°</sup></div>` +
     `<div class="hs">${sAhora != null && sAhora - act.temp >= 1.5 ? `Se siente <b>${Math.round(sAhora)}°</b> · ` : ''}${tmax != null ? `Máx ${tmax}° · Mín ${tmin}°` : ''}</div>` + `</div></div>` +
     `<h1 class="tit">${tit}</h1><p class="sub">${sub}</p>` +
-    `<div class="lugar">📍 ${esc(v.nombre)}</div>` +
+    `<div class="lugar">${estado.actualizandoUbic && estado.vista === 'ubic' ? '📍 Actualizando tu ubicación…' : '📍 ' + esc(v.nombre)}</div>` +
     `<div class="chips">${chips}</div></div>` +
     `<div class="acciones">` + (D.feedback_url ? `<button class="acc" id="breporte">☂️ Reportar clima</button><button class="acc" id="bpush" aria-pressed="${!!leer('cc_push')}">${push}</button>` : '') +
     `<button class="acc" id="bcompartir">↗ Compartir</button>${standalone || leer('cc_inst_no') === '2' ? '' : '<button class="acc inst" id="binstalar">📲 Instalar app</button>'}</div><div class="fbmini" id="fbmini"></div>` +
@@ -4112,7 +4144,7 @@ async function refrescarDatos(forzar) {
         if (nuevo.generado > D.generado) { Object.assign(D, nuevo); SAT = null; cambio = true;
           if (estado.ubic) { try { const c = JSON.parse(leer('cc_ubic_cache') || 'null'); if (c) estado.ubic = construirUbic(c); } catch (e) {} } } }
     }
-    if (estado.ubic && Date.now() - (estado.ubic.t || 0) > 20 * 60 * 1000) { refrescando = false; await cargarUbicacion({silencioso: true}); }
+    if (estado.ubic && Date.now() - (estado.ubic.t || 0) > 20 * 60 * 1000) { refrescando = false; await cargarUbicacion({silencioso: true, forzar: true}); }
     if (esLugar(estado.vista)) { const l = lugaresGuardados().find(x => 'l:' + x.id === estado.vista), c = l && estado.lugares[l.id]; if (l && (!c || Date.now() - c.t > 20 * 60 * 1000)) { refrescando = false; await cargarLugar(l, true); } }
     if (ctx && ctx.ahora !== ahoraISO(ctx.v.offset)) cambio = true;      // pasó la hora: avanzar el pronóstico
     if (cambio && ctx && $('#sheet').hidden) render();
@@ -4134,7 +4166,7 @@ if (standalone) {
     if (dy > 80) { ptr.classList.add('gira'); tocar(); refrescar(); setTimeout(() => { ptr.classList.remove('gira', 'listo'); ptr.style.opacity = 0; }, 1500); }
     else { ptr.style.opacity = 0; ptr.style.transform = ''; } });
 }
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') refrescarDatos(); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { refrescarDatos(); revisarMovimiento(20 * 1000); } });
 
 // ---------- instalar como app ----------
 let pedirInstalar = null;
@@ -4176,16 +4208,22 @@ async function inicio() {
   let cache = null;
   try { cache = JSON.parse(leer('cc_ubic_cache') || 'null'); } catch (e) {}
   if (cache && cache.om && Date.now() - cache.t < 24 * 3600 * 1000) {
-    try { estado.ubic = construirUbic(cache); estado.pos = {lat: cache.lat, lon: cache.lon}; estado.vista = 'ubic'; render(); normalUbic(cache.lat, cache.lon); } catch (e) { estado.ubic = null; }
+    try { estado.ubic = construirUbic(cache); estado.pos = {lat: cache.lat, lon: cache.lon};          // estado.pos sin posT: es de la caché, no una lectura real
+      estado.actualizandoUbic = Date.now() - cache.t > 10 * 60 * 1000; estado.vista = 'ubic'; render(); normalUbic(cache.lat, cache.lon); } catch (e) { estado.ubic = null; estado.actualizandoUbic = false; }
   }
   let permiso = 'prompt';
   try { if (navigator.permissions) permiso = (await navigator.permissions.query({name: 'geolocation'})).state; } catch (e) {}
-  if (permiso === 'denied') { if (!estado.ubic) alternativa('Sin permiso de ubicación. Actívalo en la configuración del navegador para ver el pronóstico exacto de donde estás.'); }
+  if (permiso === 'denied') {
+    estado.actualizandoUbic = false;
+    if (!estado.ubic) alternativa('Sin permiso de ubicación. Actívalo en la configuración del navegador para ver el pronóstico exacto de donde estás.');
+    else { etiquetaUbic(); toast('Sin permiso de ubicación: te mostramos la última ubicación guardada.'); }
+  }
   else if (permiso === 'granted' || leer('cc_ubic') === '1') cargarUbicacion({silencioso: !!estado.ubic});
   else if (!estado.ubic) {          // primera visita: explicamos por qué pedimos la ubicación
     estado.vista = 0; render();
     avisoTop('Para mostrarte el pronóstico exacto de donde estás, ClearSky necesita tu ubicación. No la guardamos.', true);
   }
+  if (estado.actualizandoUbic && !estado.buscando) { estado.actualizandoUbic = false; etiquetaUbic(); }      // no se llegó a pedir la posición: no dejar el texto a medias
   let rz, ancho = innerWidth;
   addEventListener('resize', () => { clearTimeout(rz); rz = setTimeout(() => { if (innerWidth !== ancho && ctx) { ancho = innerWidth; pintarGrafica(); if (mapa) mapa.invalidateSize(); if (mapaSat) mapaSat.invalidateSize(); } }, 200); });
   sugerirInstalar();
