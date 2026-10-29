@@ -1715,7 +1715,7 @@ const guardar = (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} };
 const leer = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
 const tocar = () => { try { navigator.vibrate && navigator.vibrate(4); } catch (e) {} };
 const CARGA = Date.now();
-let estado = {vista: null, dia: null, ocultas: new Set(), ubic: null, pos: null, tlSel: null, buscando: false,
+let estado = {vista: null, dia: null, ocultas: new Set(['llovizna']), ubic: null, pos: null, tlSel: null, buscando: false,
   tab: leer('cc_tab') || 'graf', vapid: undefined, mapaListo: false};
 
 // ---------- misma lógica que el script de Python ----------
@@ -1916,27 +1916,77 @@ function activarLinea(cont, rows) {
 }
 
 // ---------- gráfica (cursor con el mouse o arrastrando el dedo) ----------
+// curva suave que no se pasa de los valores reales (monótona): no inventa picos entre horas
+function curvaSuave(pts) {
+  const n = pts.length; if (n < 2) return '';
+  const dx = [], m = [], t = [];
+  for (let i = 0; i < n - 1; i++) { dx[i] = pts[i + 1][0] - pts[i][0]; m[i] = (pts[i + 1][1] - pts[i][1]) / dx[i]; }
+  t[0] = m[0]; t[n - 1] = m[n - 2];
+  for (let i = 1; i < n - 1; i++) t[i] = m[i - 1] * m[i] <= 0 ? 0 : 3 * (dx[i - 1] + dx[i]) / ((2 * dx[i] + dx[i - 1]) / m[i - 1] + (dx[i] + 2 * dx[i - 1]) / m[i]);
+  let d = `M${pts[0][0].toFixed(1)},${pts[0][1].toFixed(1)}`;
+  for (let i = 0; i < n - 1; i++) { const h = dx[i] / 3;
+    d += ` C${(pts[i][0] + h).toFixed(1)},${(pts[i][1] + t[i] * h).toFixed(1)} ${(pts[i + 1][0] - h).toFixed(1)},${(pts[i + 1][1] - t[i + 1] * h).toFixed(1)} ${pts[i + 1][0].toFixed(1)},${pts[i + 1][1].toFixed(1)}`; }
+  return d;
+}
 function grafica(cont, filas, ahora, hoy) {
-  const W = Math.max(cont.clientWidth, 280), H = 210, pl = 34, pr = 10, pt = 16, pb = 26, w = W - pl - pr, h = H - pt - pb;
-  const n = filas.length, dx = w / Math.max(n - 1, 1), X = i => pl + i * dx, Y = p => pt + h - h * p / 100;
-  const mmMax = Math.max(2, ...filas.map(r => r.mm)), oc = estado.ocultas, paso = n > 30 ? 6 : 3;
-  const hayTs = filas.some(r => (r.prob_ts || 0) >= 5);
+  const k = claro(), oc = estado.ocultas, n = filas.length, W = Math.max(cont.clientWidth, 280);
+  const C = k ? {txt: '#64748b', fuerte: '#334155', grid: '#e5e7eb', noche: 'rgba(15,23,42,.05)', banda1: 'rgba(37,99,235,.07)', banda2: 'rgba(37,99,235,.035)',
+                 linea: '#2563eb', area: '#3b82f6', dz: '#94a3b8', ts: '#7c3aed', pico: '#0f172a', fondo: '#ffffff'}
+               : {txt: '#7c8696', fuerte: '#cbd5e1', grid: '#1c2433', noche: 'rgba(255,255,255,.03)', banda1: 'rgba(96,165,250,.08)', banda2: 'rgba(96,165,250,.035)',
+                 linea: '#60a5fa', area: '#3b82f6', dz: '#94a3b8', ts: '#a78bfa', pico: '#ffffff', fondo: '#111723'};
+  const hayMm = !oc.has('mm') && filas.some(r => r.mm >= 0.1);
+  const pl = 34, pr = 10, pt = 30, h1 = W < 500 ? 150 : 175, gap = hayMm ? 22 : 0, h2 = hayMm ? 52 : 0, pb = 24;
+  const H = pt + h1 + gap + h2 + pb, w = W - pl - pr, dx = w / Math.max(n - 1, 1);
+  const X = i => pl + i * dx, Y = p => pt + h1 - h1 * Math.max(0, Math.min(100, p)) / 100;
+  const y2 = pt + h1 + gap, mmTope = Math.max(5, ...filas.map(r => r.mm)), Ym = v => y2 + h2 - h2 * Math.min(v, mmTope) / mmTope;
+  const xa = i => Math.max(pl, X(i) - dx / 2), xb = i => Math.min(W - pr, X(i) + dx / 2);
+  const paso = n > 30 ? (W < 500 ? 12 : 6) : 3;
   let s = `<svg class="graf" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="Probabilidad de lluvia por hora">`;
-  s += '<defs><linearGradient id="gl" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3b82f6" stop-opacity=".75"/><stop offset="1" stop-color="#3b82f6" stop-opacity=".05"/></linearGradient></defs>';
-  for (const p of [25, 50, 75, 100]) s += `<line x1="${pl}" x2="${W - pr}" y1="${Y(p)}" y2="${Y(p)}" class="grid"/><text x="${pl - 6}" y="${Y(p) + 4}" class="ejey">${p}%</text>`;
-  filas.forEach((r, i) => {
-    const hh = r.hora.slice(11, 13);
-    if (hh === '00' && i) s += `<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt + h}" class="dia"/><text x="${X(i) + 4}" y="${pt + 10}" class="etdia">${nombreDia(r.hora.slice(0, 10), hoy)}</text>`;
-    if (+hh % paso === 0) s += `<text x="${X(i)}" y="${H - 8}" class="ejex">${hh}h</text>`;
-    if (r.hora === ahora) s += `<line x1="${X(i)}" x2="${X(i)}" y1="${pt}" y2="${pt + h}" class="ahora"/>`;
-    if (!oc.has('mm') && r.mm > 0) { const bh = h * 0.45 * Math.min(r.mm, mmMax) / mmMax;
-      s += `<rect x="${X(i) - dx * 0.35}" y="${pt + h - bh}" width="${dx * 0.7}" height="${bh}" class="mm"/>`; }
-  });
-  const pts = filas.map((r, i) => `${X(i)},${Y(r.prob)}`).join(' ');
-  if (!oc.has('lluvia')) s += `<polygon points="${X(0)},${Y(0)} ${pts} ${X(n - 1)},${Y(0)}" fill="url(#gl)"/><polyline points="${pts}" class="linea"/>`;
-  if (!oc.has('llovizna')) s += `<polyline points="${filas.map((r, i) => `${X(i)},${Y(r.prob_dz)}`).join(' ')}" class="lineadz"/>`;
-  if (hayTs && !oc.has('tormenta')) s += `<polyline points="${filas.map((r, i) => `${X(i)},${Y(r.prob_ts || 0)}`).join(' ')}" class="lineats"/>`;
-  s += `<line class="cursor" y1="${pt}" y2="${pt + h}" visibility="hidden"/><circle class="punto" r="5" visibility="hidden"/></svg><div class="tip" hidden></div>`;
+  s += `<defs><linearGradient id="gl" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${C.area}" stop-opacity=".55"/><stop offset="1" stop-color="${C.area}" stop-opacity=".04"/></linearGradient></defs>`;
+  // noches sombreadas: ayudan a ubicar el día y la noche de un vistazo
+  for (let i = 0; i < n;) { if (!esNoche(filas[i].hora)) { i++; continue; } let j = i; while (j + 1 < n && esNoche(filas[j + 1].hora)) j++;
+    s += `<rect x="${xa(i)}" y="${pt}" width="${xb(j) - xa(i)}" height="${h1 + gap + h2}" fill="${C.noche}"/>`; i = j + 1; }
+  // zonas: probable (50-100) y posible (20-50), con su nombre a la derecha
+  s += `<rect x="${pl}" y="${Y(100)}" width="${w}" height="${Y(50) - Y(100)}" fill="${C.banda1}"/><rect x="${pl}" y="${Y(50)}" width="${w}" height="${Y(20) - Y(50)}" fill="${C.banda2}"/>`;
+  s += `<text x="${W - pr - 4}" y="${Y(100) + 13}" text-anchor="end" font-size="10.5" fill="${C.txt}" letter-spacing=".4">PROBABLE</text>` +
+       `<text x="${W - pr - 4}" y="${Y(50) + 13}" text-anchor="end" font-size="10.5" fill="${C.txt}" letter-spacing=".4">POSIBLE</text>`;
+  for (const p of [0, 20, 50, 100]) s += `<line x1="${pl}" x2="${W - pr}" y1="${Y(p)}" y2="${Y(p)}" stroke="${C.grid}" stroke-width="1"/><text x="${pl - 6}" y="${Y(p) + 4}" text-anchor="end" font-size="10.5" fill="${C.txt}">${p}%</text>`;
+  // días: separador y nombre arriba
+  const inicios = filas.map((r, i) => i === 0 || r.hora.slice(11, 13) === '00' ? i : -1).filter(i => i >= 0);
+  inicios.forEach((i, q) => { const fin = q + 1 < inicios.length ? inicios[q + 1] : n, ancho = X(fin - 1) - X(i);
+    if (i) s += `<line x1="${X(i)}" x2="${X(i)}" y1="${pt - 18}" y2="${pt + h1 + gap + h2}" stroke="${C.grid}" stroke-width="1"/>`;
+    if (ancho > 38) s += `<text x="${X(i) + 5}" y="${pt - 10}" font-size="11.5" font-weight="600" fill="${C.fuerte}">${nombreDia(filas[i].hora.slice(0, 10), hoy)}</text>`; });
+  // horas abajo
+  filas.forEach((r, i) => { const hh = +r.hora.slice(11, 13); if (hh % paso === 0 && X(i) > pl + 8 && X(i) < W - pr - 8)
+    s += `<text x="${X(i)}" y="${H - 7}" text-anchor="middle" font-size="10.5" fill="${C.txt}">${hh === 0 ? '0h' : hh + 'h'}</text>`; });
+  const pts = (campo, min = 0) => filas.map((r, i) => [X(i), Y((r[campo] || 0) >= min ? r[campo] : 0)]);
+  if (!oc.has('llovizna')) s += `<path d="${curvaSuave(pts('prob_dz'))}" fill="none" stroke="${C.dz}" stroke-width="1.3" stroke-dasharray="4 4" opacity=".8"/>`;
+  if (!oc.has('lluvia')) { const d = curvaSuave(pts('prob'));
+    s += `<path d="${d} L${X(n - 1)},${Y(0)} L${X(0)},${Y(0)} Z" fill="url(#gl)"/><path d="${d}" fill="none" stroke="${C.linea}" stroke-width="2.4" stroke-linejoin="round"/>`; }
+  if (!oc.has('tormenta') && filas.some(r => (r.prob_ts || 0) >= 10)) {
+    s += `<path d="${curvaSuave(pts('prob_ts', 15))}" fill="none" stroke="${C.ts}" stroke-width="1.5" stroke-dasharray="1.5 3.5" stroke-linecap="round"/>`;
+    filas.forEach((r, i) => { if ((r.prob_ts || 0) >= 30 && (i === 0 || (filas[i - 1].prob_ts || 0) < 30))
+      s += `<text x="${X(i)}" y="${Y(r.prob_ts) - 6}" text-anchor="middle" font-size="13">⚡</text>`; });
+  }
+  // pico de cada día con su porcentaje y hora
+  if (!oc.has('lluvia')) inicios.forEach((i, q) => { const fin = q + 1 < inicios.length ? inicios[q + 1] : n; let b = i;
+    for (let j = i; j < fin; j++) if (filas[j].prob > filas[b].prob) b = j;
+    if (filas[b].prob < 20 || fin - i < 4) return;
+    const x = Math.max(pl + 22, Math.min(W - pr - 60, X(b))), y = Math.max(pt + 12, Y(filas[b].prob) - 9);
+    s += `<circle cx="${X(b)}" cy="${Y(filas[b].prob)}" r="3.5" fill="${C.linea}" stroke="${C.fondo}" stroke-width="1.5"/>` +
+         `<text x="${x}" y="${y}" text-anchor="middle" font-size="11.5" font-weight="700" fill="${C.pico}" paint-order="stroke" stroke="${C.fondo}" stroke-width="3">${filas[b].prob}%<tspan font-weight="400" fill="${C.txt}"> ${filas[b].hora.slice(11, 13)}h</tspan></text>`; });
+  // cantidad: panel propio, con color según la intensidad
+  if (hayMm) {
+    s += `<text x="${pl}" y="${y2 - 6}" font-size="10.5" fill="${C.txt}">Cantidad si llueve (mm/h)</text>` +
+         `<line x1="${pl}" x2="${W - pr}" y1="${y2 + h2}" y2="${y2 + h2}" stroke="${C.grid}"/>`;
+    for (const v of [2, 5]) if (v <= mmTope) s += `<line x1="${pl}" x2="${W - pr}" y1="${Ym(v)}" y2="${Ym(v)}" stroke="${C.grid}" stroke-dasharray="2 4"/><text x="${pl - 6}" y="${Ym(v) + 4}" text-anchor="end" font-size="10" fill="${C.txt}">${v}</text>`;
+    filas.forEach((r, i) => { if (r.mm < 0.1) return; const c = r.mm < 2 ? (k ? '#93c5fd' : '#38bdf8') : r.mm < 5 ? (k ? '#2563eb' : '#3b82f6') : '#a855f7';
+      const x0 = Math.max(pl, X(i) - dx * 0.38), x1 = Math.min(W - pr, X(i) + dx * 0.38);
+      s += `<rect x="${x0}" y="${Ym(r.mm)}" width="${Math.max(x1 - x0, 1)}" height="${y2 + h2 - Ym(r.mm)}" rx="1.5" fill="${c}" opacity="${Math.max(0.35, r.prob / 100)}"/>`; });
+  }
+  const ia = filas.findIndex(r => r.hora === ahora);
+  if (ia >= 0) s += `<line x1="${X(ia)}" x2="${X(ia)}" y1="${pt - 18}" y2="${pt + h1 + gap + h2}" stroke="#f59e0b" stroke-width="1.5"/>`;
+  s += `<line class="cursor" y1="${pt}" y2="${pt + h1 + gap + h2}" visibility="hidden" stroke="${C.fuerte}" stroke-width="1"/><circle class="punto" r="5" visibility="hidden" fill="${C.linea}" stroke="${C.fondo}" stroke-width="2"/></svg><div class="tip" hidden></div>`;
   cont.innerHTML = s;
   const svg = cont.querySelector('svg'), tip = cont.querySelector('.tip'), cur = svg.querySelector('.cursor'), pto = svg.querySelector('.punto');
   let ult = -1, activo = false;
@@ -1946,13 +1996,15 @@ function grafica(cont, filas, ahora, hoy) {
     ult = i;
     cur.setAttribute('x1', X(i)); cur.setAttribute('x2', X(i)); cur.setAttribute('visibility', 'visible');
     pto.setAttribute('cx', X(i)); pto.setAttribute('cy', Y(r.prob)); pto.setAttribute('visibility', oc.has('lluvia') ? 'hidden' : 'visible');
-    tip.innerHTML = `<b>${nombreDia(r.hora.slice(0, 10), hoy)} ${r.hora.slice(11, 16)}</b><br>Lluvia: <b>${r.prob}%</b> · Llovizna: ${r.prob_dz}%` +
+    const nivel = r.prob >= 50 ? 'probable' : r.prob >= 20 ? 'posible' : 'poco probable';
+    tip.innerHTML = `<b>${nombreDia(r.hora.slice(0, 10), hoy)} ${r.hora.slice(11, 16)}</b><br>Lluvia: <b>${r.prob}%</b> (${nivel})` +
+      (r.prob_dz > r.prob + 5 ? `<br>Llovizna: ${r.prob_dz}%` : '') +
       ((r.prob_ts || 0) >= 5 ? `<br>Tormenta eléctrica: <b>${r.prob_ts}%</b>` : '') +
-      `<br>${r.prob >= 10 ? 'Si llueve: ' + intensidad(r.mm) : 'Sin lluvia prevista'}<br>${r.temp != null ? Math.round(r.temp) + '°C · ' : ''}${condicion(r)[1]}`;
+      `<br>${r.prob >= 10 ? 'Si llueve: ' + intensidad(r.mm) + (r.mm >= 0.1 ? ` (${r.mm} mm/h)` : '') : 'Sin lluvia prevista'}` +
+      `<br>${r.temp != null ? Math.round(r.temp) + '°C · ' : ''}${condicion(r)[1]}`;
     tip.hidden = false;
     const tw = tip.offsetWidth, th = tip.offsetHeight;
     tip.style.left = Math.max(0, Math.min(W - tw, X(i) - tw / 2)) + 'px';
-    // con el dedo, el globo va arriba para que no lo tape; si arriba lo taparía la barra superior, va abajo
     const cab = ($('.top') || {}).offsetHeight || 60, arribaLibre = rc.top - th - 8 > cab + 4;
     tip.style.top = (ev.pointerType === 'mouse' ? -6 : arribaLibre ? -th - 8 : H + 6) + 'px';
   };
