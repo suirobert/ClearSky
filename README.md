@@ -4,91 +4,78 @@
 
 🌐 [**suirobert.github.io/ClearSky**](https://suirobert.github.io/ClearSky/)
 
-Los pronósticos suelen fallar porque dependen de un solo modelo y nadie mide públicamente
-cuánto aciertan. ClearSky combina 7 modelos meteorológicos internacionales, aprende cuál acierta más
-en cada ciudad y ajusta sus porcentajes para que un 30% signifique de verdad 3 de cada 10.
-Además mira lo que está pasando **ahora** (satélite y reportes de la gente) y avisa del **calor**.
+En Ecuador es común decir "si la app dice que va a llover, no llueve". ClearSky parte de esa desconfianza:
+combina 7 modelos meteorológicos, aprende cuál acierta más en cada ciudad, ajusta sus porcentajes para que un 30%
+signifique de verdad 3 de cada 10, **y publica cada día lo que dijo contra lo que pasó, incluidos los fallos**.
 
 ## Qué ofrece
 
-- **Tu barrio primero**: pronóstico de tu punto exacto con el nombre del barrio (Urdesa, Alborada, La Carolina…). Las ciudades están en una lista aparte.
-- **Lluvia, llovizna y tormentas eléctricas** con porcentajes verificados.
-- **Calor**: sensación térmica (índice de calor), aviso desde 32°, consejos según el nivel y **onda de calor** cuando se esperan 3 días o más con máximas por encima de lo normal.
-- **Humedad, viento, ráfagas e índice UV** (con la hora de mayor riesgo).
-- **Lo que está pasando ahora**: si el satélite o varias personas cerca reportan lluvia, la página lo dice y corrige las próximas horas.
-- **Próximas 24 horas** al estilo Dark Sky: tira de horas con ícono, probabilidad y una línea de temperatura. Toca una hora para ver su detalle.
-- **7 días**, gráfica hora por hora (lluvia, cantidad, temperatura y sensación), **mapa** de lluvia (pronóstico y _lloviendo ahora_) y **satélite** GOES-19.
-- **Reportar el clima**, **avisos en el teléfono**, **compartir** como imagen, modo claro y oscuro.
-- **Instalar como app**: botón _📲 Instalar app_ (en Android instala directo; en iPhone muestra los 3 pasos de Safari).
-- **Cómo funciona**: explicación sencilla dentro de la página.
+- **Tu barrio primero**: pronóstico de tu punto exacto con el nombre del barrio. Las ciudades van en una lista aparte.
+- **Lluvia, llovizna, tormentas eléctricas, calor** (sensación térmica, onda de calor), viento, humedad e índice UV.
+- **Pestaña "Aciertos"**: día por día, lo que dijimos y lo que pasó (acertamos / falsa alarma / se nos escapó), por ciudad.
+- **Lo que está pasando ahora**: lluvia observada por satélite, rayos de los últimos 20 minutos y reportes de la gente.
+- **Lluvia en camino**: "llegaría en ~40 min, viene del oeste", a partir del movimiento de la lluvia que mide el satélite.
+- **Aviso oficial del INAMHI** cuando hay un boletín vigente que afecta tu región.
+- **Hora por hora** con selector de **24 h · 3 días · 7 días** y de variable (lluvia, temperatura, viento, UV). Los días lejanos que todavía no superan al promedio salen rayados como _orientativos_.
+- **Avisos al teléfono a tu medida**: eliges entre lluvia, tormentas eléctricas y avisos oficiales.
+- Mapa, satélite, reportar el clima, compartir, modo claro/oscuro, instalable como app, se actualiza sola.
 
-## Ciudades
+## Cómo funciona (y cómo sabemos que acierta)
 
-Guayaquil, Quito, Manta, Salinas, Esmeraldas, Cuenca, Machala, Portoviejo, Santo Domingo, Loja, Ambato,
-Latacunga, Coca, Lago Agrio, Macas y Galápagos. Las que no tienen un aeropuerto con datos suficientes usan
-lo aprendido en la ciudad verificada más cercana de su zona. Para agregar una: una línea en `CIUDADES`.
-
-## Cómo funciona
-
-1. **Datos**: cada hora, 7 modelos (ECMWF, GFS, ICON, GEM, JMA, MeteoFrance, UKMO) desde Open-Meteo, la lluvia satelital de NOAA (GOES-19) y los reportes de la gente.
+1. **Datos** cada hora: 7 modelos (ECMWF, GFS, ICON, GEM, JMA, MeteoFrance, UKMO) desde Open-Meteo.
 2. **Consenso ponderado** según lo que acertó cada modelo en cada ciudad.
-3. **Verificación diaria** de lo pronosticado 1 a 7 días antes contra los aeropuertos (METAR): lluvia, llovizna y tormentas.
-4. **Examen sin trampa**: aprende con los días anteriores y se examina con los últimos 10; cada ajuste solo se acepta si acierta más.
-5. **Ventana de 45 días** que se desliza: se adapta a la temporada. Lo aprendido queda en `datos/pesos.json`.
-6. **Corrección inmediata** con satélite y reportes para las próximas 2-3 horas.
-7. **Calor**: índice de calor de la NOAA (temperatura + humedad). Niveles: 27° precaución · 32° calor intenso · 41° peligroso · 54° extremo. Onda de calor: 3 días o más con máxima ≥ 2° sobre el promedio de los últimos 30 días.
+3. **Verificación diaria** de lo pronosticado a 1-7 días contra los aeropuertos (METAR), con **examen sin trampa**: se aprende con los días anteriores y se examina con los últimos 10, que no se usaron para aprender. Solo se acepta un ajuste si acierta más. Ventana deslizante de 45 días.
+3. **Temperatura y humedad** también se comparan cada hora con el aeropuerto y se corrigen si el examen lo aprueba.
+4. **Rayos (GOES-19 GLM)**: cada 10 minutos se cuentan las descargas a menos de 25 km de cada ciudad. Cuando hay 16 días acumulados, las **tormentas se verifican con rayos** (no solo con lo que reporta un aeropuerto) y esa calibración se usa **solo si en el examen supera a decir siempre el promedio**.
+5. **Ciudades sin aeropuerto utilizable** (Machala, Santo Domingo, Loja, Ambato, Portoviejo): se verifican con la **lluvia que estima el satélite** cuando hay 21 días acumulados, **pero solo si antes el satélite demostró coincidir con los aeropuertos** (HSS ≥ 0,25 y detecta al menos 35% de las lluvias). La página las marca como verificación _aproximada_.
+6. **Lluvia en camino**: con tres imágenes del satélite (ahora, hace 30 y hace 60 min) se mide hacia dónde se mueve la lluvia por cuadros de 2°. **Un cuadro solo se publica si con el movimiento de hace 30 min se adivinó la imagen de ahora mejor que suponiendo que la lluvia no se mueve.** Se extiende ese movimiento hasta 90 minutos.
+7. **Tablero de aciertos**: "dijimos lluvia" = máximo del día de 40% o más; "dijimos que no llovería" = menos de 20%; entre medio, dudoso.
 8. **Pruebas antes de publicar**: si algo falla, se conserva la página anterior.
 
-> Niebla, viento, humedad, UV, sensación térmica y la estimación satelital vienen de los modelos o del satélite y **todavía no se verifican**.
+> Lo que todavía **no** se verifica: niebla, viento, índice UV, humedad en ciudades sin aeropuerto y la lluvia en camino
+> (se valida el movimiento, pero no se guarda cuántas veces acertó el "llegaría en X min"; pendiente).
 
-## Datos guardados
+## Archivos de datos
 
 | Archivo | Contenido |
 |---|---|
-| `datos/pesos.json` | Lo aprendido por ciudad |
+| `datos/pesos.json` | Lo aprendido por ciudad (lluvia, tormentas con aeropuerto y con rayos, temperatura, plazos, franjas) |
 | `datos/observaciones/AAAA-MM.json` | Lluvia, llovizna y tormenta observadas en los aeropuertos |
-| `datos/satelite/AAAA-MM.json` | Lluvia satelital (mm/h) en cada ciudad, hora por hora |
-| `datos/historial/AAAA-MM-DD.csv` | Lo que mostró la página |
+| `datos/observado/AAAA-MM.json` | Observaciones propias por hora y ciudad: `[lluvia máx. mm/h del satélite, muestras, rayos a <25 km, franjas de 10 min]` |
+| `datos/historial/AAAA-MM-DD.csv` | Lo que mostró la página (base del tablero de aciertos) |
 | `datos/alertas.json` | Cambios bruscos con texto listo para publicar |
 | `datos/reportes/` y `datos/respaldos/` | Reportes de usuarios y respaldo semanal |
 
-## Operación
+## Los dos workflows
 
-- **Ejecutar a mano**: `gh workflow run actualizar.yml -f verificar=true`.
-- **Antes de editar**: `git pull`; si `git push` es rechazado, `git pull --rebase` y otra vez `git push`.
+- **`actualizar.yml`** (cada hora): pronóstico, verificación, página. Guarda lo observado en `datos/observado/`.
+- **`ahora.yml`** (cada 10 minutos, `ahora.py`): publica en la rama `ahora` los archivos `ahora.json` (lluvia, movimiento, rayos y boletín del INAMHI, que lee la página) y `hist.json` (72 h de lluvia y rayos por ciudad). Si falla, la página sigue funcionando con el pronóstico.
 
-## Servicio de reportes, avisos y vigilancia (Cloudflare)
+## Servicio de reportes y avisos (Cloudflare)
 
-Carpeta `feedback/` (Worker + D1, configurado desde el panel de Cloudflare). Secretos: `SAL`, `TOKEN`,
-`VAPID_PUBLIC`, `VAPID_PRIVATE`, opcional `VAPID_SUB` y `GH_TOKEN`; variable `ORIGEN`. Cron `*/30 * * * *`.
+Carpeta `feedback/`: Worker + D1, configurados desde el panel de Cloudflare.
 
-**Privacidad**: reportes con hora, tipo y ubicación redondeada; la IP nunca se guarda.
+- **Base de datos**: `schema.sql`. Si la tabla `sub` ya existía, ejecuta una sola vez `ALTER TABLE sub ADD COLUMN pref INTEGER NOT NULL DEFAULT 7;`
+- **Secretos**: `SAL`, `TOKEN`, `VAPID_PUBLIC`, `VAPID_PRIVATE`, opcional `VAPID_SUB` y `GH_TOKEN`; variable `ORIGEN`. Cron `*/30 * * * *`.
+- **Preferencias** (`pref`): 1 = lluvia (incluye "llegaría en X min"), 2 = tormentas eléctricas, 4 = avisos oficiales. Cada persona las elige en la página.
+- Límites: tormenta, máximo uno cada 2 h; lluvia, uno cada 6 h; oficial, una vez por boletín.
+
+**Privacidad**: la IP nunca se guarda. Los reportes guardan hora, tipo y ubicación redondeada.
 
 ## Límites conocidos
 
 - La verificación usa un punto por ciudad (el aeropuerto).
-- La lluvia satelital puede fallar con lloviznas y lluvias débiles. No es un radar.
-- **Para emergencias sigue siempre las alertas oficiales** de la Secretaría de Gestión de Riesgos y del INAMHI.
+- La lluvia satelital es una estimación: detecta bien los aguaceros, pero puede fallar con lloviznas. No es un radar.
+- "Lluvia en camino" extiende en línea recta el movimiento observado: sirve para la próxima hora y no puede anticipar lluvias que nacen o se disipan.
+- Los rayos son detecciones satelitales y pueden tardar unos minutos.
+- **Para emergencias sigue siempre las alertas oficiales** de la Secretaría de Gestión de Riesgos y del INAMHI (911).
 
 ## Créditos y licencias
 
 - Pronósticos: [Open-Meteo.com](https://open-meteo.com/), CC BY 4.0 (uso no comercial en el plan gratuito).
 - Observaciones METAR: [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu/).
-- Lluvia satelital: NOAA Enterprise Rain Rate. Imagen GOES-19 GeoColor: CIRA/NOAA vía NASA GIBS.
+- Lluvia satelital: NOAA Enterprise Rain Rate. Rayos: GOES-19 GLM (NOAA). Imagen GOES-19 GeoColor: CIRA/NOAA vía NASA GIBS.
+- Boletines: [INAMHI](https://servicios.inamhi.gob.ec/alertas/).
 - Índice de calor: fórmula de la NOAA / National Weather Service.
 - Mapa y barrios: [Leaflet](https://leafletjs.com/) y © [OpenStreetMap](https://www.openstreetmap.org/copyright).
 - Íconos: [Meteocons](https://github.com/basmilius/meteocons) de Bas Milius, MIT.
-
-
-## Ahora y aviso oficial (v15)
-
-Cada 10 minutos el workflow `ahora.yml` ejecuta `ahora.py` y publica `ahora.json` en la rama `ahora`:
-
-- **Rayos**: descargas eléctricas de los últimos 20-30 minutos (GOES-19 GLM, NOAA). Si hay 5 o más en 20 min a menos de 25 km, la página dice "Tormenta eléctrica activa cerca de ti" y el servicio de avisos notifica.
-- **Lluvia observada**: estimación satelital de NOAA (la misma de antes, ahora cada 10 minutos).
-- **Aviso oficial**: último boletín del INAMHI (`advertencia.pdf`): nivel de amenaza, vigencia, fenómeno, zonas afectadas por región y qué puede pasar. Solo se muestra si está vigente o empieza en las próximas 24 h y afecta tu región.
-
-La página lee `ahora.json` cada 5 minutos. Si esa capa falla, la página sigue funcionando con el pronóstico de siempre.
-Los avisos del teléfono distinguen **tormenta** (máx. uno cada 2 h), **lluvia** (cada 6 h) y **oficial** (una vez por boletín).
-Fuentes oficiales: [INAMHI](https://servicios.inamhi.gob.ec/alertas/), [Alertas Ecuador](https://alertasecuador.gob.ec/), [INOCAR](https://www.inocar.mil.ec/web/index.php/productos/tabla-mareas).
-Los rayos son detecciones satelitales: pueden tardar unos minutos y no sustituyen a las alertas oficiales.

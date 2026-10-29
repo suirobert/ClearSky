@@ -1,28 +1,29 @@
-// ClearSky · servicio de reportes, avisos y vigilancia (Cloudflare Workers + D1, plan gratuito) · v15
+// ClearSky · servicio de reportes, avisos y vigilancia (Cloudflare Workers + D1, plan gratuito) · v16
 // POST /reporte     {lat, lon, tipo}            -> guarda un reporte (máx. 1 cada 30 min por persona y zona)
 // GET  /resumen?lat=&lon=                       -> reportes de la última hora a ~10 km (público)
 // GET  /export?despues=<id>                     -> reportes nuevos para el script (requiere TOKEN)
 // GET  /vapid                                   -> clave pública para los avisos
-// POST /suscribir   {sub, lat, lon, nombre, admin?} -> activa avisos (admin = TOKEN: avisos de mantenimiento)
+// POST /suscribir   {sub, lat, lon, nombre, prefs?, admin?} -> activa avisos. prefs: 1 = lluvia, 2 = tormentas, 4 = oficiales
 // POST /desuscribir {endpoint}                  -> los desactiva
 // GET  /vapid-nuevo                             -> genera claves VAPID (requiere TOKEN; se usa una sola vez)
 // GET  /estado                                  -> antigüedad de la página publicada (público)
-// Tarea programada (cron, cada 30 min) -> avisos al teléfono:
-//   1. TORMENTA: 5 o más rayos en 20 min a menos de 25 km (GOES-19 GLM, desde ahora.json). Máximo uno cada 2 h.
-//   2. LLUVIA: el satélite o los reportes de la gente dicen que llueve ahora, o el pronóstico da 60% o más en
-//      las próximas 2 horas. Máximo uno cada 6 h.
-//   3. OFICIAL: cuando el INAMHI publica un boletín que afecta la región de la persona (desde 3 h antes de su
-//      inicio y mientras esté vigente). Una sola vez por boletín.
-//   4. VIGILANCIA: si la página o la capa "ahora" llevan horas sin actualizarse, relanza el workflow de GitHub
-//      (si hay GH_TOKEN) y avisa a los suscriptores administradores.
+// Tarea programada (cron, cada 30 min) -> avisos al teléfono, según lo que cada persona eligió:
+//   TORMENTA (2): 5 o más rayos en 20 min a menos de 25 km (GOES-19 GLM, desde ahora.json). Máximo uno cada 2 h.
+//   LLUVIA   (1): el satélite o los reportes de la gente dicen que llueve ahora; o la lluvia llega en menos de 40 min según el
+//                 movimiento medido por el satélite; o el pronóstico da 60% o más en las próximas 2 horas. Máximo uno cada 6 h.
+//   OFICIAL  (4): un boletín del INAMHI que afecta su región (desde 3 h antes de su inicio y mientras esté vigente). Una vez por boletín.
+//   VIGILANCIA: si la página o la capa "ahora" llevan horas sin actualizarse, relanza el workflow de GitHub (si hay GH_TOKEN)
+//                 y avisa a los suscriptores administradores.
 const TIPOS = ['soleado', 'nublado', 'llovizna', 'lluvia', 'lluvia_fuerte', 'tormenta'];
 const SITIO = 'https://suirobert.github.io/ClearSky';
 const AHORA_URL = 'https://raw.githubusercontent.com/suirobert/ClearSky/ahora/ahora.json';
 const REPO = 'suirobert/ClearSky';
 const PROB_AVISO = 60, HORAS_ENTRE_AVISOS = 6, HORAS_ENTRE_TORMENTAS = 2, MAX_ZONAS = 15, MAX_ENVIOS = 25, HORAS_VIEJA = 3;
-const RAYOS_AVISO = 5;
+const RAYOS_AVISO = 5, NOWCAST_MAX_MIN = 40, NOWCAST_MIN_MM = 1.5;
+const P_LLUVIA = 1, P_TORMENTA = 2, P_OFICIAL = 4;
 const enEcuador = (lat, lon) => lat >= -6 && lat <= 2.5 && lon >= -92.5 && lon <= -75;
 const REGION_DE_ZONA = { costa: 'litoral', sierra: 'interandina', oriente: 'amazonia', galapagos: 'insular' };
+const pref = (s) => (s.pref == null ? 7 : s.pref);
 
 export default {
   async fetch(req, env) {
@@ -101,12 +102,22 @@ export default {
         const admin = b.admin != null && env.TOKEN && String(b.admin) === env.TOKEN ? 1 : 0;
         if (b.admin != null && !admin) return json({ error: 'clave de administrador incorrecta' }, 403);
         const nombre = String((b && b.nombre) || 'tu zona').slice(0, 60);
-        await env.DB.prepare(
-          'INSERT INTO sub (endpoint, p256dh, auth, lat, lon, nombre, creado, aviso, admin) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?) ' +
-          'ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, lat = excluded.lat, lon = excluded.lon, ' +
-          'nombre = excluded.nombre, admin = MAX(sub.admin, excluded.admin)'
-        ).bind(s.endpoint, k.p256dh, k.auth, lat, lon, nombre, ahora, admin).run();
-        return json({ ok: true, admin: !!admin });
+        const prefs = Math.max(1, Math.min(7, parseInt(b.prefs, 10) || 7));
+        try {
+          await env.DB.prepare(
+            'INSERT INTO sub (endpoint, p256dh, auth, lat, lon, nombre, creado, aviso, admin, pref) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?) ' +
+            'ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, lat = excluded.lat, lon = excluded.lon, ' +
+            'nombre = excluded.nombre, admin = MAX(sub.admin, excluded.admin), pref = excluded.pref'
+          ).bind(s.endpoint, k.p256dh, k.auth, lat, lon, nombre, ahora, admin, prefs).run();
+        } catch (e) {
+          if (!/no such column|no column named|has no column/i.test(String(e && e.message))) throw e;                 // la tabla todavía no tiene la columna "pref"
+          await env.DB.prepare(
+            'INSERT INTO sub (endpoint, p256dh, auth, lat, lon, nombre, creado, aviso, admin) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?) ' +
+            'ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, lat = excluded.lat, lon = excluded.lon, ' +
+            'nombre = excluded.nombre, admin = MAX(sub.admin, excluded.admin)'
+          ).bind(s.endpoint, k.p256dh, k.auth, lat, lon, nombre, ahora, admin).run();
+        }
+        return json({ ok: true, admin: !!admin, prefs });
       }
 
       if (url.pathname === '/desuscribir' && req.method === 'POST') {
@@ -149,7 +160,7 @@ async function leerAhora(env) {
     if (!r.ok) return null;
     const j = await r.json();
     j._edadMin = (Date.now() - horaEc(j.generado)) / 60000;
-    if (!(j._edadMin < 40)) { j.rayos = null; j.lluvia = null; }               // dato viejo: no es "ahora"
+    if (!(j._edadMin < 40)) { j.rayos = null; j.lluvia = null; j.movimiento = null; }   // dato viejo: no es "ahora"
     if (j.rayos && !((Date.now() - horaEc(j.rayos.t)) / 60000 < 25)) j.rayos = null;
     return j;
   } catch (e) { return null; }
@@ -193,12 +204,37 @@ function satelite(A) {
   if (!A || !A.q) return null;
   if (!(Date.now() - horaEc(A.t) < 3 * 3600e3)) return null;
   const v = Uint8Array.from(atob(A.q), c => c.charCodeAt(0));
-  return { t: A.t, en(lat, lon) {
+  return { t: A.t, edadMin: (Date.now() - horaEc(A.t)) / 60000, en(lat, lon, r = 1) {
     const iy = Math.floor((A.lat0 - lat) / A.paso), ix = Math.floor((lon - A.lon0) / A.paso); let m = null;
-    for (let y = iy - 1; y <= iy + 1; y++) for (let x = ix - 1; x <= ix + 1; x++)
+    for (let y = iy - r; y <= iy + r; y++) for (let x = ix - r; x <= ix + r; x++)
       if (y >= 0 && y < A.ny && x >= 0 && x < A.nx) m = Math.max(m ?? 0, v[y * A.nx + x] * A.escala);
     return m;
   } };
+}
+// ---- lluvia en camino: el mismo cálculo que la página (extiende el movimiento que midió el satélite) ----
+function movEn(M, lat, lon) {
+  if (!M || !M.u) return null;
+  const ty = Math.floor((M.lat0 - lat) / M.tile), tx = Math.floor((lon - M.lon0) / M.tile);
+  let su = 0, sv = 0, sw = 0;
+  for (let y = ty - 1; y <= ty + 1; y++) for (let x = tx - 1; x <= tx + 1; x++) {
+    if (y < 0 || x < 0 || y >= M.ny || x >= M.nx) continue;
+    const u = M.u[y][x], w = M.v[y][x]; if (u == null || w == null) continue;
+    const pe = (y === ty && x === tx) ? 3 : 1; su += u * pe; sv += w * pe; sw += pe;
+  }
+  return sw ? { u: su / sw, v: sv / sw } : null;
+}
+export function nowcast(sat, M, lat, lon) {
+  const m = movEn(M, lat, lon); if (!sat || !m) return null;
+  const vel = Math.hypot(m.u, m.v); if (vel < 4) return null;
+  const edad = sat.edadMin; if (edad > 35) return null;
+  const cl = Math.cos(lat * Math.PI / 180);
+  const fuente = tt => { const t = (edad + tt) / 60; return [lat - m.v * t / 111.32, lon - m.u * t / (111.32 * cl)]; };
+  const val = tt => { const [la, lo] = fuente(tt); return sat.en(la, lo, 0) ?? 0; };
+  const pasos = []; for (let tt = 0; tt <= 90; tt += 5) pasos.push([tt, val(tt)]);
+  if (pasos[0][1] >= 1) return null;                                        // ya llueve: eso lo cubre el aviso de "está lloviendo"
+  for (let i = 1; i < pasos.length - 1; i++) if (pasos[i][1] >= 1 && pasos[i + 1][1] >= 1)
+    return { min: pasos[i][0], mm: Math.max(...pasos.slice(i, i + 7).map(p => p[1])), vel: Math.round(vel) };
+  return null;
 }
 async function revisarAvisos(env, ah) {
   if (!env.VAPID_PRIVATE || !env.VAPID_PUBLIC) return;
@@ -217,22 +253,28 @@ async function revisarAvisos(env, ah) {
     let aviso = null, destinatarios = lista;
     // 1) tormenta eléctrica: descargas detectadas por el satélite en los últimos 20 minutos
     const ry = rayosEn(ah && ah.rayos, lat, lon);
-    if (ry && ry.n20 >= RAYOS_AVISO) {
+    if (ry && ry.n20 >= RAYOS_AVISO && lista.some(s => pref(s) & P_TORMENTA)) {
+      destinatarios = lista.filter(s => pref(s) & P_TORMENTA);
       aviso = (nombre) => ({ title: `⚡ Tormenta eléctrica cerca de ${nombre}`,
         body: `${ry.n20} rayos en 20 min a menos de ${ry.radio} km. Busca refugio bajo techo.`, url: sitio + '/', tag: 'tormenta' });
     } else {
-      destinatarios = lista.filter(s => s.aviso < ahora - HORAS_ENTRE_AVISOS * 3600);      // la lluvia avisa como mucho cada 6 h
+      destinatarios = lista.filter(s => (pref(s) & P_LLUVIA) && s.aviso < ahora - HORAS_ENTRE_AVISOS * 3600);   // la lluvia avisa como mucho cada 6 h
       if (!destinatarios.length) continue;
       // 2) ¿está lloviendo ya? satélite y reportes de la gente de la última hora
       const mm = sat ? sat.en(lat, lon) : null;
       const rep = await resumen(env, lat, lon, ahora);
       const moja = (rep.lluvia || 0) + (rep.lluvia_fuerte || 0) + (rep.tormenta || 0) + 0.5 * (rep.llovizna || 0);
       const lluviaRep = rep.total >= 3 && moja / rep.total >= 0.6;
+      const nc = (mm == null || mm < 1) && !lluviaRep ? nowcast(sat, ah && ah.movimiento, lat, lon) : null;
       if ((mm != null && mm >= 1) || lluviaRep) {
         const quien = [mm != null && mm >= 0.5 ? 'el satélite' : '', lluviaRep ? `${rep.total} reportes de la gente` : ''].filter(Boolean).join(' y ');
         aviso = (nombre) => ({ title: `🌧️ Está lloviendo cerca de ${nombre}`, body: `Según ${quien}. ¡Lleva paraguas!`, url: sitio + '/', tag: 'lluvia' });
+      } else if (nc && nc.min <= NOWCAST_MAX_MIN && nc.mm >= NOWCAST_MIN_MM) {
+        // 3) la lluvia viene en camino (movimiento medido por el satélite)
+        aviso = (nombre) => ({ title: `🌧️ La lluvia llegaría a ${nombre} en ~${Math.max(nc.min, 5)} min`,
+          body: `Viene a ${nc.vel} km/h, según el satélite. ¡Lleva paraguas!`, url: sitio + '/', tag: 'lluvia' });
       } else {
-        // 3) pronóstico de las próximas 2 horas
+        // 4) pronóstico de las próximas 2 horas
         const om = await (await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=precipitation` +
           `&models=${conf.modelos.join(',')}&timezone=auto&forecast_hours=3`)).json();
         if (!om.hourly) continue;
@@ -280,6 +322,7 @@ async function avisosOficiales(env, ah) {
   let maxRid = ultimo;
   for (const s of subs) {
     maxRid = Math.max(maxRid, s.rid);
+    if (!(pref(s) & P_OFICIAL)) continue;                                                // no quiso avisos oficiales
     if (Object.keys(zonas).length && !zonas[regionDe(conf, s.lat, s.lon)]) continue;     // no afecta a su región
     const vig = `Vigente hasta ${o.hasta.slice(8, 10)}/${o.hasta.slice(5, 7)} ${o.hasta.slice(11, 16)}.`;
     const aviso = { title: '⚠️ Aviso oficial del INAMHI',

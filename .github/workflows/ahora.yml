@@ -1,7 +1,7 @@
-name: Ahora (rayos, lluvia observada y aviso oficial)
+name: Ahora (rayos, lluvia observada, movimiento y aviso oficial)
 
-# Cada 10 minutos genera ahora.json y lo publica en la rama "ahora" (un solo commit que se reemplaza
-# cada vez, para no llenar el historial). La página y el servicio de avisos leen ese archivo.
+# Cada 10 minutos genera ahora.json (lo lee la página) y hist.json (lo usa el script horario para verificar con
+# observaciones propias) y los publica en la rama "ahora" (un solo commit que se reemplaza cada vez).
 on:
   schedule:
     - cron: "*/10 * * * *"
@@ -12,12 +12,12 @@ permissions:
 
 concurrency:
   group: ahora
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   ahora:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,18 +30,25 @@ jobs:
       - name: Instalar librerías
         run: pip install --quiet netCDF4 numpy pypdf
 
-      - name: Generar ahora.json
-        run: python ahora.py ahora.json
+      - name: Traer el historial anterior (sin pasar por cachés)
+        run: |
+          git fetch --depth=1 origin ahora:refs/remotes/origin/ahora || true
+          git show origin/ahora:hist.json > hist_prev.json 2>/dev/null || rm -f hist_prev.json
+
+      - name: Generar ahora.json y hist.json
+        env:
+          CC_HIST_PREVIO: hist_prev.json
+        run: |
+          mkdir -p salida
+          python ahora.py salida
 
       - name: Publicar en la rama ahora
         run: |
           set -e
-          carpeta=$(mktemp -d)
-          cp ahora.json "$carpeta/"
-          cd "$carpeta"
+          cd salida
           git init -q -b ahora
           git config user.name "ClearSky bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add ahora.json
+          git add ahora.json hist.json
           git commit -q -m "ahora $(date -u +%H:%M)"
           git push -q -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" HEAD:ahora

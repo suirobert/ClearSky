@@ -1,22 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-ClearSky · capa AHORA y OFICIAL
---------------------------------
-Se ejecuta cada 10 minutos (workflow ahora.yml) y genera `ahora.json` con:
-  - lluvia:  lluvia que el satélite estima en este momento (NOAA Enterprise Rain Rate)
-  - rayos:   descargas eléctricas de los últimos 20-30 min (GOES-19 GLM, NOAA)
-  - oficial: último boletín meteorológico del INAMHI (nivel, vigencia, zonas, qué puede pasar)
+ClearSky · capa AHORA y OFICIAL (v16)
+-------------------------------------
+Se ejecuta cada 10 minutos (workflow ahora.yml) y genera dos archivos:
 
-Cada parte falla por separado: si una fuente no responde, se guarda el motivo en "errores" y las demás
-siguen. Solo usa la librería estándar de Python más netCDF4/numpy (satélite) y pypdf (boletín).
+  ahora.json  (lo lee la página y el servicio de avisos)
+    - lluvia:     lluvia que el satélite estima en este momento (NOAA Enterprise Rain Rate, GOES-19)
+    - movimiento: hacia dónde se mueve la lluvia (por cuadros de 2°), medido con 3 imágenes (t, t-30, t-60 min).
+                  Solo se incluyen los cuadros donde la extrapolación demostró ser mejor que "no se mueve".
+    - rayos:      descargas eléctricas de los últimos 20-30 min (GOES-19 GLM, NOAA)
+    - oficial:    último boletín meteorológico del INAMHI
 
-Uso:  python ahora.py [ruta_de_salida.json]
+  hist.json  (lo usa el script horario para VERIFICAR con observaciones propias)
+    - lluvia por ciudad cada 10 min (máximo en ~5 km) y rayos por ciudad en cada franja de 10 min completa.
+    Se conservan 72 h; el script horario los pasa a datos/observado/ para siempre.
+
+Cada parte falla por separado: si una fuente no responde, el motivo queda en "errores" y las demás siguen.
+Uso:  python ahora.py [carpeta_de_salida_o_ruta_ahora.json]
 """
 import io, json, math, os, re, sys, base64, tempfile, time, urllib.request, urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-REPO_URL = "https://github.com/suirobert/ClearSky"
+REPO = os.environ.get("GITHUB_REPOSITORY") or "suirobert/ClearSky"
+REPO_URL = f"https://github.com/{REPO}"
+URL_HIST = f"https://raw.githubusercontent.com/{REPO}/ahora/hist.json"
 OFFSET_S = -5 * 3600                       # Ecuador continental y Galápagos: UTC-5
 URL_ERR = "https://noaa-enterprise-rainrate-pds.s3.amazonaws.com"
 URL_GOES19 = "https://noaa-goes19.s3.amazonaws.com"
@@ -25,9 +33,20 @@ URL_PAG_INAMHI = "https://servicios.inamhi.gob.ec/alertas/"
 
 # --- lluvia satelital ---
 AHORA_CAJA = (-5.5, 2.5, -92.5, -75.0)      # sur, norte, oeste, este
-AHORA_PASO = 0.1
+AHORA_PASO = 0.1                            # cuadrícula que se publica (~11 km)
+PASO_FINO = 0.05                            # cuadrícula para medir el movimiento (~5,5 km)
 AHORA_MAX_H = 3
 SAT_PREFERIDOS = ["G19", "GOES-19", "BLEND", "G16", "GOES-16", "G18", "GOES-18"]   # carpetas reales: G19, BLEND, G16, G18
+
+# --- movimiento de la lluvia ---
+MOV_DT_MIN = 30                             # separación entre imágenes
+MOV_TOL_MIN = 7                             # tolerancia al buscar la imagen de hace 30 / 60 min
+MOV_TILE_DEG = 2.0                          # tamaño de cada cuadro de movimiento
+MOV_MARGEN = 12                             # celdas extra alrededor del cuadro (la lluvia viene de fuera)
+MOV_MAX_DESP = 8                            # desplazamiento máximo buscado (celdas de 0,05° en 30 min = hasta ~90 km/h)
+MOV_MIN_CELDAS = 20                         # celdas con >= 1 mm/h necesarias en el cuadro
+MOV_MIN_MEJORA = 0.15                       # el movimiento debe reducir el error al menos 15% frente a "no se mueve"
+MOV_MIN_CSI_GANANCIA = 0.05                 # la extrapolación debe superar a la persistencia por esta diferencia (CSI)
 
 # --- rayos ---
 RAYOS_CAJA = (-8.0, 5.0, -96.0, -72.0)     # algo más amplia: tormentas en el mar y en la frontera
@@ -37,6 +56,9 @@ RAYOS_MAX_EDAD_MIN = 15                    # si el archivo más nuevo es más vi
 RAYOS_RADIO_KM = 25
 RAYOS_CELDA = 0.05                         # ~5,5 km
 RAYOS_MAX_CELDAS = 1500
+RAYOS_ARCHIVOS_FRANJA = 27                 # de 30 archivos (20 s) por franja de 10 min: mínimo para darla por completa
+
+HIST_HORAS = 72
 
 CIUDADES = {
     "Guayaquil": (-2.1894, -79.8891), "Quito": (-0.1807, -78.4678), "Manta": (-0.9677, -80.7089),
@@ -46,6 +68,7 @@ CIUDADES = {
     "Coca": (-0.4664, -76.9871), "Lago Agrio": (0.0849, -76.8828), "Macas": (-2.3087, -78.1171),
     "Galápagos": (-0.7432, -90.3136),
 }
+ORDEN = list(CIUDADES)
 
 
 # =====================================================================================================
@@ -92,13 +115,6 @@ def importar_netcdf():
         return netCDF4, numpy
 
 
-def distancia_km(lat1, lon1, lat2, lon2):
-    r = 6371.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    a = math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2
-    return 2 * r * math.asin(math.sqrt(a))
-
-
 def s3_listar(base, prefijo, delimitador=True):
     """Lista un nivel de un bucket público de NOAA (sin cuenta). Devuelve (subcarpetas, archivos)."""
     import xml.etree.ElementTree as ET
@@ -126,9 +142,15 @@ def s3_listar(base, prefijo, delimitador=True):
 
 
 # =====================================================================================================
-#  1. LLUVIA ESTIMADA POR SATÉLITE (NOAA Enterprise Rain Rate)
+#  1. LLUVIA ESTIMADA POR SATÉLITE (NOAA Enterprise Rain Rate) + MOVIMIENTO
 # =====================================================================================================
-def err_ultimo():
+def _inicio_err(key):
+    m = re.search(r"_s(\d{12})", key)
+    return datetime.strptime(m.group(1), "%Y%m%d%H%M") if m else None
+
+
+def err_recientes():
+    """Archivos de lluvia instantánea más recientes (de la carpeta de la hora actual y la anterior), del más nuevo al más viejo."""
     carpetas, _ = s3_listar(URL_ERR, "")
     nombre = lambda c: c.rstrip("/").rsplit("/", 1)[-1]
     raices = [c for p in SAT_PREFERIDOS for c in carpetas if nombre(c).upper().startswith(p.upper())]
@@ -142,8 +164,20 @@ def err_ultimo():
                 carpetas, archivos = s3_listar(URL_ERR, pref)
                 nc = [a for a in archivos if a["key"].endswith(".nc")]
                 inst = [a for a in nc if "INST" in a["key"].upper()]
-                if inst or nc:
-                    return max(inst or nc, key=lambda a: (a["mod"], a["key"]))
+                lista = inst or nc
+                if lista:
+                    # la hora anterior (los cuadros de hace 30 y 60 min pueden estar ahí)
+                    m = re.search(r"(\d{4})/(\d{2})/(\d{2})/(\d{2})/?$", pref)
+                    if m:
+                        t = datetime(*map(int, m.groups())) - timedelta(hours=1)
+                        previa = pref[:m.start()] + f"{t:%Y/%m/%d/%H}/"
+                        try:
+                            _, a2 = s3_listar(URL_ERR, previa)
+                            n2 = [a for a in a2 if a["key"].endswith(".nc")]
+                            lista = lista + ([a for a in n2 if "INST" in a["key"].upper()] or n2)
+                        except Exception:
+                            pass
+                    return sorted(lista, key=lambda a: (a["mod"], a["key"]), reverse=True)
                 if not carpetas:
                     break
                 lluvia = [c for c in carpetas if "RAIN" in nombre(c).upper() or "RRQPE" in nombre(c).upper()]
@@ -157,12 +191,11 @@ def err_ultimo():
     raise RuntimeError("no se encontró el archivo de lluvia; recorrido: " + " | ".join(errores))
 
 
-def leer_lluvia_nc(ruta):
-    """Lluvia instantánea (mm/h) promediada en una cuadrícula de 0,1° sobre Ecuador.
-       Acepta latitud/longitud 1D o 2D (disco completo) y longitudes 0-360."""
+def leer_lluvia_nc(ruta, pasos=(AHORA_PASO,)):
+    """Lluvia instantánea (mm/h) promediada en una o varias cuadrículas sobre Ecuador (una por cada paso, en grados).
+       Acepta latitud/longitud 1D o 2D (disco completo) y longitudes 0-360. Devuelve (lista_de_rejillas, puntos)."""
     nc4, np = importar_netcdf()
     s0, n0, w0, e0 = AHORA_CAJA
-    ny, nx = round((n0 - s0) / AHORA_PASO), round((e0 - w0) / AHORA_PASO)
     with nc4.Dataset(ruta) as ds:
         variables = {}
         def recorrer(g):
@@ -220,41 +253,198 @@ def leer_lluvia_nc(ruta):
     if LA.size < 100:
         raise RuntimeError(f"el archivo no trae datos sobre Ecuador (variable {nombre})")
     datos = np.where(np.isfinite(datos), np.clip(datos, 0, 300), 0.0)     # 'sin dato' = no llueve
-    gy = np.clip(((n0 - LA) / AHORA_PASO).astype(int), 0, ny - 1)
-    gx = np.clip(((LO - w0) / AHORA_PASO).astype(int), 0, nx - 1)
-    suma, cuenta = np.zeros(ny * nx), np.zeros(ny * nx)
-    np.add.at(suma, gy * nx + gx, datos)
-    np.add.at(cuenta, gy * nx + gx, 1)
-    media = np.where(cuenta > 0, suma / np.maximum(cuenta, 1), 0)
-    return media.reshape(ny, nx), float(LA.size)
+    salida = []
+    for paso in pasos:
+        ny, nx = round((n0 - s0) / paso), round((e0 - w0) / paso)
+        gy = np.clip(((n0 - LA) / paso).astype(int), 0, ny - 1)
+        gx = np.clip(((LO - w0) / paso).astype(int), 0, nx - 1)
+        suma, cuenta = np.zeros(ny * nx), np.zeros(ny * nx)
+        np.add.at(suma, gy * nx + gx, datos)
+        np.add.at(cuenta, gy * nx + gx, 1)
+        salida.append(np.where(cuenta > 0, suma / np.maximum(cuenta, 1), 0).reshape(ny, nx))
+    return salida, float(LA.size)
 
 
-def lluvia_ahora():
-    ult = err_ultimo()
-    m = re.search(r"_s(\d{12})", ult["key"])
-    utc = datetime.strptime(m.group(1), "%Y%m%d%H%M") if m else datetime.strptime(ult["mod"][:16], "%Y-%m-%dT%H:%M")
+# ---------------------- movimiento ----------------------
+def _fuente(np, F, y0, y1, x0, x1, dy, dx):
+    """Recorte [y0:y1, x0:x1] de F desplazado (dy, dx): devuelve F[y-dy, x-dx] (ceros fuera del mapa)."""
+    ny, nx = F.shape
+    out = np.zeros((y1 - y0, x1 - x0), F.dtype)
+    ys0, ys1, xs0, xs1 = y0 - dy, y1 - dy, x0 - dx, x1 - dx
+    cy0, cy1, cx0, cx1 = max(ys0, 0), min(ys1, ny), max(xs0, 0), min(xs1, nx)
+    if cy0 < cy1 and cx0 < cx1:
+        out[cy0 - ys0:cy1 - ys0, cx0 - xs0:cx1 - xs0] = F[cy0:cy1, cx0:cx1]
+    return out
+
+
+def _parabola(a, b, c):
+    """Mínimo sub-celda de una parábola por tres puntos (a, b, c) en -1, 0, +1."""
+    d = a - 2 * b + c
+    return 0.0 if d <= 1e-12 else max(-0.5, min(0.5, 0.5 * (a - c) / d))
+
+
+def desplazamientos(A, B, paso, nty, ntx, tile_cells):
+    """Para cada cuadro, cuánto se movió la lluvia entre B (antes) y A (ahora): (dy, dx) en celdas, positivo = al sur / al este.
+       Devuelve una lista de listas con dicts {dy, dx, mejora, celdas} o None si no hay lluvia suficiente o no hay mejora."""
+    import numpy as np
+    g = lambda F: np.log1p(np.clip(F, 0, 30))
+    GA, GB = g(A), g(B)
+    ny, nx = A.shape
+    desp = np.arange(-MOV_MAX_DESP, MOV_MAX_DESP + 1)
+    res = [[None] * ntx for _ in range(nty)]
+    for ty in range(nty):
+        for tx in range(ntx):
+            y0, y1 = ty * tile_cells, min((ty + 1) * tile_cells, ny)
+            x0, x1 = tx * tile_cells, min((tx + 1) * tile_cells, nx)
+            celdas = int((A[y0:y1, x0:x1] >= 1.0).sum())
+            if celdas < MOV_MIN_CELDAS:
+                continue
+            wy0, wy1, wx0, wx1 = max(y0 - MOV_MARGEN, 0), min(y1 + MOV_MARGEN, ny), max(x0 - MOV_MARGEN, 0), min(x1 + MOV_MARGEN, nx)
+            ventana = GA[wy0:wy1, wx0:wx1]
+            mse = np.zeros((len(desp), len(desp)))
+            for i, dy in enumerate(desp):
+                for j, dx in enumerate(desp):
+                    mse[i, j] = float(((ventana - _fuente(np, GB, wy0, wy1, wx0, wx1, int(dy), int(dx))) ** 2).mean())
+            i0, j0 = MOV_MAX_DESP, MOV_MAX_DESP
+            base = mse[i0, j0]
+            if base <= 1e-9:
+                continue
+            i, j = np.unravel_index(int(np.argmin(mse)), mse.shape)
+            if i in (0, len(desp) - 1) or j in (0, len(desp) - 1):
+                continue                                                 # en el borde de la búsqueda: no es confiable
+            mejora = 1 - mse[i, j] / base
+            if mejora < MOV_MIN_MEJORA:
+                continue
+            dy = float(desp[i]) + _parabola(mse[i - 1, j], mse[i, j], mse[i + 1, j])
+            dx = float(desp[j]) + _parabola(mse[i, j - 1], mse[i, j], mse[i, j + 1])
+            res[ty][tx] = {"dy": dy, "dx": dx, "mejora": float(mejora), "celdas": celdas}
+    return res
+
+
+def _csi(np, pred, real, umbral=1.0):
+    p, r = pred >= umbral, real >= umbral
+    a, b, c = int((p & r).sum()), int((p & ~r).sum()), int((~p & r).sum())
+    return a / (a + b + c) if (a + b + c) else None
+
+
+def movimiento_lluvia(A, B, C, paso=PASO_FINO, dt=MOV_DT_MIN):
+    """Movimiento de la lluvia por cuadros de 2° (km/h hacia el este y hacia el norte) a partir de tres imágenes:
+       A (ahora), B (hace 30 min), C (hace 60 min). Un cuadro solo se publica si, con el movimiento medido entre C y B,
+       se predijo A mejor que suponiendo que la lluvia no se mueve (validación con datos reales de los últimos 30 min)."""
+    import numpy as np
+    s0, n0, w0, e0 = AHORA_CAJA
+    tile_cells = int(round(MOV_TILE_DEG / paso))
+    ny, nx = A.shape
+    nty, ntx = -(-ny // tile_cells), -(-nx // tile_cells)
+    ahora = desplazamientos(A, B, paso, nty, ntx, tile_cells)          # movimiento B -> A (para predecir)
+    previo = desplazamientos(B, C, paso, nty, ntx, tile_cells)         # movimiento C -> B (para validar)
+    u = [[None] * ntx for _ in range(nty)]
+    v = [[None] * ntx for _ in range(nty)]
+    q = [[None] * ntx for _ in range(nty)]
+    validos = 0
+    for ty in range(nty):
+        for tx in range(ntx):
+            m1, m0 = ahora[ty][tx], previo[ty][tx]
+            if not m1 or not m0:
+                continue
+            y0, y1 = ty * tile_cells, min((ty + 1) * tile_cells, ny)
+            x0, x1 = tx * tile_cells, min((tx + 1) * tile_cells, nx)
+            # validación: con el movimiento de hace 30 min, ¿se adivina la imagen de ahora mejor que sin movimiento?
+            pred = _fuente(np, B, y0, y1, x0, x1, int(round(m0["dy"])), int(round(m0["dx"])))
+            real = A[y0:y1, x0:x1]
+            csi_adv, csi_per = _csi(np, pred, real), _csi(np, B[y0:y1, x0:x1], real)
+            if csi_adv is None or csi_per is None or csi_adv < csi_per + MOV_MIN_CSI_GANANCIA:
+                continue
+            latc = n0 - (y0 + y1) / 2 * paso
+            km_x = m1["dx"] * paso * 111.32 * math.cos(math.radians(latc))
+            km_y = -m1["dy"] * paso * 111.32
+            ve, vn = km_x * 60 / dt, km_y * 60 / dt
+            if math.hypot(ve, vn) > 90:
+                continue
+            u[ty][tx], v[ty][tx] = round(ve, 1), round(vn, 1)
+            q[ty][tx] = round(csi_adv - csi_per, 2)
+            validos += 1
+    if not validos:
+        return None
+    return {"tile": MOV_TILE_DEG, "lat0": n0, "lon0": w0, "ny": nty, "nx": ntx, "dt_min": dt,
+            "u": u, "v": v, "skill": q, "validos": validos}
+
+
+def lluvia_y_movimiento():
+    """Lluvia actual (payload para la página), movimiento (o None) y lluvia máxima en cada ciudad (~5 km)."""
+    import numpy as np
+    lista = err_recientes()
+    t_ult = _inicio_err(lista[0]["key"])
+    utc = t_ult or datetime.strptime(lista[0]["mod"][:16], "%Y-%m-%dT%H:%M")
     edad_h = (ahora_utc() - utc).total_seconds() / 3600
     if edad_h > AHORA_MAX_H:
-        raise RuntimeError(f"la imagen más reciente tiene {edad_h:.1f} h ({ult['key']})")
-    if ult["size"] > 600 * 2 ** 20:
-        raise RuntimeError(f"archivo demasiado grande ({ult['size'] // 2 ** 20} MB)")
-    fd, ruta = tempfile.mkstemp(suffix=".nc")
-    os.close(fd)
-    try:
-        datos = http_get(f"{URL_ERR}/{urllib.parse.quote(ult['key'])}", binario=True, timeout=180)
-        with open(ruta, "wb") as f:
-            f.write(datos)
+        raise RuntimeError(f"la imagen más reciente tiene {edad_h:.1f} h ({lista[0]['key']})")
+    if lista[0]["size"] > 600 * 2 ** 20:
+        raise RuntimeError(f"archivo demasiado grande ({lista[0]['size'] // 2 ** 20} MB)")
+
+    def cercano(objetivo_min):
+        mejor = None
+        for a in lista[1:]:
+            t = _inicio_err(a["key"])
+            if t is None:
+                continue
+            d = abs((utc - t).total_seconds() / 60 - objetivo_min)
+            if d <= MOV_TOL_MIN and (mejor is None or d < mejor[0]):
+                mejor = (d, a)
+        return mejor[1] if mejor else None
+
+    previos = {"B": cercano(MOV_DT_MIN), "C": cercano(2 * MOV_DT_MIN)}
+
+    def bajar(a):
+        if a is None:
+            return None
         try:
-            rejilla, _ = leer_lluvia_nc(ruta)
+            fd, ruta = tempfile.mkstemp(suffix=".nc")
+            os.close(fd)
+            with open(ruta, "wb") as f:
+                f.write(http_get(f"{URL_ERR}/{urllib.parse.quote(a['key'])}", binario=True, timeout=180))
+            return ruta
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=3) as ex:                    # se descarga en paralelo; la lectura NetCDF, una por una
+        r_a, r_b, r_c = ex.map(bajar, [lista[0], previos["B"], previos["C"]])
+    rutas = [r for r in (r_a, r_b, r_c) if r]
+    try:
+        if not r_a:
+            raise RuntimeError(f"no se pudo descargar {lista[0]['key']}")
+        try:
+            (g10, g05), _ = leer_lluvia_nc(r_a, (AHORA_PASO, PASO_FINO))
         except Exception as e:
-            raise RuntimeError(f"{e} (archivo {ult['key']})")
+            raise RuntimeError(f"{e} (archivo {lista[0]['key']})")
+        mov, motivo = None, None
+        if r_b and r_c:
+            try:
+                (B,), _ = leer_lluvia_nc(r_b, (PASO_FINO,))
+                (C,), _ = leer_lluvia_nc(r_c, (PASO_FINO,))
+                mov = movimiento_lluvia(g05, B, C)
+                if mov is None:
+                    motivo = "sin lluvia suficiente o sin mejora frente a 'no se mueve'"
+            except Exception as e:
+                motivo = f"no se pudo medir: {e}"
+        else:
+            motivo = "faltan las imágenes de hace 30 y 60 min"
     finally:
-        os.remove(ruta)
-    import numpy as np
-    q = np.clip(np.round(rejilla * 2), 0, 255).astype("uint8")           # pasos de 0,5 mm/h
+        for r in rutas:
+            try:
+                os.remove(r)
+            except Exception:
+                pass
+    q = np.clip(np.round(g10 * 2), 0, 255).astype("uint8")           # pasos de 0,5 mm/h
     s0, n0, w0, e0 = AHORA_CAJA
-    return {"t": iso_local(utc), "lat0": n0, "lon0": w0, "paso": AHORA_PASO, "ny": int(q.shape[0]), "nx": int(q.shape[1]),
-            "escala": 0.5, "q": base64.b64encode(q.tobytes()).decode("ascii"), "fuente": ult["key"].rsplit("/", 1)[-1]}
+    lluvia = {"t": iso_local(utc), "lat0": n0, "lon0": w0, "paso": AHORA_PASO, "ny": int(q.shape[0]), "nx": int(q.shape[1]),
+              "escala": 0.5, "q": base64.b64encode(q.tobytes()).decode("ascii"), "fuente": lista[0]["key"].rsplit("/", 1)[-1]}
+    ciudades = {}
+    for c, (la, lo) in CIUDADES.items():                              # máximo en 3x3 celdas de 0,05° (~±5,5 km)
+        iy, ix = int((n0 - la) / PASO_FINO), int((lo - w0) / PASO_FINO)
+        sub = g05[max(iy - 1, 0):iy + 2, max(ix - 1, 0):ix + 2]
+        ciudades[c] = round(float(sub.max()), 1) if sub.size else None
+    return lluvia, mov, motivo, ciudades, utc
 
 
 # =====================================================================================================
@@ -346,20 +536,21 @@ def rayos_ahora():
     if len(fallos) > len(res) // 2:
         raise RuntimeError(f"no se pudieron leer {len(fallos)} de {len(res)} archivos GLM; ejemplo: {fallos[0]}")
     s0, n0, w0, e0 = RAYOS_CAJA
-    L, G, E = [], [], []
+    L, G, E, T = [], [], [], []
     for t, lat, lon, e in res:
         if lat is None or not len(lat):
             continue
         L.append(lat); G.append(lon)
         E.append(np.full(len(lat), (ahora - t).total_seconds() / 60.0, dtype=np.float32))
+        T.append(np.full(len(lat), (t - datetime(1970, 1, 1)).total_seconds() / 600.0, dtype=np.float64))   # franja de 10 min
     if L:
-        lat, lon, edad = np.concatenate(L), np.concatenate(G), np.concatenate(E)
+        lat, lon, edad, tt = np.concatenate(L), np.concatenate(G), np.concatenate(E), np.concatenate(T)
         m = np.isfinite(lat) & np.isfinite(lon) & (lat >= s0) & (lat <= n0) & (lon >= w0) & (lon <= e0)
-        lat, lon, edad = lat[m], lon[m], edad[m]
+        lat, lon, edad, tt = lat[m], lon[m], edad[m], tt[m]
     else:
         lat = lon = edad = np.zeros(0, dtype=np.float32)
+        tt = np.zeros(0, dtype=np.float64)
     rec = edad <= RAYOS_RECIENTE_MIN
-    # celdas de ~5 km: [lat, lon, descargas en 20 min, descargas en 30 min]
     celdas = []
     if len(lat):
         iy = np.round(lat / RAYOS_CELDA).astype(np.int64)
@@ -371,19 +562,39 @@ def rayos_ahora():
                            int(rec[sel].sum()), int(sel.sum())])
         celdas.sort(key=lambda c: -c[3])
         celdas = celdas[:RAYOS_MAX_CELDAS]
+    # cercanía de cada ciudad (una vez) y conteos por franja de 10 min completa
+    cerca_de = {}
     ciudades = {}
     for nombre, (cla, clo) in CIUDADES.items():
         if not len(lat):
-            break
+            cerca_de[nombre] = np.zeros(0, dtype=bool)
+            continue
         dy = (lat - cla) * 111.0
         dx = (lon - clo) * 111.0 * math.cos(math.radians(cla))
-        cerca = (dx * dx + dy * dy) <= RAYOS_RADIO_KM ** 2
-        n = int((cerca & rec).sum())
+        cerca_de[nombre] = (dx * dx + dy * dy) <= RAYOS_RADIO_KM ** 2
+        n = int((cerca_de[nombre] & rec).sum())
         if n:
             ciudades[nombre] = n
-    return {"t": iso_local(cand[-1][0]), "ventana_min": RAYOS_VENTANA_MIN, "reciente_min": RAYOS_RECIENTE_MIN,
+    ultimo = cand[-1][0]
+    por_franja = {}
+    for t, _ in cand:
+        k = int((t - datetime(1970, 1, 1)).total_seconds() // 600)
+        por_franja[k] = por_franja.get(k, 0) + 1
+    franjas = {}
+    for k, nf in por_franja.items():
+        fin = datetime(1970, 1, 1) + timedelta(minutes=10 * (k + 1))
+        if nf < RAYOS_ARCHIVOS_FRANJA or ultimo < fin - timedelta(seconds=25):
+            continue                                             # incompleta o todavía abierta
+        cuenta = {}
+        for nombre in CIUDADES:
+            msk = cerca_de[nombre]
+            n = int((msk & (np.floor(tt) == k)).sum()) if len(msk) else 0
+            if n:
+                cuenta[nombre] = n
+        franjas[iso_local(datetime(1970, 1, 1) + timedelta(minutes=10 * k))] = {"f": nf, "c": cuenta}
+    return {"t": iso_local(ultimo), "ventana_min": RAYOS_VENTANA_MIN, "reciente_min": RAYOS_RECIENTE_MIN,
             "radio_km": RAYOS_RADIO_KM, "archivos": len(cand), "total20": int(rec.sum()), "total30": int(len(lat)),
-            "ciudades": ciudades, "celdas": celdas, "fuente": "GOES-19 GLM (NOAA)"}
+            "ciudades": ciudades, "celdas": celdas, "fuente": "GOES-19 GLM (NOAA)", "_franjas": franjas}
 
 
 # =====================================================================================================
@@ -422,9 +633,8 @@ def parsear_boletin(texto):
        qué puede pasar, zonas afectadas por región, lluvia esperada y recomendaciones."""
     t = re.sub(r"\s+", " ", texto or "").strip()
     muestra = t[:240]
-    def buscar(patron, grupos=1, flags=re.I):
-        m = re.search(patron, t, flags)
-        return m
+    def buscar(patron, flags=re.I):
+        return re.search(patron, t, flags)
     m = buscar(r"Bolet[ií]n Meteorol[oó]gico\s*(?:Nro\.?|N\.?\s*[º°o]\.?|No\.?|N[º°])\s*(\d+)")
     if not m:
         raise ValueError("no se reconoce el boletín del INAMHI; texto: " + muestra)
@@ -494,22 +704,83 @@ def aviso_inamhi():
 
 
 # =====================================================================================================
+#  4. HISTORIAL PARA VERIFICAR (hist.json)
+# =====================================================================================================
+def cargar_hist():
+    """Historial anterior: del archivo local que deja el workflow (git show origin/ahora:hist.json), o de la dirección pública."""
+    try:
+        ruta = os.environ.get("CC_HIST_PREVIO")
+        texto = open(ruta, encoding="utf-8").read() if ruta and os.path.exists(ruta) else http_get(URL_HIST, intentos=2, timeout=30)
+        h = json.loads(texto)
+        if isinstance(h, dict) and h.get("ciudades") == ORDEN:
+            return h
+    except Exception:
+        pass
+    return {"v": 1, "ciudades": ORDEN, "lluvia": {}, "rayos": {}}
+
+
+def actualizar_hist(hist, utc_frame, lluvia_ciudades, franjas):
+    """Agrega la lluvia de este cuadro y las franjas de rayos completas; conserva 72 h."""
+    if lluvia_ciudades:
+        k = iso_local(utc_frame.replace(minute=utc_frame.minute // 10 * 10, second=0, microsecond=0))
+        hist["lluvia"][k] = [lluvia_ciudades.get(c) for c in ORDEN]
+    for k, f in (franjas or {}).items():
+        hist["rayos"][k] = [f["f"], [f["c"].get(c, 0) for c in ORDEN]]
+    limite = iso_local(ahora_utc() - timedelta(hours=HIST_HORAS))
+    for sec in ("lluvia", "rayos"):
+        hist[sec] = {k: v for k, v in hist[sec].items() if k >= limite}
+    return hist
+
+
+# =====================================================================================================
 def main():
     destino = sys.argv[1] if len(sys.argv) > 1 else "ahora.json"
-    salida = {"generado": iso_local(ahora_utc()), "lluvia": None, "rayos": None, "oficial": None, "errores": []}
-    for clave, f in (("lluvia", lluvia_ahora), ("rayos", rayos_ahora), ("oficial", aviso_inamhi)):
-        t0 = time.time()
-        try:
-            salida[clave] = f()
-            print(f"  {clave}: OK ({time.time() - t0:.0f} s)")
-        except Exception as e:
-            salida["errores"].append(f"{clave}: {e}")
-            print(f"  {clave}: ERROR {e}")
-    tmp = destino + ".tmp"
+    carpeta = destino if os.path.isdir(destino) else os.path.dirname(os.path.abspath(destino))
+    ruta_ahora = os.path.join(destino, "ahora.json") if os.path.isdir(destino) else destino
+    ruta_hist = os.path.join(carpeta, "hist.json")
+    salida = {"generado": iso_local(ahora_utc()), "lluvia": None, "movimiento": None, "rayos": None, "oficial": None, "errores": []}
+    utc_frame, lluvia_c, franjas = None, None, None
+    t0 = time.time()
+    try:
+        salida["lluvia"], salida["movimiento"], motivo, lluvia_c, utc_frame = lluvia_y_movimiento()
+        print(f"  lluvia: OK ({time.time() - t0:.0f} s)")
+        if salida["movimiento"]:
+            print(f"  movimiento: {salida['movimiento']['validos']} cuadros validados")
+        elif motivo:
+            print(f"  movimiento: no disponible ({motivo})")
+    except Exception as e:
+        salida["errores"].append(f"lluvia: {e}")
+        print(f"  lluvia: ERROR {e}")
+    t0 = time.time()
+    try:
+        salida["rayos"] = rayos_ahora()
+        franjas = salida["rayos"].pop("_franjas", None)
+        print(f"  rayos: OK ({time.time() - t0:.0f} s)")
+    except Exception as e:
+        salida["errores"].append(f"rayos: {e}")
+        print(f"  rayos: ERROR {e}")
+    t0 = time.time()
+    try:
+        salida["oficial"] = aviso_inamhi()
+        print(f"  oficial: OK ({time.time() - t0:.0f} s)")
+    except Exception as e:
+        salida["errores"].append(f"oficial: {e}")
+        print(f"  oficial: ERROR {e}")
+    try:
+        hist = actualizar_hist(cargar_hist(), utc_frame or ahora_utc(), lluvia_c, franjas)
+        tmp = ruta_hist + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(hist, fh, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, ruta_hist)
+        print(f"  historial: {len(hist['lluvia'])} muestras de lluvia, {len(hist['rayos'])} franjas de rayos")
+    except Exception as e:
+        salida["errores"].append(f"historial: {e}")
+        print(f"  historial: ERROR {e}")
+    tmp = ruta_ahora + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(salida, fh, ensure_ascii=False, separators=(",", ":"))
-    os.replace(tmp, destino)
-    print(f"Escrito {destino} ({os.path.getsize(destino) // 1024} KB)")
+    os.replace(tmp, ruta_ahora)
+    print(f"Escrito {ruta_ahora} ({os.path.getsize(ruta_ahora) // 1024} KB)")
     if not any(salida[k] for k in ("lluvia", "rayos", "oficial")):
         sys.exit(1)
 

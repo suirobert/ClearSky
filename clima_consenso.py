@@ -19,6 +19,9 @@ Página (index.html, generada aquí y dibujada con JavaScript):
   - 7 días (del 4 al 7 orientativos) y reportes de usuarios verificados contra lo publicado.
   - Diseño compacto (dos columnas en PC), barrio por OpenStreetMap, avisos en el teléfono y compartir.
   - Temperatura y humedad verificadas cada hora contra el aeropuerto y corregidas (solo si mejora en el examen).
+  - Tormentas verificadas con los rayos del satélite (GLM) y ciudades sin aeropuerto verificadas con la lluvia
+    satelital, ambas solo cuando hay suficientes días acumulados y pasan el examen (datos/observado/).
+  - Tablero público de aciertos día por día y selector de rango 24 h / 3 días / 7 días.
   - Calor: sensación térmica (índice de calor NOAA), alerta desde 32° y onda de calor frente a lo normal
     de los últimos 30 días; humedad, viento y UV por hora. Botón para instalar como app.
   - Mapa de lluvia por horas, satélite GOES, íconos animados Meteocons, gráfica y barra que se
@@ -103,7 +106,7 @@ DIAS_PRUEBA         = 10         # últimos días reservados para el examen (no 
 DIAS_RECIENTES      = 21         # días de la calibración que se adapta a la temporada
 MIN_MODELOS         = 3
 MIN_HORAS_REALES    = 72
-VERSION             = 10         # versión de la lógica de datos (si cambia, se re-verifica)
+VERSION             = 11         # versión de la lógica de datos (si cambia, se re-verifica)
 PLAZOS              = [1, 2, 3, 4, 5, 6, 7]   # días de anticipación que se verifican
 FRANJAS             = {"madrugada": (0, 6), "mañana": (6, 12), "tarde": (12, 18), "noche": (18, 24)}
 ALERTA_MIN          = 60         # % a partir del cual un salto se considera alerta
@@ -142,6 +145,19 @@ URL_FORECAST = "https://api.open-meteo.com/v1/forecast"
 URL_PREVIOUS = "https://previous-runs-api.open-meteo.com/v1/forecast"
 URL_IEM      = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
 ARCHIVO_ALERTAS = os.path.join(DATOS, "alertas.json")
+# Observaciones propias (satélite y rayos) que acumula ahora.py cada 10 min en la rama "ahora"
+URL_HIST     = REPO_URL.replace("https://github.com/", "https://raw.githubusercontent.com/") + "/ahora/hist.json"
+RAYOS_MIN_HORA = 3           # descargas a menos de 25 km en una hora para contarla como "hubo tormenta"
+MIN_DIAS_GLM = 16            # días de rayos acumulados antes de verificar las tormentas con ellos (14 para aprender + examen)
+MIN_HORAS_TORMENTA_GLM = 8   # horas con tormenta observada necesarias
+MIN_DIAS_SAT = 21            # días de lluvia satelital acumulada para verificar una ciudad sin aeropuerto
+LLUVIA_SAT_MM = 1.0          # mm/h a partir de los cuales el satélite "ve lluvia"
+SAT_MIN_HSS  = 0.25          # el satélite solo se acepta como observación si coincide con los aeropuertos (HSS)
+SAT_MIN_POD  = 0.35
+SAT_MIN_EVENTOS = 15
+ACIERTO_ANUNCIO = 40         # % a partir del cual "anunciamos lluvia" (tablero de aciertos)
+ACIERTO_SECO = 20            # % por debajo del cual "dijimos que no llovería"
+DIAS_TABLERO = 7
 # Lluvia observada ahora por satélite: NOAA Enterprise Rain Rate (GOES + Meteosat + Himawari, cada 10 min)
 URL_ERR      = "https://noaa-enterprise-rainrate-pds.s3.amazonaws.com"
 AHORA_CAJA   = (-5.5, 2.5, -92.5, -75.0)     # sur, norte, oeste, este (Ecuador continental y Galápagos)
@@ -226,13 +242,23 @@ def toca_verificar(p):
     return datetime.now() - datetime.fromisoformat(p["actualizado"]) >= timedelta(hours=HORAS_ENTRE_VERIF)
 
 
+def tabla_tormenta(p, ciudad, cfg):
+    """Tabla de calibración de tormentas: la de los rayos (si pasó el examen en esa ciudad); si no, la del aeropuerto."""
+    g = (p["ciudades"].get(ciudad) or {}).get("glm_ts") or {}
+    if g.get("usar") and g.get("tabla"):
+        return g["tabla"], "rayos"
+    return (cfg.get("tormenta") or {}).get("tabla") or [], "aeropuerto"
+
+
 def cfg_efectivo(p, ciudad):
     """Configuración a usar: la propia si está verificada; si no, la de la ciudad verificada
        más cercana de la misma zona. Devuelve (cfg, ciudad_de_referencia o None)."""
     propia = p["ciudades"].get(ciudad) or cfg_defecto()
     if propia.get("verificado"):
         return propia, ciudad
-    cands = [c for c in CIUDADES if c != ciudad and p["ciudades"].get(c, {}).get("verificado")]
+    cands = [c for c in CIUDADES if c != ciudad and p["ciudades"].get(c, {}).get("verificado")
+             and p["ciudades"][c].get("fuente") != "satelite"] or \
+            [c for c in CIUDADES if c != ciudad and p["ciudades"].get(c, {}).get("verificado")]
     if not cands:
         return propia, None
     z = CIUDADES[ciudad]["zona"]
@@ -691,6 +717,153 @@ def correccion_temp(cfg, hora):
     return ((tc.get("sesgo") or {}).get(franja_de(hora), 0) if tc.get("activa") else 0), (tc.get("sesgo_hum") or 0)
 
 
+# ----------------------- OBSERVACIONES PROPIAS (SATÉLITE Y RAYOS) -----------------------
+def archivo_observado(mes):
+    return os.path.join(DATOS, "observado", f"{mes}.json")
+
+
+def actualizar_observado():
+    """Descarga hist.json (lo escribe ahora.py cada 10 min) y lo convierte en datos por hora y ciudad que se guardan
+       para siempre en datos/observado/: [lluvia máx. mm/h, muestras de lluvia, rayos a <25 km, franjas de 10 min contadas].
+       Misma convención de hora que los METAR: la clave 15:00 cubre de 14:00 a 15:00."""
+    hist = json.loads(http_get(URL_HIST, {"t": int(time.time())}, intentos=2))
+    ciudades = hist.get("ciudades") or []
+    if not ciudades:
+        return 0
+    horas = {}                                                   # (ciudad, hora) -> [ll, nl, ry, nr]
+    for slot, vals in (hist.get("lluvia") or {}).items():
+        k = hora_clave(datetime.strptime(slot, "%Y-%m-%dT%H:%M"))
+        for c, v in zip(ciudades, vals):
+            if v is None:
+                continue
+            d = horas.setdefault((c, k), [0.0, 0, 0, 0])
+            d[0], d[1] = max(d[0], float(v)), d[1] + 1
+    for slot, (nf, cuentas) in (hist.get("rayos") or {}).items():
+        k = hora_clave(datetime.strptime(slot, "%Y-%m-%dT%H:%M") + timedelta(minutes=10))
+        for c, n in zip(ciudades, cuentas):
+            d = horas.setdefault((c, k), [0.0, 0, 0, 0])
+            d[2], d[3] = d[2] + int(n), d[3] + 1
+    por_mes = {}
+    for (c, k), d in horas.items():
+        por_mes.setdefault(k[:7], {}).setdefault(c, {})[k] = d
+    os.makedirs(os.path.join(DATOS, "observado"), exist_ok=True)
+    nuevos = 0
+    for mes, cont in por_mes.items():
+        ruta = archivo_observado(mes)
+        act = json.load(open(ruta, encoding="utf-8")) if os.path.exists(ruta) else {}
+        for c, hs in cont.items():
+            for k, d in hs.items():
+                v = act.setdefault(c, {}).get(k)
+                if v is None:
+                    act[c][k] = d; nuevos += 1
+                else:                                            # una ejecución posterior puede traer franjas más completas
+                    act[c][k] = [max(v[0], d[0]) if d[1] >= v[1] else v[0], max(v[1], d[1]),
+                                 d[2] if d[3] >= v[3] else v[2], max(v[3], d[3])]
+        tmp = ruta + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({c: dict(sorted(h.items())) for c, h in sorted(act.items())}, f, separators=(",", ":"))
+        os.replace(tmp, ruta)
+    return nuevos
+
+
+def cargar_observado():
+    out = {}
+    for ruta in sorted(glob.glob(os.path.join(DATOS, "observado", "*.json"))):
+        try:
+            with open(ruta, encoding="utf-8") as f:
+                for c, hs in json.load(f).items():
+                    out.setdefault(c, {}).update(hs)
+        except Exception as e:
+            log_error(f"observado ilegible en {os.path.basename(ruta)}: {e}")
+    return out
+
+
+def obs_rayos(obs_c):
+    """hora -> 1/0 (¿hubo tormenta cerca?) solo para horas con al menos 5 de 6 franjas de rayos contadas."""
+    return {k: int(v[2] >= RAYOS_MIN_HORA) for k, v in obs_c.items() if v[3] >= 5}
+
+
+def obs_lluvia_sat(obs_c):
+    """hora -> (lluvia, llovizna, tormenta) según el satélite, solo para horas con al menos 3 muestras."""
+    return {k: (int(v[0] >= LLUVIA_SAT_MM), int(v[0] >= LLUVIA_SAT_MM), 0) for k, v in obs_c.items() if v[1] >= 3}
+
+
+def calibrar_tormenta_glm(obs_c, cods):
+    """Verifica y calibra la probabilidad de tormenta eléctrica con los rayos que detecta el satélite GOES-19 (GLM):
+       cuenta como tormenta una hora con RAYOS_MIN_HORA o más descargas a menos de 25 km. Mismo examen sin trampa que la lluvia.
+       Solo se usa (usar=True) si en el examen acierta más que decir siempre el promedio."""
+    ahora = datetime.now().strftime("%Y-%m-%dT%H:00")
+    og = obs_rayos(obs_c)
+    horas = sorted(k for k in og if k < ahora and sum(k in cods[m] for m in cods) >= 2)
+    base = {"fuente": "rayos", "horas": len(horas), "dias": round(len(horas) / 24, 1), "radio_km": 25, "min_rayos": RAYOS_MIN_HORA}
+    if len(horas) < 24 * MIN_DIAS_GLM:
+        return dict(base, verificado=False, usar=False, motivo="reuniendo datos", necesita_dias=MIN_DIAS_GLM)
+    o = {k: int(any(og.get(v, 0) for v in vecinos(k, TOLERANCIA_H))) for k in horas}
+    eventos = sum(og[k] for k in horas)
+    base["horas_tormenta"] = eventos
+    if eventos < MIN_HORAS_TORMENTA_GLM:
+        return dict(base, verificado=False, usar=False, motivo="pocas tormentas observadas")
+    pr = {k: prob_tormenta({m: cods[m][k] for m in cods if k in cods[m]}) for k in horas}
+    ent, pru = separar_examen(horas)
+    if not hay_examen(ent, pru):
+        return dict(base, verificado=False, usar=False, motivo="reuniendo datos", necesita_dias=MIN_DIAS_GLM)
+    real = [o[k] for k in pru]
+    res = {n: brier([calibrar_prob(pr[k], t) for k in pru], real) for n, t in opciones_calibracion(ent, pr, o).items()}
+    mejor = min(res.values())
+    modo = min((n for n, b in res.items() if b <= mejor + 0.0005), key=ORDEN_PRUDENCIA.index)
+    fb = sum(o[k] for k in ent) / len(ent)
+    bc = brier([fb * 100] * len(pru), real)
+    mejora = round((1 - res[modo] / bc) * 100) if bc else None
+    tabla = opciones_calibracion(horas, pr, o)[modo]
+    cal = [calibrar_prob(pr[k], tabla) for k in horas]
+    reales = [o[k] for k in horas]
+    anuncios = [i for i, p in enumerate(cal) if p >= 30]
+    return dict(base, verificado=True, usar=bool(mejora and mejora > 0), tabla=tabla, modo=modo,
+                examen={"brier_sistema": res[modo], "brier_clima": bc, "mejora_vs_clima_pct": mejora},
+                anuncios=len(anuncios), anuncios_acertados=sum(reales[i] for i in anuncios))
+
+
+def validar_satelite(arch, observado):
+    """¿Se puede confiar en la lluvia del satélite como observación? Se compara hora por hora con los aeropuertos
+       (METAR) en las ciudades que tienen ambos. Solo si coincide lo suficiente se usa para verificar ciudades sin aeropuerto."""
+    a = b = c_ = d = 0
+    por_ciudad = {}
+    for c, hs in observado.items():
+        ar = arch.get(c) or {}
+        sat = obs_lluvia_sat(hs)
+        comunes = [k for k in sat if k in ar]
+        if len(comunes) < 24 * 5:
+            continue
+        pron = {k: sat[k][0] for k in comunes}
+        obs = {k: ar[k][0] for k in comunes}
+        m = metricas(pron, obs)
+        por_ciudad[c] = {"horas": m["n"], "pod": m["pod"], "far": m["far"], "hss": m["hss"]}
+        a, b, c_, d = a + m["aciertos"], b + m["falsas"], c_ + m["perdidas"], d + m["neg_ok"]
+    n = a + b + c_ + d
+    if not n:
+        return {"valido": False, "horas": 0, "motivo": "reuniendo datos", "ciudades": {}}
+    esp = ((a + c_) * (a + b) + (d + c_) * (d + b)) / n
+    hss = round((a + d - esp) / (n - esp), 3) if n != esp else 0.0
+    pod = round(a / (a + c_) * 100) if a + c_ else None
+    far = round(b / (a + b) * 100) if a + b else None
+    ok = bool((a + c_) >= SAT_MIN_EVENTOS and hss >= SAT_MIN_HSS and pod is not None and pod >= SAT_MIN_POD * 100)
+    return {"valido": ok, "horas": n, "eventos": a + c_, "pod": pod, "far": far, "hss": hss, "ciudades": por_ciudad,
+            "motivo": None if ok else "todavía no coincide lo suficiente con los aeropuertos"}
+
+
+def calibrar_por_satelite(obs_c, prev):
+    """Ciudad sin aeropuerto utilizable: se calibra con la lluvia que estima el satélite (aproximado)."""
+    obs = obs_lluvia_sat(obs_c)
+    ahora = datetime.now().strftime("%Y-%m-%dT%H:00")
+    obs = {k: v for k, v in obs.items() if k < ahora}
+    if len(obs) < 24 * MIN_DIAS_SAT or sum(v[0] for v in obs.values()) < MIN_HORAS_LLUVIA:
+        return None
+    r = calibrar(obs, prev)
+    r["fuente"] = "satelite"
+    r["cobertura_obs_pct"] = round(len(obs) / (DIAS_VERIFICACION * 24) * 100)
+    return r
+
+
 # ----------------------- TORMENTAS ELÉCTRICAS -----------------------
 def es_tormenta(codigo):
     return codigo is not None and codigo >= 95
@@ -814,6 +987,7 @@ def seguimiento_real(ciudad, obs_ciudad):
 def verificar(p):
     print("Verificando modelos contra lo que realmente pasó...")
     arch = cargar_archivo_obs()
+    cache_prev = {}
     for c, cfg in CIUDADES.items():
         if not cfg.get("metar"):
             continue
@@ -828,6 +1002,7 @@ def verificar(p):
                           f"(mínimo {cfg['cob_min']:.0%}); se mantiene la configuración anterior")
                 continue
             previos, cods, tprev = descargar_previos(cfg["est"][0], cfg["est"][1], DIAS_VERIFICACION)
+            cache_prev[c] = (previos, cods, tprev)
             prev = previos.get(1, {})
             if len(prev) < MIN_MODELOS:
                 log_error(f"{c}: solo {len(prev)} modelos con historial; se mantiene la configuración anterior")
@@ -866,6 +1041,10 @@ def verificar(p):
             log_error(f"verificación {c}: {e} (se mantiene la configuración anterior)")
     guardar_archivo_obs(arch)
     try:
+        verificar_con_observado(p, arch, cache_prev)
+    except Exception as e:
+        log_error(f"verificación con rayos y satélite: {e}")
+    try:
         reps = leer_reportes(DIAS_VERIFICACION)
     except Exception as e:
         log_error(f"lectura de reportes: {e}")
@@ -882,6 +1061,37 @@ def verificar(p):
     p["actualizado"] = datetime.now().isoformat(timespec="seconds")
     p["version"] = VERSION
     guardar_pesos(p)
+
+
+def verificar_con_observado(p, arch, cache_prev):
+    """Verificación con las observaciones propias (rayos GLM y lluvia satelital). Se activan solas cuando hay suficientes días."""
+    observado = cargar_observado()
+    if not observado:
+        return
+    p["satelite"] = validar_satelite(arch, observado)
+    print(f"  Satélite vs aeropuertos: válido={p['satelite']['valido']} ({p['satelite'].get('horas', 0)} h, HSS {p['satelite'].get('hss')})")
+    for c, cfg in CIUDADES.items():
+        obs_c = observado.get(c)
+        if not obs_c:
+            continue
+        try:
+            if c not in cache_prev:
+                est = cfg.get("est") or (cfg["lat"], cfg["lon"])
+                cache_prev[c] = descargar_previos(est[0], est[1], DIAS_VERIFICACION)
+                time.sleep(0.5)
+            previos, cods, _ = cache_prev[c]
+            prop = p["ciudades"].setdefault(c, cfg_defecto())
+            prop["glm_ts"] = calibrar_tormenta_glm(obs_c, cods)
+            g = prop["glm_ts"]
+            print(f"  {c}: tormentas con rayos -> {'USAR' if g.get('usar') else g.get('motivo') or 'sin mejora'} ({g.get('dias')} días)")
+            if not prop.get("verificado") and p["satelite"]["valido"] and len(previos.get(1, {})) >= MIN_MODELOS:
+                r = calibrar_por_satelite(obs_c, previos[1])
+                if r:
+                    r["glm_ts"] = prop.get("glm_ts")
+                    p["ciudades"][c] = r
+                    print(f"  {c}: verificada con satélite ({r['horas']} h, {r['horas_lluvia']} con lluvia)")
+        except Exception as e:
+            log_error(f"observado {c}: {e}")
 
 
 # ----------------------- PRONÓSTICO ACTUAL -----------------------
@@ -916,7 +1126,7 @@ def consenso(data, cfg, lat=None, lon=None, offset_s=OFFSET_S):
     lat = data.get("latitude", lat) if lat is None else lat
     lon = data.get("longitude", lon) if lon is None else lon
     pesos, umbral = cfg["pesos"], cfg["umbral"]
-    tabla_ts = (cfg.get("tormenta") or {}).get("tabla") or []
+    tabla_ts = cfg.get("tabla_ts") if cfg.get("tabla_ts") is not None else (cfg.get("tormenta") or {}).get("tabla") or []
     n = len(h["time"])
     ahora = datetime(1970, 1, 1) + timedelta(seconds=time.time() + offset_s)
     def serie(var, m, i):
@@ -1015,6 +1225,9 @@ def nivel_fiabilidad(cfg):
 
 
 def html_verificacion(v, ciudad):
+    if v.get("fuente") == "satelite":
+        return (f"<p class='plano'>Fiabilidad actual: <b>Aproximada</b></p><p class='nota'>Comparamos lo que pronosticamos con lo que el "
+                f"satélite estima que llovió durante {v.get('periodo', 'las últimas semanas')} ({v['horas']} horas, {v['horas_lluvia']} con lluvia).</p>")
     if not v.get("verificado"):
         return ("<p class='nota'>Todavía estamos reuniendo datos para medir qué tan confiable es el "
                 "pronóstico aquí. Vuelve a revisar en unos días.</p>")
@@ -1115,6 +1328,23 @@ def html_plazos(cfg):
     return out
 
 
+def html_satelite_validacion(sv, cfg):
+    if not sv:
+        return ""
+    out = "<h4>Lluvia observada por satélite</h4>"
+    if cfg.get("fuente") == "satelite":
+        out += ("<p class='aviso'>Esta ciudad no tiene un aeropuerto con datos suficientes: su pronóstico se verifica con la lluvia que "
+                "estima el satélite. Es una verificación <b>aproximada</b>.</p>")
+    if sv.get("valido"):
+        out += (f"<p class='nota'>Antes de usar el satélite como observación lo comparamos con los aeropuertos: en {sv['horas']} horas "
+                f"coincidió con <b>{sv['pod']}%</b> de las lluvias que reportaron y {sv['far']}% de sus avisos no se confirmaron.</p>")
+    else:
+        out += ("<p class='nota'>Estamos comparando la lluvia del satélite con los aeropuertos"
+                + (f" (llevamos {sv['horas']} horas)" if sv.get("horas") else "") +
+                " para decidir si se puede usar como observación en las ciudades sin aeropuerto.</p>")
+    return out
+
+
 def html_temp(t, ciudad):
     out = "<h4>Temperatura, humedad y sensación térmica</h4>"
     if not t or not t.get("verificado"):
@@ -1131,9 +1361,22 @@ def html_temp(t, ciudad):
             "calculamos la sensación térmica (índice de calor de la NOAA).</p>")
 
 
-def html_tormenta(t, ciudad):
+def html_tormenta(t, ciudad, g=None):
     aero = AEROPUERTOS.get(CIUDADES[ciudad]["metar"], "aeropuerto")
     out = "<h4>Tormentas eléctricas</h4>"
+    if g:
+        if g.get("usar"):
+            ex = g.get("examen") or {}
+            out += ("<p class='nota'>Las tormentas se verifican con los <b>rayos que detecta el satélite GOES-19</b> (NOAA): "
+                    f"una hora cuenta como tormenta si cae {g['min_rayos']} rayo(s) o más a menos de {g['radio_km']} km. "
+                    f"Llevamos <b>{g['horas_tormenta']} horas con tormenta</b> en {g['dias']} días. "
+                    + (f"En el examen sin trampa fue <b>{ex['mejora_vs_clima_pct']}% más preciso</b> que decir siempre el promedio." if ex.get("mejora_vs_clima_pct") else "") + "</p>")
+            if g.get("anuncios", 0) >= 5:
+                out += f"<p class='nota'>Cuando dijimos 30% o más, cayeron rayos cerca <b>{round(g['anuncios_acertados'] / g['anuncios'] * 10)} de cada 10 veces</b>.</p>"
+            return out
+        out += ("<p class='nota'>Estamos acumulando los rayos que detecta el satélite para verificar las tormentas "
+                f"({g.get('dias', 0)} de {MIN_DIAS_GLM} días necesarios" + (f"; hasta ahora {g['horas_tormenta']} horas con tormenta" if g.get("horas_tormenta") is not None else "") +
+                "). Mientras tanto usamos la verificación con el aeropuerto.</p>")
     if not t or not t.get("verificado"):
         n = (t or {}).get("horas_tormenta")
         return out + ("<p class='nota'>En los últimos días casi no hubo tormentas en el " + aero +
@@ -1157,7 +1400,8 @@ def datos_ciudad(p, ciudad, filas, normal=None):
     propia = bool(p["ciudades"].get(ciudad, {}).get("verificado"))
     verif = html_verificacion(cfg, ref) if ref else html_verificacion(cfg, ciudad)
     verif += html_plazos(cfg)
-    verif += html_tormenta(cfg.get("tormenta"), ref or ciudad)
+    verif += html_tormenta(cfg.get("tormenta"), ref or ciudad, (p["ciudades"].get(ciudad) or {}).get("glm_ts"))
+    verif += html_satelite_validacion(p.get("satelite"), cfg)
     verif += html_temp(cfg.get("temp"), ref or ciudad)
     verif += html_reportes(p["ciudades"].get(ciudad, {}).get("reportes"))
     verif += ("<p class='nota'>Niebla, ráfagas de viento e índice UV vienen de los modelos y todavía "
@@ -1167,10 +1411,10 @@ def datos_ciudad(p, ciudad, filas, normal=None):
                  f"Mientras tanto usamos lo aprendido en {ref}.</p>" + verif)
     o = CIUDADES[ciudad]
     return {"nombre": ciudad, "lat": o["lat"], "lon": o["lon"], "zona": o["zona"], "propia": propia,
-            "ref": ref, "nivel": nivel_fiabilidad(cfg),
+            "ref": ref, "nivel": nivel_fiabilidad(cfg), "fuente": cfg.get("fuente") or "aeropuerto",
             "cfg": {"umbral": cfg.get("umbral", UMBRAL_DEFECTO), "pesos": cfg.get("pesos", {}),
                     "tabla_lluvia": cfg.get("tabla_lluvia") or [], "tabla_llovizna": cfg.get("tabla_llovizna") or [],
-                    "tabla_tormenta": (cfg.get("tormenta") or {}).get("tabla") or [],
+                    "tabla_tormenta": tabla_tormenta(p, ciudad, cfg)[0],
                     "franjas": cfg.get("franjas") if (cfg.get("franjas") or {}).get("activa") else None,
                     "plazos": {d: {"verificado": z.get("verificado", False), "tabla": z.get("tabla") or [],
                                    "mejora": z.get("mejora_vs_clima_pct")}
@@ -1303,6 +1547,56 @@ def html_reportes(r):
     return (out + "<ul class='lst'>" + "".join(li) + "</ul><p class='nota'>Por ahora los reportes sirven para comprobar "
             "el pronóstico en los barrios; todavía no cambian los porcentajes, porque necesitamos muchos para que sean "
             "fiables y no se puedan manipular.</p>")
+
+
+# ----------------------- TABLERO: CÓMO NOS FUE -----------------------
+def tablero_aciertos(p):
+    """Lo que dijimos contra lo que pasó, día por día (últimos 7 días completos) y por ciudad. Se publica entero, también cuando fallamos.
+       Anunciamos lluvia = el máximo publicado ese día fue 40% o más; dijimos que no llovería = menos de 20%."""
+    arch = cargar_archivo_obs()
+    observado = cargar_observado()
+    sat_ok = bool((p.get("satelite") or {}).get("valido"))
+    hoy = date.today()
+    dias = [(hoy - timedelta(days=d)).isoformat() for d in range(DIAS_TABLERO, 0, -1)]
+    out, tot = {}, {"a": 0, "f": 0, "e": 0, "d": 0}
+    for c in CIUDADES:
+        try:
+            pub = leer_pronosticos_publicados(c)
+            if not pub:
+                continue
+            obs, fuente = {k: v[0] for k, v in (arch.get(c) or {}).items()}, "aeropuerto"
+            if len(obs) < 24 * 5:
+                if sat_ok and observado.get(c):
+                    obs, fuente = {k: v[0] for k, v in obs_lluvia_sat(observado[c]).items()}, "satélite"
+                else:
+                    continue
+            filas, a, f, e, dud = [], 0, 0, 0, 0
+            for d in dias:
+                hp = [k for k in pub if k.startswith(d)]
+                ho = [k for k in obs if k.startswith(d)]
+                if len(hp) < 12 or len(ho) < 12:
+                    continue
+                mx, hl = round(max(pub[k] for k in hp)), sum(obs[k] for k in ho)
+                if mx >= ACIERTO_ANUNCIO:
+                    veredicto = "acierto" if hl else "falsa"
+                elif mx < ACIERTO_SECO:
+                    veredicto = "escapo" if hl else "acierto"
+                else:
+                    veredicto = "duda"
+                a, f, e, dud = a + (veredicto == "acierto"), f + (veredicto == "falsa"), e + (veredicto == "escapo"), dud + (veredicto == "duda")
+                filas.append({"d": d, "max": mx, "llovio": int(hl > 0), "h": hl, "c": veredicto})
+            if not filas:
+                continue
+            real = (p["ciudades"].get(c) or {}).get("real") or {}
+            out[c] = {"dias": filas, "a": a, "f": f, "e": e, "dudas": dud, "n": a + f + e, "fuente": fuente,
+                      "anuncios": real.get("anuncios"), "anuncios_ok": real.get("anuncios_acertados"),
+                      "mejora": real.get("mejora_vs_clima_pct"), "horas": real.get("horas")}
+            for k, v in (("a", a), ("f", f), ("e", e), ("d", dud)):
+                tot[k] += v
+        except Exception as ex:
+            log_error(f"tablero {c}: {ex}")
+    return {"generado": datetime.now().strftime("%Y-%m-%dT%H:%M"), "dias": dias, "ciudades": out,
+            "global": {"a": tot["a"], "f": tot["f"], "e": tot["e"], "dudas": tot["d"], "n": tot["a"] + tot["f"] + tot["e"]}}
 
 
 # ----------------------- ALERTAS DE CAMBIO BRUSCO -----------------------
@@ -1778,13 +2072,13 @@ def validar_pagina(doc, datos):
         raise RuntimeError("la página no pasó las pruebas: " + " | ".join(errores[:8]))
 
 
-def generar_html(resultados, p, mapa=None, iconos=None, alertas=None, ahora=None, normales=None):
+def generar_html(resultados, p, mapa=None, iconos=None, alertas=None, ahora=None, normales=None, tablero=None):
     datos = {"generado": datetime.now().strftime("%Y-%m-%dT%H:%M"), "offset": OFFSET_S,
              "modelos": MODELOS, "umbral_llovizna": UMBRAL_LLOVIZNA, "feedback_url": FEEDBACK_URL,
              "repo": REPO_URL, "verificacion": p.get("actualizado"), "vars": VARS_PRON,
              "ciudades": [datos_ciudad(p, c, f, (normales or {}).get(c)) for c, f in resultados.items()],
              "mapa": mapa, "iconos": iconos or {}, "alertas": alertas or [], "ahora": ahora,
-             "franjas": {k: list(v) for k, v in FRANJAS.items()}}
+             "franjas": {k: list(v) for k, v in FRANJAS.items()}, "tablero": tablero}
     js_datos = json.dumps(datos, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
     doc = PLANTILLA.replace("__CSS__", CSS).replace("__JS__", JS).replace("__DATOS__", js_datos)
     validar_pagina(doc, datos)
@@ -2153,6 +2447,35 @@ html[data-tema=claro] .alerta.calor{background:linear-gradient(90deg,#ea580c,#dc
 .ley .lg{cursor:default}
 html[data-tema=claro] .dc.agua b{color:#2563eb}html[data-tema=claro] .dc.ts b{color:#7c3aed}html[data-tema=claro] .dc.hot b{color:#dc2626}
 @media(min-width:980px){.dcards{grid-template-columns:repeat(3,minmax(0,1fr))}}
+/* ---------- v16: rango, aciertos, avisos a elegir ---------- */
+.rsel{display:flex;gap:6px;margin:-4px 0 10px}
+.rb{flex:none;border:0;background:var(--card2);border-radius:8px;padding:5px 11px;font-size:12px;color:var(--tx2);cursor:pointer;min-height:30px}
+.rb.on{background:var(--acc2);color:#fff;font-weight:600}
+.btnchip{border:0;font:inherit;font-size:12.5px;cursor:pointer;background:#12351f;color:#bbf7d0}
+.btnchip b{color:#fff}
+html[data-tema=claro] .btnchip{background:#dcfce7;color:#166534}html[data-tema=claro] .btnchip b{color:#14532d}
+.cabB{align-self:start}
+@media(min-width:980px){.cab{align-items:start}.cabB{padding-top:20px}.cabA{position:relative}.cabA .chips{width:min(1100px,calc(100vw - 80px));max-width:none}}
+.ac h3{margin:4px 0 8px}
+.ac-big{font-size:22px;font-weight:600;margin:2px 0 6px}.ac-big b{color:#4ade80}.ac-big span{font-size:14px;font-weight:400;color:var(--tx2)}
+html[data-tema=claro] .ac-big b{color:#15803d}
+.acl{margin:8px 0}
+.acd b{white-space:nowrap}
+.acf{display:grid;grid-template-columns:66px 1fr 1fr auto;gap:8px;align-items:center;padding:9px 2px;border-top:1px solid var(--line);font-size:13.5px}
+.acf:first-child{border-top:0}.acm,.acr{color:var(--tx2)}.acm b{color:var(--tx)}
+.acv{font-size:11.5px;font-weight:700;border-radius:999px;padding:3px 9px;white-space:nowrap}
+.acv.ok{background:rgba(34,197,94,.15);color:#4ade80}.acv.mal{background:rgba(239,68,68,.15);color:#f87171}.acv.neu{background:var(--card2);color:var(--tx2)}
+html[data-tema=claro] .acv.ok{background:#dcfce7;color:#166534}html[data-tema=claro] .acv.mal{background:#fee2e2;color:#991b1b}
+@media(max-width:420px){.acf{grid-template-columns:62px 1fr auto;gap:4px 8px}.acr{grid-column:2;grid-row:2;font-size:12.5px}.acm{grid-column:2;grid-row:1}.acv{grid-column:3;grid-row:1 / span 2}}
+.swl{margin:8px 0 12px}
+.sw{display:flex;align-items:center;gap:12px;padding:12px 4px;border-top:1px solid var(--line);cursor:pointer}
+.sw:first-child{border-top:0}
+.sw-i{flex:none;width:36px;height:36px;border-radius:10px;background:var(--card2);display:flex;align-items:center;justify-content:center;font-size:18px}
+.sw-t{flex:1;min-width:0}.sw-t b{display:block;font-size:14.5px}.sw-t small{display:block;font-size:12px;color:var(--tx2);margin-top:2px}
+.sw input{appearance:none;-webkit-appearance:none;flex:none;width:46px;height:28px;border-radius:14px;background:#334155;position:relative;cursor:pointer;transition:background .2s;outline-offset:3px}
+.sw input:after{content:"";position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:#fff;transition:transform .2s}
+.sw input:checked{background:var(--acc2)}.sw input:checked:after{transform:translateX(18px)}
+html[data-tema=claro] .sw input{background:#cbd5e1}html[data-tema=claro] .sw input:checked{background:var(--acc2)}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 """
 
@@ -2192,7 +2515,7 @@ const guardar = (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} };
 const leer = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
 const tocar = () => { try { navigator.vibrate && navigator.vibrate(4); } catch (e) {} };
 const CARGA = Date.now();
-let estado = {vista: null, dia: null, ocultas: new Set(['llovizna']), ubic: null, pos: null, tlSel: null, buscando: false,
+let estado = {rango: null, vista: null, dia: null, ocultas: new Set(['llovizna']), ubic: null, pos: null, tlSel: null, buscando: false,
   tab: leer('cc_tab') || 'graf', vapid: undefined, mapaListo: false};
 
 // ---------- misma lógica que el script de Python ----------
@@ -2311,6 +2634,45 @@ function conAhora(filas, ahora, ev) {
     else if (i === 0) c.prob = Math.min(r.prob, 25);
     return c;
   });
+}
+
+// ---------- lluvia en camino: se extiende hacia adelante el movimiento que midió el satélite ----------
+function movEn(lat, lon) {
+  const M = D.movimiento; if (!M || !M.u) return null;
+  const ty = Math.floor((M.lat0 - lat) / M.tile), tx = Math.floor((lon - M.lon0) / M.tile);
+  let su = 0, sv = 0, sw = 0;
+  for (let y = ty - 1; y <= ty + 1; y++) for (let x = tx - 1; x <= tx + 1; x++) {
+    if (y < 0 || x < 0 || y >= M.ny || x >= M.nx) continue;
+    const u = M.u[y][x], w = M.v[y][x]; if (u == null || w == null) continue;
+    const pe = (y === ty && x === tx) ? 3 : 1; su += u * pe; sv += w * pe; sw += pe;
+  }
+  return sw ? {u: su / sw, v: sv / sw} : null;
+}
+const RUMBOS8 = ['norte', 'noreste', 'este', 'sureste', 'sur', 'suroeste', 'oeste', 'noroeste'];
+function rumboHacia(la1, lo1, la2, lo2) {
+  const R = Math.PI / 180, y = Math.sin((lo2 - lo1) * R) * Math.cos(la2 * R), x = Math.cos(la1 * R) * Math.sin(la2 * R) - Math.sin(la1 * R) * Math.cos(la2 * R) * Math.cos((lo2 - lo1) * R);
+  return RUMBOS8[Math.round((((Math.atan2(y, x) / R) + 360) % 360) / 45) % 8];
+}
+function nowcast(lat, lon) {
+  const S = satAhora(), m = movEn(lat, lon); if (!S || !m) return null;
+  const vel = Math.hypot(m.u, m.v); if (vel < 4) return null;                       // casi quieta: no se puede predecir cuándo llega
+  const edad = (Date.now() - (Date.UTC(+S.t.slice(0, 4), +S.t.slice(5, 7) - 1, +S.t.slice(8, 10), +S.t.slice(11, 13), +S.t.slice(14, 16)) - D.offset * 1000)) / 6e4;
+  if (edad > 35) return null;                                                      // imagen vieja: no sirve para "próximos minutos"
+  const cl = Math.cos(lat * Math.PI / 180);
+  const fuente = tt => { const t = (edad + tt) / 60; return [lat - m.v * t / 111.32, lon - m.u * t / (111.32 * cl)]; };   // de dónde viene la lluvia que llegará en tt minutos
+  const val = tt => { const [la, lo] = fuente(tt); return satEn(la, lo, 0) ?? 0; };
+  const pasos = []; for (let tt = 0; tt <= 90; tt += 5) pasos.push([tt, val(tt)]);
+  const res = {vel: Math.round(vel), edad: Math.round(edad)};
+  if (pasos[0][1] < 1) {
+    for (let i = 1; i < pasos.length - 1; i++) if (pasos[i][1] >= 1 && pasos[i + 1][1] >= 1) {   // dos pasos seguidos: evita falsos por ruido
+      const tt = pasos[i][0], [la, lo] = fuente(tt);
+      return Object.assign(res, {estado: 'llega', min: tt, desde: rumboHacia(lat, lon, la, lo), mm: Math.max(...pasos.slice(i, i + 7).map(p => p[1]))});
+    }
+    return null;
+  }
+  for (let i = 1; i < pasos.length - 1; i++) if (pasos[i][1] < 0.5 && pasos[i + 1][1] < 0.5)
+    return Object.assign(res, {estado: 'termina', min: pasos[i][0], mm: Math.max(...pasos.slice(0, i + 1).map(p => p[1]))});
+  return Object.assign(res, {estado: 'sigue', mm: pasos[0][1]});
 }
 
 // ---------- textos ----------
@@ -2507,12 +2869,18 @@ function grafica(cont, filas, ahora, hoy, vr) {
   }
   const Y = v => pt + h - h * (Math.max(lo, Math.min(hi, v)) - lo) / (hi - lo);
   const xa = i => Math.max(pl, X(i) - dx / 2), xb = i => Math.min(W - pr, X(i) + dx / 2);
-  const paso = n > 30 ? (W < 500 ? 12 : 6) : 3;
+  const paso = n > 100 ? (W < 500 ? 24 : 12) : n > 30 ? (W < 500 ? 12 : 6) : 3;
   let s = `<svg class="graf" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="Gráfica hora por hora">`;
   s += `<defs><linearGradient id="gl" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${C.area}" stop-opacity=".55"/><stop offset="1" stop-color="${C.area}" stop-opacity=".04"/></linearGradient>` +
-       `<linearGradient id="gv" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${C.vto}" stop-opacity=".35"/><stop offset="1" stop-color="${C.vto}" stop-opacity=".03"/></linearGradient></defs>`;
+       `<linearGradient id="gv" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${C.vto}" stop-opacity=".35"/><stop offset="1" stop-color="${C.vto}" stop-opacity=".03"/></linearGradient>` +
+       `<pattern id="hat" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="7" stroke="${C.txt}" stroke-width="1.2" opacity=".35"/></pattern></defs>`;
   for (let i = 0; i < n;) { if (!esNoche(filas[i].hora)) { i++; continue; } let j = i; while (j + 1 < n && esNoche(filas[j + 1].hora)) j++;
     s += `<rect x="${xa(i)}" y="${pt}" width="${xb(j) - xa(i)}" height="${h}" fill="${C.noche}"/>`; i = j + 1; }
+  // pronóstico lejano que todavía no supera al promedio en nuestras mediciones: zona rayada "orientativo"
+  const orient = vr === 'lluvia' ? filas.map(r => !verificadoA((ctx && ctx.v && ctx.v.cfg) || {}, r.plazo || 1)) : [];
+  for (let i = 0; i < n;) { if (!orient[i]) { i++; continue; } let j = i; while (j + 1 < n && orient[j + 1]) j++;
+    s += `<rect x="${xa(i)}" y="${pt}" width="${xb(j) - xa(i)}" height="${h}" fill="url(#hat)"/>`;
+    if (xb(j) - xa(i) > 90) s += `<text x="${xa(i) + 6}" y="${pt + h - 6}" font-size="10" fill="${C.txt}" letter-spacing=".5">ORIENTATIVO</text>`; i = j + 1; }
   const banda = (v0, v1, color, txt) => { const y0 = Y(v1), y1 = Y(v0);
     s += `<rect x="${pl}" y="${y0}" width="${w}" height="${Math.max(y1 - y0, 0)}" fill="${color}"/>`;
     if (txt) s += `<text x="${W - pr - 4}" y="${y0 + 13}" text-anchor="end" font-size="10.5" fill="${C.txt}" letter-spacing=".4">${txt}</text>`; };
@@ -2537,6 +2905,7 @@ function grafica(cont, filas, ahora, hoy, vr) {
     const d = curvaSuave(serie(r => r.prob));
     s += `<path d="${d} L${X(n - 1)},${Y(0)} L${X(0)},${Y(0)} Z" fill="url(#gl)"/><path d="${d}" fill="none" stroke="${C.linea}" stroke-width="2.4" stroke-linejoin="round"/>`;
     leyenda.push([C.linea, 'Probabilidad de lluvia', '']);
+    if (orient.some(Boolean)) leyenda.push([C.txt, 'Orientativo (sin verificar)', 'sq']);
     if (filas.some(r => (r.prob_ts || 0) >= 15)) {
       s += `<path d="${curvaSuave(serie(r => r.prob_ts || 0, 15))}" fill="none" stroke="${C.ts}" stroke-width="1.6" stroke-dasharray="1.5 3.5" stroke-linecap="round"/>`;
       filas.forEach((r, i) => { if ((r.prob_ts || 0) >= 30 && (i === 0 || (filas[i - 1].prob_ts || 0) < 30)) s += `<text x="${X(i)}" y="${Y(r.prob_ts) - 6}" text-anchor="middle" font-size="13">⚡</text>`; });
@@ -2592,7 +2961,7 @@ function grafica(cont, filas, ahora, hoy, vr) {
     const v = principal === 'temp' ? r.temp : r[principal];
     cur.setAttribute('x1', X(i)); cur.setAttribute('x2', X(i)); cur.setAttribute('visibility', 'visible');
     pto.setAttribute('cx', X(i)); pto.setAttribute('cy', Y(v ?? lo)); pto.setAttribute('visibility', v == null || vr === 'uv' ? 'hidden' : 'visible');
-    tip.innerHTML = texto(r); tip.hidden = false;
+    tip.innerHTML = texto(r) + (orient[i] ? '<br><i>Pronóstico lejano: orientativo</i>' : ''); tip.hidden = false;
     const tw = tip.offsetWidth, th = tip.offsetHeight;
     tip.style.left = Math.max(0, Math.min(W - tw, X(i) - tw / 2)) + 'px';
     const cab = ($('.top') || {}).offsetHeight || 60, arribaLibre = rc.top - th - 8 > cab + 4;
@@ -3098,9 +3467,13 @@ let ctx = null;
 function pintarGrafica() {
   if (!ctx || !$('#graf') || estado.tab !== 'graf') return;
   const {ahora, hoy, dias, prox} = ctx;
-  const filasG = estado.dia ? dias[estado.dia] : prox.slice(0, 72);
-  $('#titg').textContent = estado.dia ? `Hora por hora · ${nombreDia(estado.dia, hoy)}` : 'Hora por hora · 3 días';
+  const rg = estado.rango || leer('cc_rango') || '72', NR = +rg || 72;
+  const filasG = estado.dia ? dias[estado.dia] : prox.slice(0, NR);
+  $('#titg').textContent = estado.dia ? `Hora por hora · ${nombreDia(estado.dia, hoy)}` : `Hora por hora · ${rg === '24' ? '24 horas' : rg === '168' ? '7 días' : '3 días'}`;
   $('#todo').hidden = !estado.dia;
+  const rs = $('#rsel'); rs.hidden = !!estado.dia;
+  rs.innerHTML = [['24', '24 h'], ['72', '3 días'], ['168', '7 días']].map(([k, n]) => `<button class="rb${k === rg ? ' on' : ''}" data-r="${k}" aria-pressed="${k === rg}">${n}</button>`).join('');
+  $$('#rsel .rb').forEach(b => b.onclick = () => { tocar(); estado.rango = b.dataset.r; guardar('cc_rango', estado.rango); pintarGrafica(); });
   const vr = estado.gvar || varAuto(filasG);
   $('#gsel').innerHTML = VARS_G.map(([k, n]) => `<button class="gb${k === vr ? ' on' : ''}" data-v="${k}" aria-pressed="${k === vr}">${n}</button>`).join('');
   $$('#gsel .gb').forEach(b => b.onclick = () => { tocar(); estado.gvar = b.dataset.v; pintarGrafica(); });
@@ -3115,14 +3488,14 @@ function pintarDias() {
       const s = document.querySelector('.drow.sel'); if (s) s.scrollIntoView({block: 'nearest', behavior: 'smooth'}); };
     d.onclick = f; d.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); f(); } }; });
 }
-const TABS = [['graf', 'Por hora'], ['mapa', 'Mapa de lluvia'], ['sat', 'Satélite']];
+const TABS = [['graf', 'Por hora'], ['mapa', 'Mapa'], ['sat', 'Satélite'], ['acier', 'Aciertos']];
 function mostrarTab(t, foco) {
   estado.tab = t; guardar('cc_tab', t);
   $$('.tab').forEach(b => { const on = b.dataset.t === t; b.classList.toggle('on', on); b.setAttribute('aria-selected', on); b.tabIndex = on ? 0 : -1; if (on && foco) b.focus(); });
   $$('.panel').forEach(p => p.hidden = p.dataset.t !== t);
   if (t === 'graf') pintarGrafica();
   else if (t === 'mapa') activarMapa(ctx.v);
-  else activarSatelite(ctx.v);
+  else if (t === 'sat') activarSatelite(ctx.v);
 }
 function alertaPara(v) {
   return (D.alertas || []).filter(a => a.ciudad === v.ref || a.ciudad === v.nombre).sort((a, b) => b.prob - a.prob)[0];
@@ -3172,7 +3545,7 @@ function render() {
     act.viento != null && act.viento >= 15 ? `<span class="chip">Viento <b>${act.viento} km/h</b></span>` : '',
     (tsMax.prob_ts || 0) >= 10 ? `<span class="chip ts">⚡ Tormenta <b>${tsMax.prob_ts}%</b> ${franja(tsMax.hora)}</span>` : '',
     uvMax != null && uvMax >= 3 && !esNoche(ahora) ? `<span class="chip">UV <b>${Math.round(uvMax)}</b> ${nivelUV(uvMax)}${uvPico ? ' a las ' + uvPico.hora.slice(11, 16) : ''}</span>` : '',
-    rfMax != null && rfMax >= 40 ? `<span class="chip">Ráfagas <b>${rfMax} km/h</b></span>` : ''].join('');
+    rfMax != null && rfMax >= 40 ? `<span class="chip">Ráfagas <b>${rfMax} km/h</b></span>` : '', chipAciertos(v)].join('');
   const al = alertaPara(v);
   const push = leer('cc_push') ? '🔔 Avisos activos' : '🔔 Avisarme';
   $('#vista').innerHTML =
@@ -3183,7 +3556,7 @@ function render() {
     `<div class="hs">${sAhora != null && sAhora - act.temp >= 1.5 ? `Se siente <b>${Math.round(sAhora)}°</b> · ` : ''}${tmax != null ? `Máx ${tmax}° · Mín ${tmin}°` : ''}</div>` + `</div></div>` +
     `<h1 class="tit">${tit}</h1><p class="sub">${sub}</p>` +
     `<div class="lugar">📍 ${esc(v.nombre)}</div>` +
-    `</div><div class="cabB"><div class="chips">${chips}</div>` +
+    `<div class="chips">${chips}</div></div><div class="cabB">` +
     `<div class="acciones">` + (D.feedback_url ? `<button class="acc" id="breporte">☂️ Reportar clima</button><button class="acc" id="bpush" aria-pressed="${!!leer('cc_push')}">${push}</button>` : '') +
     `<button class="acc" id="bcompartir">↗ Compartir</button>${standalone || leer('cc_inst_no') === '2' ? '' : '<button class="acc inst" id="binstalar">📲 Instalar app</button>'}</div><div class="fbmini" id="fbmini"></div></div></section><section class="col1" aria-label="Pronóstico">` +
     `<div class="card" id="c24"><h3>Próximas 24 horas</h3>${lineaTiempo(p24, ahora)}</div>` +
@@ -3191,9 +3564,10 @@ function render() {
     `</section><section class="col2" aria-label="Gráfica, mapa y satélite">` +
     `<div class="card cmulti"><div class="tabs" role="tablist" aria-label="Vistas">` +
     TABS.map(([t, n]) => `<button class="tab" role="tab" id="tab-${t}" data-t="${t}" aria-controls="panel-${t}">${n}</button>`).join('') + `</div>` +
-    `<div class="panel" data-t="graf" id="panel-graf" role="tabpanel" aria-labelledby="tab-graf"><h3><span id="titg"></span><button id="todo" hidden>Ver 3 días</button></h3><div class="gsel" id="gsel" role="group" aria-label="Qué mostrar"></div><div id="graf" style="position:relative"></div><div class="ley" id="leyg"></div></div>` +
+    `<div class="panel" data-t="graf" id="panel-graf" role="tabpanel" aria-labelledby="tab-graf"><h3><span id="titg"></span><button id="todo" hidden>Ver todo</button></h3><div class="gsel" id="gsel" role="group" aria-label="Qué mostrar"></div><div class="rsel" id="rsel" role="group" aria-label="Cuánto tiempo mostrar"></div><div id="graf" style="position:relative"></div><div class="ley" id="leyg"></div></div>` +
     `<div class="panel" data-t="mapa" id="panel-mapa" role="tabpanel" aria-labelledby="tab-mapa" hidden>${htmlMapa()}</div>` +
-    `<div class="panel" data-t="sat" id="panel-sat" role="tabpanel" aria-labelledby="tab-sat" hidden>${htmlSatelite()}</div></div>` +
+    `<div class="panel" data-t="sat" id="panel-sat" role="tabpanel" aria-labelledby="tab-sat" hidden>${htmlSatelite()}</div>` +
+    `<div class="panel" data-t="acier" id="panel-acier" role="tabpanel" aria-labelledby="tab-acier" hidden>${htmlAciertos(v)}</div></div>` +
     `<details><summary>Qué dice cada modelo meteorológico</summary>${tablaModelos(prox.slice(0, 72), v.cfg, hoy)}</details>` +
     `<details><summary>¿Qué tan confiable es este pronóstico?</summary>${v.verif_html}</details>` +
     `<details id="como"><summary>Cómo funciona ClearSky</summary>${htmlComo()}</details>` +
@@ -3206,11 +3580,43 @@ function render() {
   mostrarTab(TABS.some(([t]) => t === estado.tab) ? estado.tab : 'graf');
   $('#todo').onclick = () => { estado.dia = null; pintarDias(); pintarGrafica(); };
   const br = $('#breporte'); if (br) br.onclick = () => { tocar(); abrirReporte(); };
-  const bp = $('#bpush'); if (bp) bp.onclick = () => { tocar(); alternarAvisos(); };
+  const bp = $('#bpush'); if (bp) bp.onclick = () => { tocar(); abrirAvisos(); };
+  const ca = $('#chipac'); if (ca) ca.onclick = () => { tocar(); mostrarTab('acier'); const el = document.querySelector('.cmulti'); el && el.scrollIntoView({behavior: 'smooth', block: 'start'}); };
   $('#bcompartir').onclick = () => { tocar(); compartir(); };
   const bi = $('#binstalar'); if (bi) bi.onclick = () => { tocar(); instalar(); };
   if (Math.abs(scrollY - y0) > 2) scrollTo(0, y0);
   resumenFeedback();
+}
+
+// ---------- cómo nos fue (tablero público de aciertos) ----------
+const DIAS_C = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
+const VEREDICTO = {acierto: ['Acertamos', 'ok'], falsa: ['Falsa alarma', 'mal'], escapo: ['Se nos escapó', 'mal'], duda: ['Dudoso', 'neu']};
+function tableroDe(v) {
+  const T = D.tablero; if (!T || !T.ciudades) return null;
+  const c = T.ciudades[v.ref] ? v.ref : (T.ciudades[v.nombre] ? v.nombre : null);
+  return c ? Object.assign({ciudad: c}, T.ciudades[c]) : null;
+}
+function chipAciertos(v) {
+  const t = tableroDe(v);
+  return t && t.n >= 4 ? `<button class="chip btnchip" id="chipac" aria-label="Ver cómo nos fue esta semana">✓ Acertamos <b>${t.a} de ${t.n}</b> días</button>` : '';
+}
+function htmlAciertos(v) {
+  const T = D.tablero, t = tableroDe(v);
+  if (!T || !t) return '<div class="ac"><p class="nota">Todavía estamos reuniendo datos para mostrar cómo nos fue aquí. Cuando haya suficientes días comprobados los verás en esta pestaña, con aciertos y fallos.</p></div>';
+  const filas = t.dias.slice().reverse().map(d => { const f = new Date(d.d + 'T12:00:00Z'), [txt, cls] = VEREDICTO[d.c] || ['', 'neu'];
+    return `<div class="acf"><div class="acd"><b>${DIAS_C[f.getUTCDay()]} ${f.getUTCDate()}</b></div><div class="acm">Dijimos <b>${d.max}%</b></div>` +
+      `<div class="acr">${d.llovio ? '🌧️ Llovió' : '☀️ No llovió'}</div><span class="acv ${cls}">${txt}</span></div>`; }).join('');
+  const g = T.global || {}, lineas = [];
+  if ((t.anuncios || 0) >= 5) lineas.push(`Cuando anunciamos lluvia con 40% o más, llovió <b>${Math.round(t.anuncios_ok / t.anuncios * 10)} de cada 10 veces</b> (últimos 45 días).`);
+  if ((t.mejora || 0) > 0) lineas.push(`En ese periodo fuimos <b>${t.mejora}% más precisos</b> que decir siempre el promedio.`);
+  if (g.n >= 10) lineas.push(`En todo el país: <b>${g.a} de ${g.n}</b> días-ciudad acertados esta semana.`);
+  const donde = t.ciudad !== v.nombre ? ` Son los datos de ${esc(t.ciudad)}, la ciudad verificada más cercana.` : '';
+  return `<div class="ac"><h3><span>Cómo nos fue · ${esc(t.ciudad)}</span></h3>` +
+    `<div class="ac-big">Acertamos <b>${t.a} de ${t.n}</b> días${t.n ? ` <span>(${Math.round(t.a / t.n * 100)}%)</span>` : ''}</div>` +
+    `<p class="nota">Cada día comparamos lo que dijimos con lo que pasó. Mostramos todo, también cuando fallamos.${donde}</p><div class="acl">${filas}</div>` +
+    (lineas.length ? `<ul class="lst">${lineas.map(x => `<li>${x}</li>`).join('')}</ul>` : '') +
+    `<p class="nota"><b>Cómo se cuenta:</b> "Dijimos lluvia" es un máximo del día de 40% o más; "dijimos que no llovería", menos de 20%; entre medio, dudoso. ` +
+    `Lo que pasó viene de ${t.fuente === 'satélite' ? 'la lluvia que estima el satélite (aproximado)' : 'los reportes del aeropuerto'}. Los días de hoy en adelante todavía no cuentan.</p></div>`;
 }
 
 // ---------- cómo funciona ----------
@@ -3218,10 +3624,12 @@ function htmlComo() {
   const pasos = [
     ['🛰️', 'Reunimos los datos', `Cada hora descargamos ${KEYS.length} modelos meteorológicos internacionales (Europa, EE. UU., Alemania, Canadá, Japón, Francia y Reino Unido), la lluvia que ve el satélite GOES en ese momento y lo que reportan los aeropuertos y las personas.`],
     ['⚖️', 'Los combinamos', 'Cada modelo "vota" con más o menos peso según cuánto ha acertado en tu zona. Así un modelo que exagera no arrastra el resultado.'],
-    ['✅', 'Comprobamos todos los días', 'Comparamos lo que dijimos con lo que pasó en los aeropuertos los últimos 45 días: lluvia, llovizna y tormentas eléctricas, a 1 y hasta 7 días de anticipación.'],
+    ['✅', 'Comprobamos todos los días', 'Comparamos lo que dijimos con lo que pasó en los aeropuertos los últimos 45 días: lluvia, llovizna y tormentas eléctricas, a 1 y hasta 7 días de anticipación. Los rayos que detecta el satélite se usan para verificar las tormentas cuando ya hay suficientes días acumulados.'],
     ['📝', 'Hacemos un examen sin trampa', 'Guardamos los últimos 10 días sin usarlos para aprender y vemos cómo nos habría ido. Solo aceptamos un ajuste si acierta más que antes.'],
     ['🔁', 'Aprende solo', 'Todo se recalcula cada día con los últimos 45 días, así se adapta al invierno y al verano. Lo aprendido se guarda en público en el repositorio.'],
     ['👀', 'Corrige con lo que pasa ahora', 'Si el satélite o varias personas cerca de ti ven lluvia, las próximas horas se corrigen al instante.'],
+    ['🧭', 'Lluvia en camino', 'Seguimos el movimiento de la lluvia en las imágenes del satélite de la última hora y lo extendemos hacia adelante. Solo mostramos "llegaría en X min" donde ese movimiento demostró funcionar con datos reales de los últimos 30 minutos. Sirve para la próxima hora, no más.'],
+    ['📊', 'Tablero de aciertos', 'En la pestaña "Aciertos" mostramos, día por día, lo que dijimos y lo que pasó, incluidos los fallos. Así puedes juzgar por ti mismo si ClearSky acierta.'],
     ['🌡️', 'Calor', 'Comparamos cada hora la temperatura y la humedad con las del aeropuerto y corregimos el error típico de los modelos. Con esos valores calculamos la sensación térmica (índice de calor de la NOAA). Desde 32° hay que tomar precauciones. Hay onda de calor cuando se esperan 3 días o más con máximas 2° por encima de lo normal del último mes en tu zona.'],
   ];
   return '<div class="como">' + pasos.map(([e, t, x], i) => `<div class="paso"><div class="pn" aria-hidden="true">${e}</div><div><b>${i + 1}. ${t}</b><p>${x}</p></div></div>`).join('') +
@@ -3254,10 +3662,37 @@ async function clavePush() {
   try { estado.vapid = (await (await fetch(`${D.feedback_url}/vapid`)).json()).publica || null; } catch (e) { estado.vapid = null; }
   return estado.vapid;
 }
+// bits: 1 = lluvia, 2 = tormentas eléctricas, 4 = avisos oficiales del INAMHI
+const AVISOS_TIPOS = [[1, '🌧️', 'Lluvia', 'Cuando llueve donde estás o va a llegar en menos de una hora'],
+  [2, '⚡', 'Tormentas eléctricas', 'Cuando caen rayos cerca de ti'], [4, '⚠️', 'Avisos oficiales', 'Boletines del INAMHI que afectan tu región']];
+function prefsActuales() { const p = parseInt(leer('cc_prefs'), 10); return p >= 1 && p <= 7 ? p : 7; }
+function htmlAvisos(activo) {
+  const pr = prefsActuales();
+  return `<div class="grab"></div><h2>Avisos en este dispositivo</h2><p class="nota">Elige qué quieres recibir. Nunca más de un aviso de cada tipo cada pocas horas.</p>` +
+    `<div class="swl">${AVISOS_TIPOS.map(([b, e, t, d]) => `<label class="sw"><span class="sw-i" aria-hidden="true">${e}</span><span class="sw-t"><b>${t}</b><small>${d}</small></span><input type="checkbox" data-b="${b}"${pr & b ? ' checked' : ''}></label>`).join('')}</div>` +
+    `<button class="btn" id="avok" style="width:100%">${activo ? 'Guardar cambios' : 'Activar avisos'}</button>` +
+    (activo ? `<button class="btn sec" id="avoff" style="width:100%;margin-top:8px">Desactivar avisos</button>` : '') + `<div class="fbres" id="avres" aria-live="polite"></div>`;
+}
+async function abrirAvisos() {
+  if (!pushPosible()) { toast(ios && !standalone ? 'En iPhone, primero instala ClearSky: toca Compartir → "Agregar a inicio" y ábrela desde ahí.' : 'Tu navegador no permite avisos.'); return; }
+  const activo = !!leer('cc_push');
+  abrirHoja(htmlAvisos(activo), 'Avisos', () => {
+    const bits = () => [...$$('.swl input')].reduce((a, i) => a | (i.checked ? +i.dataset.b : 0), 0);
+    $('#avok').onclick = async () => {
+      const b = bits(); if (!b) { $('#avres').textContent = 'Elige al menos un tipo de aviso.'; return; }
+      guardar('cc_prefs', String(b));
+      if (!activo) { cerrarSelector(); await alternarAvisos(); return; }
+      try { const reg = await navigator.serviceWorker.ready, sub = await reg.pushManager.getSubscription();
+        if (sub) { await enviarSuscripcion(sub); $('#avres').textContent = 'Listo: guardamos tus preferencias.'; setTimeout(cerrarSelector, 900); } }
+      catch (e) { $('#avres').textContent = 'No pudimos guardar. Inténtalo más tarde.'; }
+    };
+    const off = $('#avoff'); if (off) off.onclick = async () => { cerrarSelector(); await alternarAvisos(); };
+  });
+}
 async function enviarSuscripcion(sub) {
   const pos = estado.pos, u = estado.ubic;
   const r = await fetch(`${D.feedback_url}/suscribir`, {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({sub: sub.toJSON(), lat: +pos.lat.toFixed(2), lon: +pos.lon.toFixed(2), nombre: (u && u.nombre) || 'tu zona',
+    body: JSON.stringify({sub: sub.toJSON(), lat: +pos.lat.toFixed(2), lon: +pos.lon.toFixed(2), nombre: (u && u.nombre) || 'tu zona', prefs: prefsActuales(),
       admin: location.hash === '#admin' ? (leer('cc_admin') || (() => { const t = prompt('Clave de administrador (TOKEN)') || ''; guardar('cc_admin', t); return t; })()) : undefined})});
   if (!r.ok) throw new Error(r.status);
 }
@@ -3497,6 +3932,11 @@ async function inicio() {
 .ah-d mark{background:rgba(245,158,11,.28);color:inherit;border-radius:4px;padding:0 2px}
 .ah-d a{color:#93c5fd}
 .ah-ley{font-size:12px;color:var(--tx2);margin-top:8px}
+.etq.pr{background:rgba(96,165,250,.14);color:#60a5fa}
+.ah-nc{display:flex;gap:10px;align-items:center;padding:10px 12px;border-color:rgba(96,165,250,.35);background:linear-gradient(90deg,rgba(96,165,250,.13),transparent 70%),var(--card);color:var(--tx)}
+.ah-nc small{display:block;font-size:11.5px;color:var(--tx3);margin-top:2px}
+html[data-tema=claro] .etq.pr{background:#dbeafe;color:#1d4ed8}
+html[data-tema=claro] .ah-nc{background:linear-gradient(90deg,rgba(96,165,250,.25),transparent 70%),#fff}
 html[data-tema=claro] .etq.ahora{background:#dcfce7;color:#15803d}
 html[data-tema=claro] .etq.of{background:#fef3c7;color:#92400e}
 html[data-tema=claro] .ah-d a{color:#1d4ed8}
@@ -3599,6 +4039,22 @@ html[data-tema=claro] .ah-rayo{background:linear-gradient(90deg,rgba(250,204,21,
       if (sub) sub.textContent = `${ry.n20} rayos en los últimos 20 min a menos de ${ry.radio} km. Si oyes truenos, busca refugio bajo techo.`;
       if (ic) ic.innerHTML = icono('tormenta', 64);
     }
+    // lluvia en camino (extrapolación del movimiento medido por el satélite)
+    let nc = null; try { nc = v.lat != null ? nowcast(v.lat, v.lon) : null; } catch (e) {}
+    if (nc && nc.estado === 'llega' && !(ry && ry.n20 >= 5) && !evidencia(v).llueve) {
+      const cuando = nc.min < 10 ? 'unos minutos' : `~${nc.min} min`;
+      piezas.push(`<div class="ah-b ah-nc" role="status"><span class="etq pr">En camino</span><span><b>🌧️ La lluvia llegaría en ${cuando}</b> · viene del ${nc.desde} a ${nc.vel} km/h · ${intensidad(nc.mm)}` +
+        `<small>Extrapolación del movimiento que mide el satélite (NOAA) en la última hora. Puede cambiar.</small></span></div>`);
+      if (nc.min <= 60) {
+        const tit = document.querySelector('.tit'), sub = document.querySelector('.sub'), ic = document.querySelector('.hero .ic');
+        if (tit) tit.textContent = `Lluvia llegando en ${cuando}`;
+        if (sub) sub.textContent = `Viene del ${nc.desde}, intensidad ${intensidad(nc.mm)}. Según el movimiento de la lluvia en la última hora.`;
+        if (ic) ic.innerHTML = icono('lluvia', 64);
+      }
+    } else if (nc && nc.estado === 'termina' && nc.min <= 60 && evidencia(v).llueve) {
+      piezas.push(`<div class="ah-b ah-nc" role="status"><span class="etq pr">En camino</span><span><b>☀️ La lluvia se alejaría en ~${Math.max(nc.min, 5)} min</b>` +
+        `<small>Extrapolación del movimiento que mide el satélite (NOAA). Puede cambiar.</small></span></div>`);
+    }
     const of = oficialPara(v);
     if (of) piezas.push(htmlOficial(of, hoy, v));
     if (piezas.length) cab.insertAdjacentHTML('afterbegin', piezas.join(''));
@@ -3625,7 +4081,7 @@ html[data-tema=claro] .ah-rayo{background:linear-gradient(90deg,rgba(250,204,21,
       if (!r.ok) return;
       const j = await r.json(), f = JSON.stringify([j.generado, j.rayos && j.rayos.t, j.oficial && j.oficial.id, j.lluvia && j.lluvia.t]);
       if (f === firma) return;
-      firma = f; AH = j; D.rayos = j.rayos; D.oficial = j.oficial;
+      firma = f; AH = j; D.rayos = j.rayos; D.oficial = j.oficial; D.movimiento = j.movimiento || null;
       if (ctx && $('#sheet').hidden) render(); else montar();
     } catch (e) {}
   }
@@ -3677,6 +4133,11 @@ inicio().catch(e => { console.error(e); $('#vista').innerHTML = '<div class="vac
 # ----------------------- MAIN -----------------------
 def main():
     p = cargar_pesos()
+    try:
+        n = actualizar_observado()
+        print(f"Observaciones propias (satélite y rayos): {n} horas nuevas")
+    except Exception as e:
+        log_error(f"observaciones propias: {e} (todavía no hay datos de la rama ahora o no responde)")
     if "--verificar" in sys.argv or toca_verificar(p):
         verificar(p)
     resultados = {}
@@ -3685,6 +4146,7 @@ def main():
         print(f"Descargando pronóstico {ciudad}...")
         try:
             cfg, _ = cfg_efectivo(p, ciudad)
+            cfg = dict(cfg, tabla_ts=tabla_tormenta(p, ciudad, cfg)[0])
             filas = consenso(descargar(o["lat"], o["lon"]), cfg, o["lat"], o["lon"])
             if filas:
                 resultados[ciudad] = filas
@@ -3734,7 +4196,12 @@ def main():
     except Exception as e:
         log_error(f"lluvia por satélite: {e} (la página se publica sin esa capa)")
     try:
-        generar_html(resultados, p, mapa, iconos, alertas, ahora, normales)
+        tablero = None
+        try:
+            tablero = tablero_aciertos(p)
+        except Exception as e:
+            log_error(f"tablero de aciertos: {e}")
+        generar_html(resultados, p, mapa, iconos, alertas, ahora, normales, tablero)
     except Exception as e:
         log_error(f"{e}; se conserva la página anterior")
         sys.exit(1)
