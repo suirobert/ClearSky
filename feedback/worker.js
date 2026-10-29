@@ -1,4 +1,6 @@
-// ClearSky · servicio de reportes, avisos y vigilancia (Cloudflare Workers + D1, plan gratuito) · v16
+// Required Notice: Copyright (c) 2026 Robert Alejandro Figueroa Pazmiño (https://github.com/suirobert/ClearSky)
+// Licencia: PolyForm Noncommercial 1.0.0 (ver el archivo LICENSE). Uso no comercial.
+// ClearSky · servicio de reportes, avisos y vigilancia (Cloudflare Workers + D1, plan gratuito) · v19
 // POST /reporte     {lat, lon, tipo}            -> guarda un reporte (máx. 1 cada 30 min por persona y zona)
 // GET  /resumen?lat=&lon=                       -> reportes de la última hora a ~10 km (público)
 // GET  /export?despues=<id>                     -> reportes nuevos para el script (requiere TOKEN)
@@ -10,17 +12,20 @@
 // Tarea programada (cron, cada 30 min) -> avisos al teléfono, según lo que cada persona eligió:
 //   TORMENTA (2): 5 o más rayos en 20 min a menos de 25 km (GOES-19 GLM, desde ahora.json). Máximo uno cada 2 h.
 //   LLUVIA   (1): el satélite o los reportes de la gente dicen que llueve ahora; o la lluvia llega en menos de 40 min según el
-//                 movimiento medido por el satélite; o el pronóstico da 60% o más en las próximas 2 horas. Máximo uno cada 6 h.
+//                 movimiento medido por el satélite (SOLO si esa función está "verificada" en ahora.json); o el pronóstico da 60% o
+//                 más en las próximas 2 horas. Máximo uno cada 6 h. El aviso abre la página con la pregunta "¿Te llovió?".
 //   OFICIAL  (4): un boletín del INAMHI que afecta su región (desde 3 h antes de su inicio y mientras esté vigente). Una vez por boletín.
 //   VIGILANCIA: si la página o la capa "ahora" llevan horas sin actualizarse, relanza el workflow de GitHub (si hay GH_TOKEN)
 //                 y avisa a los suscriptores administradores.
-const TIPOS = ['soleado', 'nublado', 'llovizna', 'lluvia', 'lluvia_fuerte', 'tormenta'];
+const TIPOS = ['soleado', 'despejado', 'nublado', 'llovizna', 'lluvia', 'lluvia_fuerte', 'tormenta'];
 const SITIO = 'https://suirobert.github.io/ClearSky';
 const AHORA_URL = 'https://raw.githubusercontent.com/suirobert/ClearSky/ahora/ahora.json';
 const REPO = 'suirobert/ClearSky';
 const PROB_AVISO = 60, HORAS_ENTRE_AVISOS = 6, HORAS_ENTRE_TORMENTAS = 2, MAX_ZONAS = 15, MAX_ENVIOS = 25, HORAS_VIEJA = 3;
 const RAYOS_AVISO = 5, NOWCAST_MAX_MIN = 40, NOWCAST_MIN_MM = 1.5;
 const P_LLUVIA = 1, P_TORMENTA = 2, P_OFICIAL = 4;
+const REPO_AHORA = 'ahora.yml';
+const esCronAhora = (c) => /^\*\/10\s/.test(String(c || '').trim());      // cron de cada 10 minutos
 const enEcuador = (lat, lon) => lat >= -6 && lat <= 2.5 && lon >= -92.5 && lon <= -75;
 const REGION_DE_ZONA = { costa: 'litoral', sierra: 'interandina', oriente: 'amazonia', galapagos: 'insular' };
 const pref = (s) => (s.pref == null ? 7 : s.pref);
@@ -133,6 +138,10 @@ export default {
   },
 
   async scheduled(evento, env, ctx) {
+    if (esCronAhora(evento && evento.cron)) {            // cada 10 min: solo lanza la capa "ahora" (GitHub no la dispara solo)
+      ctx.waitUntil(lanzarAhora(env));
+      return;
+    }
     ctx.waitUntil((async () => {
       const ah = await leerAhora(env);
       await revisarAvisos(env, ah).catch(e => console.log('avisos:', e && e.message));
@@ -265,14 +274,15 @@ async function revisarAvisos(env, ah) {
       const rep = await resumen(env, lat, lon, ahora);
       const moja = (rep.lluvia || 0) + (rep.lluvia_fuerte || 0) + (rep.tormenta || 0) + 0.5 * (rep.llovizna || 0);
       const lluviaRep = rep.total >= 3 && moja / rep.total >= 0.6;
-      const nc = (mm == null || mm < 1) && !lluviaRep ? nowcast(sat, ah && ah.movimiento, lat, lon) : null;
+      const verificada = !!(ah && ah.nowcast && ah.nowcast.estado === 'verificado');       // en pruebas u oculta: no se avisa
+      const nc = verificada && (mm == null || mm < 1) && !lluviaRep ? nowcast(sat, ah && ah.movimiento, lat, lon) : null;
       if ((mm != null && mm >= 1) || lluviaRep) {
         const quien = [mm != null && mm >= 0.5 ? 'el satélite' : '', lluviaRep ? `${rep.total} reportes de la gente` : ''].filter(Boolean).join(' y ');
-        aviso = (nombre) => ({ title: `🌧️ Está lloviendo cerca de ${nombre}`, body: `Según ${quien}. ¡Lleva paraguas!`, url: sitio + '/', tag: 'lluvia' });
+        aviso = (nombre) => ({ title: `🌧️ Está lloviendo cerca de ${nombre}`, body: `Según ${quien}. ¡Lleva paraguas!`, url: sitio + '/?q=ll', tag: 'lluvia' });
       } else if (nc && nc.min <= NOWCAST_MAX_MIN && nc.mm >= NOWCAST_MIN_MM) {
         // 3) la lluvia viene en camino (movimiento medido por el satélite)
         aviso = (nombre) => ({ title: `🌧️ La lluvia llegaría a ${nombre} en ~${Math.max(nc.min, 5)} min`,
-          body: `Viene a ${nc.vel} km/h, según el satélite. ¡Lleva paraguas!`, url: sitio + '/', tag: 'lluvia' });
+          body: `Viene a ${nc.vel} km/h, según el satélite. ¡Lleva paraguas!`, url: sitio + '/?q=ll', tag: 'lluvia' });
       } else {
         // 4) pronóstico de las próximas 2 horas
         const om = await (await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=precipitation` +
@@ -287,7 +297,7 @@ async function revisarAvisos(env, ah) {
           if (p >= PROB_AVISO && (!mejor || p > mejor.p)) mejor = { p, t };
         });
         if (mejor) aviso = (nombre) => ({ title: `🌧️ Lluvia probable en ${nombre}`,
-          body: `${mejor.p}% de probabilidad hacia las ${mejor.t.slice(11, 16)}. ¡Lleva paraguas!`, url: sitio + '/', tag: 'lluvia' });
+          body: `${mejor.p}% de probabilidad hacia las ${mejor.t.slice(11, 16)}. ¡Lleva paraguas!`, url: sitio + '/?q=ll', tag: 'lluvia' });
       }
     }
     if (!aviso) continue;
@@ -341,6 +351,23 @@ async function edadPagina(env) {
     const conf = await (await fetch(`${sitio}/push.json?t=${Date.now()}`, { cf: { cacheTtl: 0 } })).json();
     return { generado: conf.generado, horas: (Date.now() - horaEc(conf.generado)) / 36e5 };
   } catch (e) { return { generado: null, horas: null }; }
+}
+// Lanza ahora.yml en GitHub y deja anotado en la tabla "estado" qué respondió (SELECT * FROM estado;)
+async function lanzarAhora(env) {
+  let resultado = 'sin GH_TOKEN';
+  try {
+    if (env.GH_TOKEN) {
+      const r = await fetch(`https://api.github.com/repos/${REPO}/actions/workflows/${REPO_AHORA}/dispatches`, { method: 'POST',
+        headers: { Authorization: `Bearer ${env.GH_TOKEN}`, Accept: 'application/vnd.github+json', 'User-Agent': 'ClearSky-cron',
+                   'X-GitHub-Api-Version': '2022-11-28' }, body: JSON.stringify({ ref: 'main' }) });
+      resultado = r.status === 204 ? '204 ok' : `${r.status} ${(await r.text()).replace(/\s+/g, ' ').slice(0, 140)}`;
+    }
+  } catch (e) { resultado = 'error ' + String((e && e.message) || e).slice(0, 140); }
+  try {
+    await env.DB.prepare("INSERT INTO estado (k, v) VALUES ('dispatch-ahora', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v")
+      .bind(`${new Date().toISOString()} ${resultado}`).run();
+  } catch (e) {}
+  console.log('dispatch ahora.yml:', resultado);
 }
 async function relanzar(env, workflow) {
   if (!env.GH_TOKEN) return false;

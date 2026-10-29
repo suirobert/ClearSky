@@ -1,7 +1,8 @@
 name: Ahora (rayos, lluvia observada, movimiento y aviso oficial)
 
-# Cada 10 minutos genera ahora.json (lo lee la página) y hist.json (lo usa el script horario para verificar con
-# observaciones propias) y los publica en la rama "ahora" (un solo commit que se reemplaza cada vez).
+# Cada 10 minutos genera ahora.json (lo lee la página), hist.json (observaciones propias para verificar) y
+# nowcast.json (cuántas veces acertó el "llegaría en X min") y los publica en la rama "ahora"
+# (un solo commit que se reemplaza cada vez).
 on:
   schedule:
     - cron: "*/10 * * * *"
@@ -30,14 +31,16 @@ jobs:
       - name: Instalar librerías
         run: pip install --quiet netCDF4 numpy pypdf
 
-      - name: Traer el historial anterior (sin pasar por cachés)
+      - name: Traer lo guardado antes (sin pasar por cachés)
         run: |
           git fetch --depth=1 origin ahora:refs/remotes/origin/ahora || true
           git show origin/ahora:hist.json > hist_prev.json 2>/dev/null || rm -f hist_prev.json
+          git show origin/ahora:nowcast.json > nowcast_prev.json 2>/dev/null || rm -f nowcast_prev.json
 
-      - name: Generar ahora.json y hist.json
+      - name: Generar ahora.json, hist.json y nowcast.json
         env:
           CC_HIST_PREVIO: hist_prev.json
+          CC_NC_PREVIO: nowcast_prev.json
         run: |
           mkdir -p salida
           python ahora.py salida
@@ -50,5 +53,6 @@ jobs:
           git config user.name "ClearSky bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add ahora.json hist.json
+          git add nowcast.json || true          # si por alguna razón no se generó, no impide publicar lo demás
           git commit -q -m "ahora $(date -u +%H:%M)"
           git push -q -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" HEAD:ahora

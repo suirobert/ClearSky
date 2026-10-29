@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# Required Notice: Copyright (c) 2026 Robert Alejandro Figueroa Pazmiño (https://github.com/suirobert/ClearSky)
+# Licencia: PolyForm Noncommercial 1.0.0 (ver el archivo LICENSE). Uso no comercial.
 """
 ClearSky - pronóstico del tiempo verificado para Ecuador
 --------------------------------------------------------
@@ -22,6 +24,7 @@ Página (index.html, generada aquí y dibujada con JavaScript):
   - Tormentas verificadas con los rayos del satélite (GLM) y ciudades sin aeropuerto verificadas con la lluvia
     satelital, ambas solo cuando hay suficientes días acumulados y pasan el examen (datos/observado/).
   - Tablero público de aciertos día por día (tarjeta "Cómo nos fue esta semana") y selector de rango 24 h / 3 días / 7 días.
+  - "Lluvia en camino" con verificación propia (ahora.py): solo se muestra como verificada si acierta; mapa que se reproduce solo.
   - Calor: sensación térmica (índice de calor NOAA), alerta desde 32° y onda de calor frente a lo normal
     de los últimos 30 días; humedad, viento y UV por hora. Botón para instalar como app.
   - Mapa de lluvia por horas, satélite GOES, íconos animados Meteocons, gráfica y barra que se
@@ -134,7 +137,7 @@ ARCHIVO_HTML  = os.path.abspath(os.environ.get("CC_HTML") or os.path.join(BASE, 
 ARCHIVO_ERR   = os.path.join(DATOS, "errores.log")
 FEEDBACK_URL  = (os.environ.get("CC_FEEDBACK_URL") or "").strip().rstrip("/")
 FEEDBACK_TOKEN = (os.environ.get("CC_FEEDBACK_TOKEN") or "").strip()   # para descargar los reportes
-TIPOS_REPORTE = {"soleado": 0, "nublado": 0, "llovizna": 0, "lluvia": 1, "lluvia_fuerte": 1, "tormenta": 1}  # 1 = llueve
+TIPOS_REPORTE = {"soleado": 0, "despejado": 0, "nublado": 0, "llovizna": 0, "lluvia": 1, "lluvia_fuerte": 1, "tormenta": 1}  # 1 = llueve
 RADIO_REPORTES_KM = 30
 MIN_REPORTES  = 30           # reportes comparables necesarios para mostrar resultados
 REPO_URL      = "https://github.com/suirobert/ClearSky"
@@ -862,6 +865,35 @@ def calibrar_por_satelite(obs_c, prev):
     r["fuente"] = "satelite"
     r["cobertura_obs_pct"] = round(len(obs) / (DIAS_VERIFICACION * 24) * 100)
     return r
+
+
+# ----------------------- LLUVIA EN CAMINO: ARCHIVO PERMANENTE -----------------------
+URL_NC = REPO_URL.replace("https://github.com/", "https://raw.githubusercontent.com/") + "/ahora/nowcast.json"
+
+
+def actualizar_nowcast():
+    """Guarda para siempre en datos/nowcast/ cada predicción de "la lluvia llega en X min" ya comprobada
+       (ciudad, hora de la predicción, minutos previstos, mm/h previstos y 1 = llovió a la hora prevista / 0 = no)."""
+    est = json.loads(http_get(URL_NC, {"t": int(time.time())}, intentos=2))
+    por_mes = {}
+    for h in est.get("hechas") or []:
+        por_mes.setdefault(h["t0"][:7], []).append([h["c"], h["t0"], h["m"], h["mm"], h["r"]])
+    carpeta = os.path.join(DATOS, "nowcast")
+    os.makedirs(carpeta, exist_ok=True)
+    nuevos = 0
+    for mes, filas in por_mes.items():
+        ruta = os.path.join(carpeta, f"{mes}.json")
+        act = json.load(open(ruta, encoding="utf-8")) if os.path.exists(ruta) else []
+        vistos = {(a[0], a[1]) for a in act}
+        for f in filas:
+            if (f[0], f[1]) not in vistos:
+                act.append(f)
+                nuevos += 1
+        tmp = ruta + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(sorted(act, key=lambda a: (a[1], a[0])), fh, separators=(",", ":"), ensure_ascii=False)
+        os.replace(tmp, ruta)
+    return nuevos
 
 
 # ----------------------- TORMENTAS ELÉCTRICAS -----------------------
@@ -2015,7 +2047,7 @@ e.respondWith(fetch(r).then(res=>{const cp=res.clone();caches.open(C).then(c=>c.
 self.addEventListener('push',e=>{let d={};try{d=e.data.json()}catch(x){d={title:'ClearSky',body:e.data?e.data.text():''}}
 e.waitUntil(self.registration.showNotification(d.title||'ClearSky',{body:d.body||'',icon:'icon-192.png',badge:'icon-192.png',tag:d.tag||'clearsky',renotify:true,data:{url:d.url||'./'}}));});
 self.addEventListener('notificationclick',e=>{e.notification.close();const u=(e.notification.data||{}).url||'./';
-e.waitUntil(clients.matchAll({type:'window',includeUncontrolled:true}).then(cs=>{for(const c of cs){if('focus' in c)return c.focus();}return clients.openWindow(u);}));});
+e.waitUntil(clients.matchAll({type:'window',includeUncontrolled:true}).then(async cs=>{for(const c of cs){if('focus' in c){if(/[?]q=ll/.test(u)){try{await c.navigate(u)}catch(x){}}return c.focus();}}return clients.openWindow(u);}));});
 """
 
 
@@ -2507,6 +2539,27 @@ html[data-tema=claro] .sw input{background:#cbd5e1}html[data-tema=claro] .sw inp
   .hero{margin-top:6px}
   .col2 .card:first-child{margin-top:14px}
 }
+/* ---------- v19: etiquetas de color, estado de los datos, lugares guardados ---------- */
+.chip.hum{background:#0c2a3d;color:#bae6fd}.chip.hum b{color:#fff}
+.chip.vto{background:#0b3330;color:#99f6e4}.chip.vto b{color:#fff}
+.chip.uv-b{background:#10321d;color:#bbf7d0}.chip.uv-m{background:#3a3210;color:#fef08a}.chip.uv-a{background:#3d2410;color:#fed7aa}
+.chip.uv-ma{background:#3d1515;color:#fecaca}.chip.uv-e{background:#2f1a4d;color:#e9d5ff}
+.chip.uv b{color:#fff}
+html[data-tema=claro] .chip.hum{background:#e0f2fe;color:#075985}html[data-tema=claro] .chip.hum b{color:#0c4a6e}
+html[data-tema=claro] .chip.vto{background:#ccfbf1;color:#115e59}html[data-tema=claro] .chip.vto b{color:#134e4a}
+html[data-tema=claro] .chip.uv-b{background:#dcfce7;color:#166534}html[data-tema=claro] .chip.uv-m{background:#fef9c3;color:#854d0e}
+html[data-tema=claro] .chip.uv-a{background:#ffedd5;color:#9a3412}html[data-tema=claro] .chip.uv-ma{background:#fee2e2;color:#991b1b}
+html[data-tema=claro] .chip.uv-e{background:#f3e8ff;color:#6b21a8}html[data-tema=claro] .chip.uv b{color:#1e1b4b}
+.fbb button:last-child:nth-child(3n+1){grid-column:1/-1}
+.etq.pb{background:rgba(148,163,184,.16);color:var(--tx2)}
+.ah-nc.prueba{border-color:var(--line);background:var(--card)}
+.est{display:flex;align-items:center;gap:10px;padding:9px 2px;border-top:1px solid var(--line);font-size:13.5px}
+.est span{flex:1;color:var(--tx2)}.est b{font-weight:600}
+.sem{width:10px;height:10px;border-radius:50%;flex:none;background:#64748b}.sem.ok{background:#22c55e}.sem.aviso{background:#f59e0b}.sem.mal{background:#ef4444}
+.lrow{display:flex;align-items:center;gap:2px}.lrow .lit{flex:1;min-width:0}
+.lq{flex:none;width:40px;height:40px;border:0;background:none;color:var(--tx3);font-size:15px;cursor:pointer;border-radius:50%}
+.lq:active,.lq:hover{background:var(--card2)}
+.lgrd{margin:8px 4px 2px;width:calc(100% - 8px)}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 """
 
@@ -2546,7 +2599,7 @@ const guardar = (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} };
 const leer = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
 const tocar = () => { try { navigator.vibrate && navigator.vibrate(4); } catch (e) {} };
 const CARGA = Date.now();
-let estado = {rango: null, vista: null, dia: null, ocultas: new Set(['llovizna']), ubic: null, pos: null, tlSel: null, buscando: false,
+let estado = {lugares: {}, rango: null, vista: null, dia: null, ocultas: new Set(['llovizna']), ubic: null, pos: null, tlSel: null, buscando: false,
   tab: leer('cc_tab') || 'graf', vapid: undefined, mapaListo: false};
 
 // ---------- misma lógica que el script de Python ----------
@@ -2647,7 +2700,7 @@ function evidencia(v) {
   const sat = satEn(v.lat, v.lon), j = (estado.rep && estado.rep.clave === claveRep(v)) ? estado.rep.j : null;
   const n = j ? j.total || 0 : 0;
   const moja = j ? (j.lluvia || 0) + (j.lluvia_fuerte || 0) + (j.tormenta || 0) + 0.5 * (j.llovizna || 0) : 0;
-  const seco = j ? (j.soleado || 0) + (j.nublado || 0) : 0;
+  const seco = j ? (j.soleado || 0) + (j.despejado || 0) + (j.nublado || 0) : 0;
   const lluviaRep = n >= 3 && moja / n >= 0.6, secoRep = n >= 3 && seco / n >= 0.9;
   const llueve = (sat != null && sat >= 1) || lluviaRep || (sat != null && sat >= 0.5 && moja >= 1);
   const noLlueve = !llueve && secoRep && (sat == null || sat < 0.3);
@@ -3120,7 +3173,7 @@ function colorRampa(p) {
   }
   return RAMPA[RAMPA.length - 1][1];
 }
-let mapa = null;
+let mapa = null, mapaAnim = null;     // mapaAnim: {pausar, reanudar} de la animación del mapa
 function cargarLeaflet() {
   if (window.L) return Promise.resolve();
   return new Promise((ok, mal) => {
@@ -3193,35 +3246,62 @@ function activarMapa(v) {
       const hr = M.horas[k]; lab.textContent = `${nombreDia(hr.slice(0, 10), hoy)} ${hr.slice(11, 16)}`; };
     map.on('click', e => { const p = Math.round(probEn(j, e.latlng.lat, e.latlng.lng));
       L.popup({closeButton: false, className: 'pop'}).setLatLng(e.latlng).setContent(`<b>${p}%</b> de lluvia · ${lab.textContent}`).openOn(map); });
-    let tm = null; const play = $('#mplay');
+    const play = $('#mplay'), reducido = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let tm = null, manual = false, modo = 'pron', capaAhora = null, marcos = [], urlsAhora = {}, k2 = 0;
     const ahora = ahoraISO(D.offset); let j0 = M.horas.findIndex(h => h >= ahora); if (j0 < 0) j0 = 0;
+    const S = satAhora(), msL = t => Date.UTC(+t.slice(0, 4), +t.slice(5, 7) - 1, +t.slice(8, 10), +t.slice(11, 13), +t.slice(14, 16));
+    // imágenes de lluvia del satélite de la última hora (hace 60 min, hace 30 min y ahora) para la animación
+    const armarMarcos = () => { if (!S) return []; const out = [];
+      for (const f of (D.ahora_prev || [])) { if (!f || !f.q || f.t >= S.t) continue;
+        try { const v8 = Uint8Array.from(atob(f.q), c => c.charCodeAt(0)); if (v8.length === S.nx * S.ny) out.push({t: f.t, v: v8}); } catch (e) {} }
+      out.push({t: S.t, v: S.v}); return out; };
+    const total = () => modo === 'ahora' ? marcos.length : M.horas.length;
+    const mostrar = k => {
+      if (modo === 'pron') { sl.value = k; pintar(k); return; }
+      const f = marcos[k]; if (!f || !capaAhora) return; k2 = k; sl.value = k;
+      capaAhora.setUrl(urlsAhora[k] || (urlsAhora[k] = imagenAhora(f.v)));
+      const m = Math.round((msL(S.t) - msL(f.t)) / 6e4); lab.textContent = `${m ? 'hace ' + m + ' min' : 'Ahora'} · ${f.t.slice(11, 16)}`;
+    };
+    const detener = porUsuario => { if (tm) { clearInterval(tm); tm = null; } play.textContent = '▶'; play.setAttribute('aria-label', 'Reproducir la animación'); if (porUsuario) manual = true; };
+    const arrancar = () => { if (tm || total() < 2 || !$('#mapa')) return;
+      play.textContent = '❚❚'; play.setAttribute('aria-label', 'Pausar la animación');
+      tm = setInterval(() => { if (!$('#mapa')) { clearInterval(tm); tm = null; return; } if (document.hidden) return;
+        const a = modo === 'pron' ? j0 : 0, b = modo === 'pron' ? Math.min(M.horas.length, j0 + 24) : marcos.length;     // el pronóstico gira sobre las próximas 24 horas
+        let k = +sl.value + 1; if (k >= b || k < a) k = a; mostrar(k); }, modo === 'ahora' ? 1100 : 600); };
     sl.value = j0; pintar(j0);
-    sl.addEventListener('input', () => pintar(+sl.value));
-    play.onclick = () => { if (tm) { clearInterval(tm); tm = null; play.textContent = '▶'; play.setAttribute('aria-label', 'Reproducir la animación'); return; }
-      play.textContent = '❚❚'; play.setAttribute('aria-label', 'Pausar');
-      tm = setInterval(() => { if (!$('#mapa')) return clearInterval(tm); sl.value = (+sl.value + 1) % M.horas.length; pintar(+sl.value); }, 600); };
+    sl.addEventListener('input', () => { detener(true); mostrar(+sl.value); });          // tocar la barra pausa la animación
+    play.onclick = () => { if (tm) detener(true); else { manual = false; arrancar(); } };
     mapa = map;
-    // modo "lloviendo ahora": estimación satelital de NOAA de los últimos minutos
-    const S = satAhora(); let capaAhora = null;
-    $$('.modo').forEach(b => b.onclick = () => {
-      const ahoraM = b.dataset.m === 'ahora'; tocar();
-      $$('.modo').forEach(x => { x.classList.toggle('on', x === b); x.setAttribute('aria-pressed', x === b); });
-      $('#mctl').hidden = ahoraM; $('#mley').hidden = ahoraM; $('#mley2').hidden = !ahoraM;
-      if (tm) play.onclick();
+    mapaAnim = {pausar: () => detener(false), reanudar: () => { if (!manual && !reducido) arrancar(); }};
+    const cambiarModo = m => {
+      detener(false); manual = false; modo = m;
+      const ahoraM = m === 'ahora';
+      $$('.modo').forEach(x => { const on = x.dataset.m === m; x.classList.toggle('on', on); x.setAttribute('aria-pressed', on); });
+      $('#mley').hidden = ahoraM; $('#mley2').hidden = !ahoraM;
       if (ahoraM) {
+        marcos = armarMarcos(); urlsAhora = {};
         map.removeLayer(capa);
-        if (!capaAhora) capaAhora = L.imageOverlay(imagenAhora(), [[S.lat0 - S.ny * S.paso, S.lon0], [S.lat0, S.lon0 + S.nx * S.paso]], {className: 'capa-lluvia'});
+        if (!capaAhora) capaAhora = L.imageOverlay(imagenAhora(S.v), [[S.lat0 - S.ny * S.paso, S.lon0], [S.lat0, S.lon0 + S.nx * S.paso]], {className: 'capa-lluvia'});
         capaAhora.addTo(map);
-        $('#mnota').textContent = `Lluvia estimada por satélite a las ${S.t.slice(11, 16)}. Toca el mapa para ver la intensidad. No es un radar: puede fallar con lluvias muy débiles.`;
+        sl.max = Math.max(0, marcos.length - 1); $('#mctl').hidden = marcos.length < 2;
+        mostrar(reducido ? marcos.length - 1 : 0);
+        $('#mnota').textContent = marcos.length > 1
+          ? 'Lluvia estimada por el satélite en la última hora (hace 60 min, hace 30 min y ahora). Toca la barra para detener la animación. No es un radar: puede fallar con lluvias muy débiles.'
+          : `Lluvia estimada por satélite a las ${S.t.slice(11, 16)}. Toca el mapa para ver la intensidad. No es un radar: puede fallar con lluvias muy débiles.`;
       } else {
         if (capaAhora) map.removeLayer(capaAhora); capa.addTo(map);
+        sl.max = M.horas.length - 1; $('#mctl').hidden = false; mostrar(j >= j0 ? j : j0);
         $('#mnota').textContent = 'Probabilidad de lluvia en cada zona a la hora elegida. Toca el mapa para ver el porcentaje exacto. Es un pronóstico, no un radar.';
       }
       map.off('click'); map.on('click', ahoraM ? clicAhora : clicPron);
-    });
+      if (!reducido) arrancar();                                                          // se reproduce solo en los dos modos
+    };
+    $$('.modo').forEach(b => b.onclick = () => { tocar(); cambiarModo(b.dataset.m); });
+    if (!reducido) setTimeout(() => { if (!manual && $('#mapa')) arrancar(); }, 700);    // el pronóstico arranca solo al abrir el mapa
     const clicPron = e => { const p = Math.round(probEn(j, e.latlng.lat, e.latlng.lng));
       L.popup({closeButton: false, className: 'pop'}).setLatLng(e.latlng).setContent(`<b>${p}%</b> de lluvia · ${lab.textContent}`).openOn(map); };
-    const clicAhora = e => { const mm = satEn(e.latlng.lat, e.latlng.lng, 0);
+    const clicAhora = e => { const f = marcos[k2] || {v: S.v}, iy = Math.floor((S.lat0 - e.latlng.lat) / S.paso), ix = Math.floor((e.latlng.lng - S.lon0) / S.paso);
+      const mm = iy >= 0 && iy < S.ny && ix >= 0 && ix < S.nx ? f.v[iy * S.nx + ix] * S.escala : null;
       L.popup({closeButton: false, className: 'pop'}).setLatLng(e.latlng).setContent(mm == null ? 'Sin datos' : mm < 0.5 ? 'Sin lluvia' : `<b>Lluvia ${intensidad(mm)}</b> · ${mm} mm/h`).openOn(map); };
   })();
 }
@@ -3232,10 +3312,10 @@ function colorMM(v) {
     return ca.map((x, k) => x + (cb[k] - x) * f); }
   return RAMPA_MM[RAMPA_MM.length - 1][1];
 }
-function imagenAhora() {
-  const S = satAhora(), cv = document.createElement('canvas'); cv.width = S.nx; cv.height = S.ny;
+function imagenAhora(v8) {
+  const S = satAhora(), arr = v8 || S.v, cv = document.createElement('canvas'); cv.width = S.nx; cv.height = S.ny;
   const cx = cv.getContext('2d'), img = cx.createImageData(S.nx, S.ny);
-  for (let k = 0; k < S.nx * S.ny; k++) { const c = colorMM(S.v[k] * S.escala);
+  for (let k = 0; k < S.nx * S.ny; k++) { const c = colorMM(arr[k] * S.escala);
     img.data[k * 4] = c[0]; img.data[k * 4 + 1] = c[1]; img.data[k * 4 + 2] = c[2]; img.data[k * 4 + 3] = Math.round(c[3] * 255); }
   cx.putImageData(img, 0, 0);
   return cv.toDataURL();
@@ -3297,12 +3377,12 @@ function activarSatelite(v) {
 }
 
 // ---------- reportes de usuarios ----------
-const TIPOS_REP = [['soleado', '☀️', 'Soleado'], ['nublado', '☁️', 'Nublado'], ['llovizna', '🌦️', 'Llovizna'],
+const TIPOS_REP = [['soleado', '☀️', 'Soleado'], ['despejado', '🔆', 'Despejado'], ['nublado', '☁️', 'Nublado'], ['llovizna', '🌦️', 'Llovizna'],
                    ['lluvia', '🌧️', 'Lluvia'], ['lluvia_fuerte', '🌊', 'Aguacero'], ['tormenta', '⛈️', 'Tormenta']];
 const NOMBRE_REP = Object.fromEntries(TIPOS_REP.map(([t, , n]) => [t, n.toLowerCase()]));
 function htmlFeedback() {
   return `<div class="grab"></div><h2>¿Cómo está el clima donde estás?</h2><div class="fbb">` +
-    TIPOS_REP.map(([t, e, n]) => `<button data-t="${t}"><span class="fbe" aria-hidden="true">${e}</span>${n}</button>`).join('') +
+    TIPOS_REP.filter(([t]) => !(t === 'soleado' && esNoche(ahoraISO(D.offset)))).map(([t, e, n]) => `<button data-t="${t}"><span class="fbe" aria-hidden="true">${t === 'despejado' && esNoche(ahoraISO(D.offset)) ? '🌙' : e}</span>${n}</button>`).join('') +
     `</div><div class="fbres" id="fbres" aria-live="polite"></div><div class="fbres" id="fbsum"></div><p class="nota">Tu reporte nos ayuda a comprobar el pronóstico en tu barrio. ` +
     `Solo guardamos la hora, lo que reportas y tu ubicación aproximada; nunca datos personales.</p>`;
 }
@@ -3347,8 +3427,10 @@ function activarFeedback() {
     if (!enEcuador(pos)) { box.textContent = TXT_FUERA; return; }
     $$('.fbb button').forEach(x => x.disabled = true);
     try {
-      const r = await fetch(`${D.feedback_url}/reporte`, {method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({lat: +pos.lat.toFixed(2), lon: +pos.lon.toFixed(2), tipo: b.dataset.t})});
+      const enviarRep = t => fetch(`${D.feedback_url}/reporte`, {method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({lat: +pos.lat.toFixed(2), lon: +pos.lon.toFixed(2), tipo: t})});
+      let r = await enviarRep(b.dataset.t);
+      if (r.status === 400 && b.dataset.t === 'despejado') { const e = await r.clone().json().catch(() => ({})); if (e.error === 'datos') r = await enviarRep('soleado'); }
       if (r.status === 429) box.textContent = 'Ya registramos tu reporte hace poco. ¡Gracias!';
       else if (r.status === 400) box.textContent = TXT_FUERA;
       else if (!r.ok) throw new Error(r.status);
@@ -3476,21 +3558,51 @@ function resumenCiudad(c) {
   return {t: prox[0].temp != null ? Math.round(prox[0].temp) + '°' : '-', ic: condicion(prox[0])[0],
     txt: top.prob >= 20 ? `Lluvia hoy: hasta ${top.prob}%` : condicion(prox[0])[1]};
 }
+// ---------- lugares guardados (se guardan en este dispositivo; los avisos siguen a tu ubicación actual) ----------
+const MAX_LUGARES = 5;
+function lugaresGuardados() { try { return (JSON.parse(leer('cc_lugares') || '[]') || []).filter(l => l && isFinite(l.lat) && isFinite(l.lon) && l.id); } catch (e) { return []; } }
+function guardarLugares(a) { guardar('cc_lugares', JSON.stringify(a.slice(0, MAX_LUGARES))); }
+const esLugar = v => typeof v === 'string' && v.startsWith('l:');
+async function cargarLugar(l, silencioso) {
+  if (!silencioso) { estado.vista = 'l:' + l.id; cabecera(); avisoTop(''); $('#vista').innerHTML = '<div class="vacio"><span class="cargando"></span>Calculando el pronóstico de este lugar…</div>'; }
+  try {
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${l.lat}&longitude=${l.lon}&hourly=${D.vars.join(',')}&models=${KEYS.join(',')}&timezone=auto&forecast_days=7`;
+    const om = await (await fetch(url)).json();
+    if (!om.hourly) throw new Error(om.reason || 'sin datos');
+    estado.lugares[l.id] = construirUbic({lat: l.lat, lon: l.lon, om, nombre: l.nombre, t: Date.now()});
+    if (estado.vista === 'l:' + l.id) render();
+  } catch (e) { if (!silencioso) { estado.vista = estado.ubic ? 'ubic' : ciudadCercana(); render(); toast('No pudimos descargar el pronóstico de ese lugar. Revisa tu conexión.'); } }
+}
 function abrirSelector() {
-  const u = estado.ubic;
+  const u = estado.ubic, lugares = lugaresGuardados();
+  const tempDe = x => { if (!x || !x.filas.length) return ''; const p = x.filas.find(r => r.hora >= ahoraISO(x.offset)); return p && p.temp != null ? Math.round(p.temp) + '°' : ''; };
   let h = `<div class="grab"></div><h2>Elegir lugar</h2>` +
     `<button class="lit${estado.vista === 'ubic' ? ' on' : ''}" data-v="ubic"><span style="font-size:22px">📍</span><span class="nm">Mi ubicación<small>${u ? esc(u.nombre) + ' · pronóstico exacto de donde estás' : 'Pronóstico exacto de donde estás'}</small></span>` +
-    (u && u.filas.length ? `<span class="tt">${(() => { const p = u.filas.find(r => r.hora >= ahoraISO(u.offset)); return p && p.temp != null ? Math.round(p.temp) + '°' : ''; })()}</span>` : '') + `</button>` +
-    `<div class="sh">Otras ciudades</div>`;
+    (u ? `<span class="tt">${tempDe(u)}</span>` : '') + `</button>`;
+  if (u && estado.vista === 'ubic' && lugares.length < MAX_LUGARES && !lugares.some(l => l.id === claveRep(u)))
+    h += `<button class="btn sec lgrd" id="lgrd">⭐ Guardar este lugar</button>`;
+  if (lugares.length) h += `<div class="sh">Mis lugares</div>` + lugares.map(l => `<div class="lrow"><button class="lit${estado.vista === 'l:' + l.id ? ' on' : ''}" data-v="l:${esc(l.id)}">` +
+    `<span style="font-size:22px">⭐</span><span class="nm">${esc(l.nombre.split(',')[0])}<small>${esc(l.nombre.split(',').slice(1).join(',').trim() || 'Lugar guardado')}</small></span><span class="tt">${tempDe(estado.lugares[l.id])}</span></button>` +
+    `<button class="lq" data-q="${esc(l.id)}" aria-label="Quitar ${esc(l.nombre)} de mis lugares">✕</button></div>`).join('');
+  h += `<div class="sh">Otras ciudades</div>`;
   h += D.ciudades.map((c, i) => { const r = resumenCiudad(c);
     return `<button class="lit${estado.vista === i ? ' on' : ''}" data-v="${i}"><span class="ic">${icono(r.ic, 30)}</span><span class="nm">${esc(c.nombre)}<small>${esc(r.txt)}</small></span><span class="tt">${r.t}</span></button>`; }).join('');
-  abrirHoja(h, 'Elegir lugar', () => $('#sheet').querySelectorAll('.lit').forEach(b => b.onclick = () => {
-    tocar(); cerrarSelector();
-    estado.dia = null; estado.tlSel = null;
-    if (b.dataset.v === 'ubic') { estado.ubic ? (estado.vista = 'ubic', avisoTop(''), render()) : cargarUbicacion({forzar: true}); }
-    else { estado.vista = +b.dataset.v; render(); }
-    window.scrollTo({top: 0, behavior: 'smooth'});
-  }));
+  abrirHoja(h, 'Elegir lugar', () => {
+    $('#sheet').querySelectorAll('.lit').forEach(b => b.onclick = () => {
+      tocar(); cerrarSelector();
+      estado.dia = null; estado.tlSel = null;
+      if (b.dataset.v === 'ubic') { estado.ubic ? (estado.vista = 'ubic', avisoTop(''), render()) : cargarUbicacion({forzar: true}); }
+      else if (esLugar(b.dataset.v)) {
+        const l = lugaresGuardados().find(x => 'l:' + x.id === b.dataset.v), c = l && estado.lugares[l.id];
+        if (l && c && Date.now() - c.t < 20 * 60 * 1000) { estado.vista = b.dataset.v; avisoTop(''); render(); } else if (l) cargarLugar(l);
+      }
+      else { estado.vista = +b.dataset.v; render(); }
+      window.scrollTo({top: 0, behavior: 'smooth'});
+    });
+    const g = $('#lgrd'); if (g) g.onclick = () => { tocar(); const a = lugaresGuardados(); a.push({id: claveRep(u), nombre: u.nombre, lat: u.lat, lon: u.lon}); guardarLugares(a); estado.lugares[claveRep(u)] = u; toast('Lugar guardado. Los avisos del teléfono siguen a tu ubicación actual.'); abrirSelector(); };
+    $('#sheet').querySelectorAll('.lq').forEach(b => b.onclick = () => { tocar(); guardarLugares(lugaresGuardados().filter(l => l.id !== b.dataset.q)); delete estado.lugares[b.dataset.q];
+      if (estado.vista === 'l:' + b.dataset.q) { estado.vista = estado.ubic ? 'ubic' : ciudadCercana(); render(); } abrirSelector(); });
+  });
 }
 let focoAntes = null;
 function abrirHoja(html, etiqueta, alAbrir) {
@@ -3522,14 +3634,16 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') cerrarSelect
 // ---------- página ----------
 function vistaActual() {
   if (estado.vista === 'ubic') return estado.ubic;
+  if (esLugar(estado.vista)) return estado.lugares[estado.vista.slice(2)] || null;
   const c = D.ciudades[estado.vista]; if (!c) return null;
   return {nombre: c.nombre, ref: c.ref || c.nombre, lat: c.lat, lon: c.lon, filas: c.filas, cfg: c.cfg, offset: D.offset, nivel: c.nivel,
     verif_html: c.verif_html, t: null,
     lugar: c.propia ? '' : (c.ref ? `Pronóstico de ${c.nombre} ajustado con lo aprendido en ${c.ref} mientras reunimos datos propios.` : '')};
 }
 function cabecera() {
-  const v = estado.vista === 'ubic' ? (estado.ubic ? estado.ubic.nombre.split(',')[0] : 'Tu ubicación') : (D.ciudades[estado.vista] || {}).nombre || 'Elegir lugar';
-  $('#lugarnom').textContent = (estado.vista === 'ubic' ? '📍 ' : '') + v;
+  const lug = esLugar(estado.vista) ? estado.lugares[estado.vista.slice(2)] : null;
+  const v = lug ? lug.nombre.split(',')[0] : estado.vista === 'ubic' ? (estado.ubic ? estado.ubic.nombre.split(',')[0] : 'Tu ubicación') : (D.ciudades[estado.vista] || {}).nombre || 'Elegir lugar';
+  $('#lugarnom').textContent = (estado.vista === 'ubic' ? '📍 ' : esLugar(estado.vista) ? '⭐ ' : '') + v;
 }
 const VARS_G = [['lluvia', 'Lluvia'], ['temp', 'Temperatura'], ['viento', 'Viento'], ['uv', 'UV']];
 // si va a llover, la gráfica abre en lluvia; si no, en temperatura
@@ -3571,6 +3685,7 @@ function mostrarTab(t, foco) {
   if (t === 'graf') pintarGrafica();
   else if (t === 'mapa') activarMapa(ctx.v);
   else if (t === 'sat') activarSatelite(ctx.v);
+  if (mapaAnim) { if (t === 'mapa') mapaAnim.reanudar(); else mapaAnim.pausar(); }   // la animación solo corre si el mapa está a la vista
 }
 function alertaPara(v) {
   return (D.alertas || []).filter(a => a.ciudad === v.ref || a.ciudad === v.nombre).sort((a, b) => b.prob - a.prob)[0];
@@ -3603,6 +3718,7 @@ function render() {
   const tprox = act.prob >= 20 ? `${ctxt.toLowerCase()} (${act.prob}%)` : `${ctxt}, sin lluvia`;
   const dias = porDia(filas, ahora);
   if (estado.dia && !dias[estado.dia]) estado.dia = null;
+  if (mapaAnim) { mapaAnim.pausar(); mapaAnim = null; }
   if (mapa) { mapa.remove(); mapa = null; }
   if (mapaSat) { mapaSat.remove(); mapaSat = null; }
   const y0 = scrollY;
@@ -3616,11 +3732,11 @@ function render() {
   const sAhora = sens(act), uvPico = uvs.length ? horaPico(hoyF.filter(r => r.uv != null), r => r.uv) : null;
   const chips = [`<span class="chip">Próxima hora: <b>${tprox}</b></span>`,
     sMax != null && sMax >= UMBRAL_CALOR ? `<span class="chip hot">🌡️ Sensación <b>${Math.round(sMax)}°</b> ${franja(sPico.hora)}</span>` : '',
-    act.hum != null ? `<span class="chip">Humedad <b>${act.hum}%</b></span>` : '',
-    act.viento != null && act.viento >= 15 ? `<span class="chip">Viento <b>${act.viento} km/h</b></span>` : '',
+    act.hum != null ? `<span class="chip hum">Humedad <b>${act.hum}%</b></span>` : '',
+    act.viento != null && act.viento >= 15 ? `<span class="chip vto">Viento <b>${act.viento} km/h</b></span>` : '',
     (tsMax.prob_ts || 0) >= 10 ? `<span class="chip ts">⚡ Tormenta <b>${tsMax.prob_ts}%</b> ${franja(tsMax.hora)}</span>` : '',
-    uvMax != null && uvMax >= 3 && !esNoche(ahora) ? `<span class="chip">UV <b>${Math.round(uvMax)}</b> ${nivelUV(uvMax)}${uvPico ? ' a las ' + uvPico.hora.slice(11, 16) : ''}</span>` : '',
-    rfMax != null && rfMax >= 40 ? `<span class="chip">Ráfagas <b>${rfMax} km/h</b></span>` : '', chipAciertos(v)].join('');
+    uvMax != null && uvMax >= 3 && !esNoche(ahora) ? `<span class="chip uv ${uvMax < 3 ? 'uv-b' : uvMax < 6 ? 'uv-m' : uvMax < 8 ? 'uv-a' : uvMax < 11 ? 'uv-ma' : 'uv-e'}">UV <b>${Math.round(uvMax)}</b> ${nivelUV(uvMax)}${uvPico ? ' a las ' + uvPico.hora.slice(11, 16) : ''}</span>` : '',
+    rfMax != null && rfMax >= 40 ? `<span class="chip vto">Ráfagas <b>${rfMax} km/h</b></span>` : '', chipAciertos(v)].join('');
   const al = alertaPara(v);
   const fuera = v.lat != null && !enEcuador(v);                    // el navegador ubica a la persona fuera de Ecuador (VPN, red de empresa)
   const push = leer('cc_push') ? '🔔 Avisos activos' : '🔔 Avisarme';
@@ -3648,6 +3764,7 @@ function render() {
     `<details><summary>Qué dice cada modelo meteorológico</summary>${tablaModelos(prox.slice(0, 72), v.cfg, hoy)}</details>` +
     htmlCardAciertos(v, fuera) +
     `<details><summary>¿Qué tan confiable es este pronóstico?</summary>${v.verif_html}</details>` +
+    htmlCardEstado() +
     `<details id="como"><summary>Cómo funciona ClearSky</summary>${htmlComo()}</details>` +
     `</section></div>`;
   document.querySelectorAll('#vista details').forEach(d => { if (abiertos.has(d.id || (d.querySelector('summary') || {}).textContent)) d.open = true; });
@@ -3711,6 +3828,33 @@ function htmlAciertos(v) {
     `Lo que pasó viene de ${t.fuente === 'satélite' ? 'la lluvia que estima el satélite (aproximado)' : 'los reportes del aeropuerto'}. Los días de hoy en adelante todavía no cuentan.</p></div>`;
 }
 
+// ---------- estado de los datos: qué tan frescas están las fuentes y cómo va la verificación de la lluvia en camino ----------
+function htmlCardEstado() {
+  const A = D.ah || null, ahoraMs = Date.now();
+  const iso = t => Date.UTC(+t.slice(0, 4), +t.slice(5, 7) - 1, +t.slice(8, 10), +t.slice(11, 13), +t.slice(14, 16)) - D.offset * 1000;
+  const edad = t => t ? Math.max(0, Math.round((ahoraMs - iso(t)) / 6e4)) : null;
+  const txt = m => m == null ? 'sin dato' : m < 2 ? 'ahora' : m < 90 ? `hace ${m} min` : m < 2880 ? `hace ${Math.round(m / 60)} h` : `hace ${Math.round(m / 1440)} días`;
+  const cls = (m, ok, aviso) => m == null ? 'mal' : m <= ok ? 'ok' : m <= aviso ? 'aviso' : 'mal';
+  const fila = (n, m, ok, av) => `<div class="est"><i class="sem ${cls(m, ok, av)}"></i><span>${n}</span><b>${txt(m)}</b></div>`;
+  const o = A && A.oficial, hoyMin = ahoraISO(D.offset).slice(0, 16);
+  const inamhi = !A ? 'sin dato' : !o ? 'no se pudo leer el boletín' : hoyMin > o.hasta ? 'sin boletín vigente' : `boletín ${o.id}, hasta ${o.hasta.slice(8, 10)}/${o.hasta.slice(5, 7)} ${o.hasta.slice(11, 16)}`;
+  let h = fila('Pronóstico (7 modelos)', edad(D.generado), 90, 180) + fila('Lluvia por satélite', A && A.lluvia ? edad(A.lluvia.t) : edad(D.ahora && D.ahora.t), 30, 120) +
+    fila('Rayos (GOES-19)', A && A.rayos ? edad(A.rayos.t) : null, 25, 90) + fila('Capa "ahora" (cada 10 min)', A ? edad(A.generado) : null, 25, 70) +
+    fila('Verificación con aeropuertos', D.verificacion ? edad(D.verificacion.slice(0, 16)) : null, 26 * 60, 50 * 60) +
+    `<div class="est"><i class="sem ${A && o && hoyMin <= o.hasta ? 'ok' : 'neu'}"></i><span>Boletín del INAMHI</span><b>${inamhi}</b></div>`;
+  const N = D.nowcast;
+  if (N) {
+    let t;
+    if (N.estado === 'verificado') t = `<b>Verificada.</b> En los últimos ${N.n} casos acertó ${N.ok} (${N.precision}%). Cuenta como acierto que la lluvia empiece a la hora prevista, con ${N.ventana_min} min de margen.`;
+    else if (N.estado === 'oculto') t = `<b>Oculta.</b> En los últimos ${N.n} casos acertó solo ${N.ok} (${N.precision}%), menos de ${N.min_precision}%. No la mostramos hasta que mejore.`;
+    else t = `<b>En pruebas.</b> Llevamos ${N.n} de ${N.min_casos} casos comprobados${N.n ? ` (acertó ${N.ok}, ${N.precision}%)` : ''}. Hasta completarlos la mostramos como referencia y no enviamos avisos al teléfono.`;
+    if (N.base != null) t += ` Sin avisar nada, a una ciudad seca le llega lluvia en los siguientes 40 minutos el ${N.base}% de las veces: ese es el punto de comparación.`;
+    if (N.cobertura != null) t += ` De las lluvias nuevas que empezaron en las ciudades, anticipamos ${N.detectados} de ${N.eventos} (${N.cobertura}%).`;
+    h += `<h4>Lluvia en camino</h4><p class="nota">${t} Se comprueba con la lluvia que estima el satélite, no con pluviómetros.</p>`;
+  }
+  return `<details id="estado"><summary>Estado de los datos</summary>${h}</details>`;
+}
+
 // ---------- cómo funciona ----------
 function htmlComo() {
   const pasos = [
@@ -3720,8 +3864,8 @@ function htmlComo() {
     ['📝', 'Hacemos un examen sin trampa', 'Guardamos los últimos 10 días sin usarlos para aprender y vemos cómo nos habría ido. Solo aceptamos un ajuste si acierta más que antes.'],
     ['🔁', 'Aprende solo', 'Todo se recalcula cada día con los últimos 45 días, así se adapta al invierno y al verano. Lo aprendido se guarda en público en el repositorio.'],
     ['👀', 'Corrige con lo que pasa ahora', 'Si el satélite o varias personas cerca de ti ven lluvia, las próximas horas se corrigen al instante.'],
-    ['🧭', 'Lluvia en camino', 'Seguimos el movimiento de la lluvia en las imágenes del satélite de la última hora y lo extendemos hacia adelante. Solo mostramos "llegaría en X min" donde ese movimiento demostró funcionar con datos reales de los últimos 30 minutos. Sirve para la próxima hora, no más.'],
-    ['📊', 'Tablero de aciertos', 'En la pestaña "Aciertos" mostramos, día por día, lo que dijimos y lo que pasó, incluidos los fallos. Así puedes juzgar por ti mismo si ClearSky acierta.'],
+    ['🧭', 'Lluvia en camino', 'Seguimos el movimiento de la lluvia en las imágenes del satélite de la última hora y lo extendemos hacia adelante. Solo lo mostramos donde ese movimiento demostró funcionar con datos reales de los últimos 30 minutos, y además comprobamos cada predicción: si la lluvia llegó a la hora prevista (±20 min). Mientras no tenga 30 casos comprobados aparece como "en pruebas" y no cambia el titular ni envía avisos; si acierta menos de la mitad de las veces, se oculta. Sirve para la próxima hora, no más.'],
+    ['📊', 'Tablero de aciertos', 'En la tarjeta "Cómo nos fue esta semana" mostramos, día por día, lo que dijimos y lo que pasó, incluidos los fallos. Así puedes juzgar por ti mismo si ClearSky acierta.'],
     ['🌡️', 'Calor', 'Comparamos cada hora la temperatura y la humedad con las del aeropuerto y corregimos el error típico de los modelos. Con esos valores calculamos la sensación térmica (índice de calor de la NOAA). Desde 32° hay que tomar precauciones. Hay onda de calor cuando se esperan 3 días o más con máximas 2° por encima de lo normal del último mes en tu zona.'],
   ];
   return '<div class="como">' + pasos.map(([e, t, x], i) => `<div class="paso"><div class="pn" aria-hidden="true">${e}</div><div><b>${i + 1}. ${t}</b><p>${x}</p></div></div>`).join('') +
@@ -3863,7 +4007,7 @@ function pie() {
     `Pronóstico combinado de ${KEYS.length} modelos y verificado cada día. <a href="#como" id="vercomo">¿Cómo funciona?</a><br>` +
     `Para emergencias sigue siempre las alertas oficiales de la Secretaría de Gestión de Riesgos y del INAMHI.<br>` +
     `Datos: <a href="https://open-meteo.com/" rel="noopener">Open-Meteo.com</a> (CC BY 4.0) · Observaciones: Iowa Environmental Mesonet · Satélite y lluvia observada: NOAA (GOES, Enterprise Rain Rate) · Mapa y barrios: © OpenStreetMap${mc} · ` +
-    `<a href="${D.repo}" rel="noopener">Código abierto</a>`;
+    `<a href="${D.repo}" rel="noopener">Código disponible</a> · <a href="${D.repo}/blob/main/LICENSE" rel="noopener">licencia PolyForm Noncommercial</a>`;
   const vc = $('#vercomo'); if (vc) vc.onclick = e => { e.preventDefault(); const d = $('#como'); if (d) { d.open = true; d.scrollIntoView({behavior: 'smooth', block: 'start'}); } };
 }
 function toast(msg, accion, fn) {
@@ -3889,6 +4033,7 @@ async function refrescarDatos(forzar) {
           if (estado.ubic) { try { const c = JSON.parse(leer('cc_ubic_cache') || 'null'); if (c) estado.ubic = construirUbic(c); } catch (e) {} } } }
     }
     if (estado.ubic && Date.now() - (estado.ubic.t || 0) > 20 * 60 * 1000) { refrescando = false; await cargarUbicacion({silencioso: true}); }
+    if (esLugar(estado.vista)) { const l = lugaresGuardados().find(x => 'l:' + x.id === estado.vista), c = l && estado.lugares[l.id]; if (l && (!c || Date.now() - c.t > 20 * 60 * 1000)) { refrescando = false; await cargarLugar(l, true); } }
     if (ctx && ctx.ahora !== ahoraISO(ctx.v.offset)) cambio = true;      // pasó la hora: avanzar el pronóstico
     if (cambio && ctx && $('#sheet').hidden) render();
     if (estado.rep) { estado.rep.t = 0; resumenFeedback(); }             // solo redibuja si cambia lo que se ve
@@ -3964,6 +4109,12 @@ async function inicio() {
   let rz, ancho = innerWidth;
   addEventListener('resize', () => { clearTimeout(rz); rz = setTimeout(() => { if (innerWidth !== ancho && ctx) { ancho = innerWidth; pintarGrafica(); if (mapa) mapa.invalidateSize(); if (mapaSat) mapaSat.invalidateSize(); } }, 200); });
   sugerirInstalar();
+  try {                                                    // la persona llegó desde un aviso de lluvia: le preguntamos si le llovió
+    if (new URLSearchParams(location.search).get('q') === 'll') {
+      history.replaceState(null, '', location.pathname + location.hash);
+      setTimeout(() => toast('¿Llovió donde estás? Tu respuesta ayuda a comprobar los avisos.', 'Responder', abrirReporte), 2500);
+    }
+  } catch (e) {}
 }
 // ---------- v15 capa ahora: AHORA (rayos y lluvia observada) y OFICIAL (INAMHI) ----------
 // Se engancha a render() y pie() sin tocar el resto de la página. Si algo falla aquí, la página sigue igual.
@@ -4055,7 +4206,7 @@ html[data-tema=claro] .ah-rayo{background:linear-gradient(90deg,rgba(250,204,21,
 
   // ---------- aviso oficial ----------
   function provDe(v) {
-    if (estado.vista !== 'ubic') return PROV_CIUDAD[v.nombre] || PROV_CIUDAD[v.ref] || null;
+    if (estado.vista !== 'ubic' && !esLugar(estado.vista)) return PROV_CIUDAD[v.nombre] || PROV_CIUDAD[v.ref] || null;   // ciudades; en tu ubicación y en lugares guardados se consulta la provincia real del punto
     const k = 'cc_prov_' + v.lat.toFixed(1) + ',' + v.lon.toFixed(1);
     if (k in provCache) return provCache[k];
     const g = leer(k); if (g) return (provCache[k] = g);
@@ -4132,21 +4283,21 @@ html[data-tema=claro] .ah-rayo{background:linear-gradient(90deg,rgba(250,204,21,
       if (sub) sub.textContent = `${ry.n20} rayos en los últimos 20 min a menos de ${ry.radio} km. Si oyes truenos, busca refugio bajo techo.`;
       if (ic) ic.innerHTML = icono('tormenta', 64);
     }
-    // lluvia en camino (extrapolación del movimiento medido por el satélite)
-    let nc = null; try { nc = v.lat != null ? nowcast(v.lat, v.lon) : null; } catch (e) {}
+    // lluvia en camino: se muestra según lo que dice la verificación (ahora.json -> nowcast): en pruebas, verificada u oculta
+    const N = (AH && AH.nowcast) || null, estN = N && N.estado ? N.estado : 'pruebas';
+    let nc = null; try { nc = v.lat != null && estN !== 'oculto' ? nowcast(v.lat, v.lon) : null; } catch (e) {}
     if (nc && nc.estado === 'llega' && !(ry && ry.n20 >= 5) && !evidencia(v).llueve) {
-      const cuando = nc.min < 10 ? 'unos minutos' : `~${nc.min} min`;
-      piezas.push(`<div class="ah-b ah-nc" role="status"><span class="etq pr">En camino</span><span><b>🌧️ La lluvia llegaría en ${cuando}</b> · viene del ${nc.desde} a ${nc.vel} km/h · ${intensidad(nc.mm)}` +
-        `<small>Extrapolación del movimiento que mide el satélite (NOAA) en la última hora. Puede cambiar.</small></span></div>`);
-      if (nc.min <= 60) {
+      const cuando = nc.min < 10 ? 'unos minutos' : `~${nc.min} min`, ver = estN === 'verificado';
+      const nota = ver ? `Acertó ${Math.round(N.precision / 10)} de cada 10 veces en las últimas ${N.n} comprobaciones. Extrapolación del movimiento que mide el satélite (NOAA); puede cambiar.`
+        : `Función en pruebas: todavía no sabemos cuántas veces acierta (${N ? N.n : 0} de ${N ? N.min_casos : 30} casos comprobados). Tómala solo como referencia.`;
+      piezas.push(`<div class="ah-b ah-nc${ver ? '' : ' prueba'}" role="status"><span class="etq ${ver ? 'pr' : 'pb'}">${ver ? 'En camino' : 'En pruebas'}</span><span><b>🌧️ La lluvia llegaría en ${cuando}</b> · viene del ${nc.desde} a ${nc.vel} km/h · ${intensidad(nc.mm)}` +
+        `<small>${nota}</small></span></div>`);
+      if (ver && nc.min <= 60) {                      // solo cambia el titular cuando la función demostró acertar
         const tit = document.querySelector('.tit'), sub = document.querySelector('.sub'), ic = document.querySelector('.hero .ic');
         if (tit) tit.textContent = `Lluvia llegando en ${cuando}`;
         if (sub) sub.textContent = `Viene del ${nc.desde}, intensidad ${intensidad(nc.mm)}. Según el movimiento de la lluvia en la última hora.`;
         if (ic) ic.innerHTML = icono('lluvia', 64);
       }
-    } else if (nc && nc.estado === 'termina' && nc.min <= 60 && evidencia(v).llueve) {
-      piezas.push(`<div class="ah-b ah-nc" role="status"><span class="etq pr">En camino</span><span><b>☀️ La lluvia se alejaría en ~${Math.max(nc.min, 5)} min</b>` +
-        `<small>Extrapolación del movimiento que mide el satélite (NOAA). Puede cambiar.</small></span></div>`);
     }
     const of = oficialPara(v);
     if (of) piezas.push(htmlOficial(of, hoy, v));
@@ -4165,16 +4316,16 @@ html[data-tema=claro] .ah-rayo{background:linear-gradient(90deg,rgba(250,204,21,
 
   // ---------- datos: ahora.json (se actualiza cada 10 minutos) ----------
   function aplicarLluvia() {
-    if (AH && AH.lluvia && (!D.ahora || (D.ahora.t || '') < AH.lluvia.t)) { D.ahora = AH.lluvia; SAT = null; }
+    if (AH && AH.lluvia && (!D.ahora || (D.ahora.t || '') <= AH.lluvia.t)) { D.ahora = AH.lluvia; D.ahora_prev = AH.lluvia_prev || null; SAT = null; }
   }
   async function cargar() {
     if (!RAW) return;
     try {
       const r = await fetch(RAW, {cache: 'no-store'});
       if (!r.ok) return;
-      const j = await r.json(), f = JSON.stringify([j.generado, j.rayos && j.rayos.t, j.oficial && j.oficial.id, j.lluvia && j.lluvia.t]);
+      const j = await r.json(), f = JSON.stringify([j.generado, j.rayos && j.rayos.t, j.oficial && j.oficial.id, j.lluvia && j.lluvia.t, j.nowcast && j.nowcast.estado, j.nowcast && j.nowcast.n]);
       if (f === firma) return;
-      firma = f; AH = j; D.rayos = j.rayos; D.oficial = j.oficial; D.movimiento = j.movimiento || null;
+      firma = f; AH = j; D.ah = j; D.rayos = j.rayos; D.oficial = j.oficial; D.movimiento = j.movimiento || null; D.nowcast = j.nowcast || null;
       if (ctx && $('#sheet').hidden) render(); else montar();
     } catch (e) {}
   }
@@ -4231,6 +4382,12 @@ def main():
         print(f"Observaciones propias (satélite y rayos): {n} horas nuevas")
     except Exception as e:
         log_error(f"observaciones propias: {e} (todavía no hay datos de la rama ahora o no responde)")
+    try:
+        n = actualizar_nowcast()
+        if n:
+            print(f"Lluvia en camino: {n} predicciones comprobadas archivadas")
+    except Exception as e:
+        log_error(f"archivo de la lluvia en camino: {e} (todavía no existe nowcast.json en la rama ahora o no responde)")
     if "--verificar" in sys.argv or toca_verificar(p):
         verificar(p)
     resultados = {}

@@ -1,16 +1,22 @@
 # -*- coding: utf-8 -*-
+# Required Notice: Copyright (c) 2026 Robert Alejandro Figueroa Pazmiño (https://github.com/suirobert/ClearSky)
+# Licencia: PolyForm Noncommercial 1.0.0 (ver el archivo LICENSE). Uso no comercial.
 """
-ClearSky · capa AHORA y OFICIAL (v17)
+ClearSky · capa AHORA y OFICIAL (v19)
 -------------------------------------
 Se ejecuta cada 10 minutos (workflow ahora.yml) y genera dos archivos:
 
   ahora.json  (lo lee la página y el servicio de avisos)
     - lluvia:     lluvia que el satélite estima en este momento (NOAA Enterprise Rain Rate, GOES-19)
+    - lluvia_prev: las imágenes de hace 60 y 30 min (misma cuadrícula) para la animación "Lloviendo ahora"
+    - nowcast:    cuántas veces acertó el "llegaría en X min" (precisión, base y cobertura) y su estado:
+                  pruebas (menos de 30 casos comprobados) / verificado (50% o más) / oculto (menos de 50%)
     - movimiento: hacia dónde se mueve la lluvia (por cuadros de 2°), medido con 3 imágenes (t, t-30, t-60 min).
                   Solo se incluyen los cuadros donde la extrapolación demostró ser mejor que "no se mueve".
     - rayos:      descargas eléctricas de los últimos 20-30 min (GOES-19 GLM, NOAA)
     - oficial:    último boletín meteorológico del INAMHI
 
+  nowcast.json (estado de la verificación del "llegaría en X min"; el workflow lo conserva entre ejecuciones)
   hist.json  (lo usa el script horario para VERIFICAR con observaciones propias)
     - lluvia por ciudad cada 10 min (máximo en ~5 km) y rayos por ciudad en cada franja de 10 min completa.
     Se conservan 72 h; el script horario los pasa a datos/observado/ para siempre.
@@ -59,6 +65,19 @@ RAYOS_MAX_CELDAS = 1500
 RAYOS_ARCHIVOS_FRANJA = 27                 # de 30 archivos (20 s) por franja de 10 min: mínimo para darla por completa
 
 HIST_HORAS = 72
+URL_NC = f"https://raw.githubusercontent.com/{REPO}/ahora/nowcast.json"
+
+# --- verificación de "lluvia en camino" ---
+NC_MAX_MIN = 60                  # solo se registran llegadas previstas en menos de 60 min (lo que muestra la página)
+NC_VENTANA_MIN = 20              # acierto: la lluvia empezó a la hora prevista, con ±20 min de margen
+NC_LLUVIA_MM = 1.0               # mm/h a partir de los cuales el satélite "ve lluvia"
+NC_MIN_CASOS = 30                # casos comprobados antes de dar la función por "verificada"
+NC_MIN_PRECISION = 0.50          # precisión mínima para mostrarla como verificada
+NC_ROLLING = 100                 # el estado se calcula con los últimos 100 casos (se adapta a la temporada)
+NC_REPETIR_MIN = 30              # no se registra otra predicción de la misma ciudad antes de 30 min
+NC_PRED_HORAS = 8                # cuánto se conservan las predicciones (para medir la cobertura)
+NC_HECHAS_MAX = 600
+NC_MIN_EVENTOS = 10              # lluvias nuevas necesarias para publicar la cobertura
 
 CIUDADES = {
     "Guayaquil": (-2.1894, -79.8891), "Quito": (-0.1807, -78.4678), "Manta": (-0.9677, -80.7089),
@@ -461,13 +480,15 @@ def lluvia_y_movimiento():
             (g10, g05), _ = leer_lluvia_nc(r_a, (AHORA_PASO, PASO_FINO))
         except Exception as e:
             raise RuntimeError(f"{e} (archivo {lista[0]['key']})")
-        mov, motivo = None, None
+        mov, motivo, previas = None, None, []
         tf = lambda a: iso_local(_inicio_err(a["key"])) if a and _inicio_err(a["key"]) else None
         diag = {"imagenes": {"ahora": iso_local(utc), "hace30": tf(previos["B"]), "hace60": tf(previos["C"])}}
         if r_b and r_c:
             try:
-                (B,), _ = leer_lluvia_nc(r_b, (PASO_FINO,))
-                (C,), _ = leer_lluvia_nc(r_c, (PASO_FINO,))
+                (Bg, B), _ = leer_lluvia_nc(r_b, (AHORA_PASO, PASO_FINO))
+                (Cg, C), _ = leer_lluvia_nc(r_c, (AHORA_PASO, PASO_FINO))
+                cuadro = lambda g, a: {"t": iso_local(_inicio_err(a["key"])), "q": base64.b64encode(np.clip(np.round(g * 2), 0, 255).astype("uint8").tobytes()).decode("ascii")}
+                previas = [cuadro(Cg, previos["C"]), cuadro(Bg, previos["B"])]      # del más viejo al más nuevo
                 mov, d = movimiento_lluvia(g05, B, C)
                 diag.update(d)
                 if mov is None:
@@ -493,6 +514,7 @@ def lluvia_y_movimiento():
         iy, ix = int((n0 - la) / PASO_FINO), int((lo - w0) / PASO_FINO)
         sub = g05[max(iy - 1, 0):iy + 2, max(ix - 1, 0):ix + 2]
         ciudades[c] = round(float(sub.max()), 1) if sub.size else None
+    lluvia["_previas"] = previas
     return lluvia, mov, motivo, ciudades, utc, diag
 
 
@@ -753,6 +775,163 @@ def aviso_inamhi():
 
 
 # =====================================================================================================
+#  5. "LLUVIA EN CAMINO": PREDICCIÓN Y VERIFICACIÓN CON CASOS REALES
+# =====================================================================================================
+def _mov_en(M, lat, lon):
+    """Movimiento medio (km/h hacia el este y el norte) alrededor del punto, solo de cuadros que superaron la validación."""
+    if not M or not M.get("u"):
+        return None
+    ty, tx = int((M["lat0"] - lat) // M["tile"]), int((lon - M["lon0"]) // M["tile"])
+    su = sv = sw = 0.0
+    for y in range(ty - 1, ty + 2):
+        for x in range(tx - 1, tx + 2):
+            if y < 0 or x < 0 or y >= M["ny"] or x >= M["nx"]:
+                continue
+            u, v = M["u"][y][x], M["v"][y][x]
+            if u is None or v is None:
+                continue
+            pe = 3 if (y == ty and x == tx) else 1
+            su, sv, sw = su + u * pe, sv + v * pe, sw + pe
+    return (su / sw, sv / sw) if sw else None
+
+
+def nowcast_punto(lluvia, q, M, lat, lon, edad_min):
+    """Misma cuenta que la página y el servicio de avisos: extiende el movimiento medido hacia adelante y mira cuándo
+       le llegaría a este punto la lluvia que hoy está contra el viento. Devuelve {min, mm, vel} o None."""
+    m = _mov_en(M, lat, lon)
+    if not m or edad_min > 35:
+        return None
+    u, v = m
+    vel = math.hypot(u, v)
+    if vel < 4:
+        return None
+    cl = math.cos(math.radians(lat))
+
+    def valor(tt):
+        t = (edad_min + tt) / 60
+        la, lo = lat - v * t / 111.32, lon - u * t / (111.32 * cl)
+        iy, ix = int((lluvia["lat0"] - la) // lluvia["paso"]), int((lo - lluvia["lon0"]) // lluvia["paso"])
+        return float(q[iy, ix]) * lluvia["escala"] if 0 <= iy < lluvia["ny"] and 0 <= ix < lluvia["nx"] else 0.0
+
+    pasos = [(tt, valor(tt)) for tt in range(0, 91, 5)]
+    if pasos[0][1] >= NC_LLUVIA_MM:
+        return None                                              # ya llueve
+    for i in range(1, len(pasos) - 1):
+        if pasos[i][1] >= NC_LLUVIA_MM and pasos[i + 1][1] >= NC_LLUVIA_MM:
+            return {"min": pasos[i][0], "mm": max(p[1] for p in pasos[i:i + 7]), "vel": round(vel)}
+    return None
+
+
+def _t(iso):
+    return datetime.strptime(iso, "%Y-%m-%dT%H:%M")
+
+
+def cargar_nc():
+    try:
+        ruta = os.environ.get("CC_NC_PREVIO")
+        texto = open(ruta, encoding="utf-8").read() if ruta and os.path.exists(ruta) else http_get(URL_NC, intentos=2, timeout=30)
+        e = json.loads(texto)
+        if isinstance(e, dict) and e.get("v") == 1:
+            return e
+    except Exception:
+        pass
+    return {"v": 1, "preds": [], "hechas": [], "tot": {"n": 0, "ok": 0, "eventos": 0, "detectados": 0}, "ev_hasta": None}
+
+
+def _series(hist):
+    """ciudad -> {hora(iso): mm/h máximos en ~5 km} a partir del historial de lluvia de cada 10 min."""
+    out = {c: {} for c in hist["ciudades"]}
+    for slot, vals in hist["lluvia"].items():
+        for c, v in zip(hist["ciudades"], vals):
+            if v is not None:
+                out[c][slot] = float(v)
+    return out
+
+
+def verificar_nc(est, hist, ahora_loc, lluvia, q, mov, edad_min):
+    """1) comprueba las predicciones que ya cumplieron su plazo, 2) mide cuántas lluvias nuevas se anticiparon y 3) registra
+       las predicciones de ahora. Devuelve el resumen que se publica en ahora.json."""
+    series = _series(hist)
+    paso = timedelta(minutes=10)
+    # 1) predicciones vencidas -> acierto (llovió a la hora prevista ±20 min) o fallo
+    for p in est["preds"]:
+        if p.get("r") is not None:
+            continue
+        centro = _t(p["t0"]) + timedelta(minutes=p["m"])
+        fin = centro + timedelta(minutes=NC_VENTANA_MIN)
+        if ahora_loc < fin + timedelta(minutes=15):
+            continue                                            # todavía faltan muestras de la ventana
+        ini = max(_t(p["t0"]), centro - timedelta(minutes=NC_VENTANA_MIN))
+        vals = [v for k, v in series.get(p["c"], {}).items() if ini <= _t(k) <= fin]
+        if len(vals) < 3:
+            p["r"] = -1                                         # sin datos suficientes: no cuenta ni a favor ni en contra
+            continue
+        p["r"] = 1 if max(vals) >= NC_LLUVIA_MM else 0
+        est["hechas"].append({"c": p["c"], "t0": p["t0"], "m": p["m"], "mm": p["mm"], "r": p["r"]})
+        est["tot"]["n"] += 1
+        est["tot"]["ok"] += p["r"]
+    # 2) cobertura: de las lluvias que EMPEZARON en una ciudad, ¿cuántas se anticiparon entre 60 y 10 min antes (±20 min)?
+    limite = ahora_loc - timedelta(minutes=70)
+    desde = _t(est["ev_hasta"]) if est.get("ev_hasta") else limite
+    if desde < limite:
+        for c, serie in series.items():
+            for k in sorted(serie):
+                T = _t(k)
+                if not (desde < T <= limite) or serie[k] < NC_LLUVIA_MM:
+                    continue
+                antes = [serie.get((T - paso * i).strftime("%Y-%m-%dT%H:%M")) for i in range(1, 5)]
+                if sum(v is not None for v in antes) < 3 or any(v is not None and v >= NC_LLUVIA_MM for v in antes):
+                    continue                                    # no es el comienzo de una lluvia nueva
+                est["tot"]["eventos"] += 1
+                if any(p["c"] == c and T - timedelta(minutes=60) <= _t(p["t0"]) <= T - timedelta(minutes=10)
+                       and abs((_t(p["t0"]) + timedelta(minutes=p["m"]) - T).total_seconds()) <= NC_VENTANA_MIN * 60 for p in est["preds"]):
+                    est["tot"]["detectados"] += 1
+    est["ev_hasta"] = limite.strftime("%Y-%m-%dT%H:%M")
+    # 3) predicciones de ahora (una por ciudad cada 30 min, para que no cuente 3 veces el mismo caso)
+    nuevas = 0
+    for c, (la, lo) in CIUDADES.items():
+        reciente = any(p["c"] == c and _t(p["t0"]) > ahora_loc - timedelta(minutes=NC_REPETIR_MIN) for p in est["preds"])
+        if reciente:
+            continue
+        if any(v >= NC_LLUVIA_MM for k, v in series.get(c, {}).items() if _t(k) >= ahora_loc - timedelta(minutes=20)):
+            continue                                            # ya llueve cerca: acertar "va a llover" sería trivial, no se registra
+        nc = nowcast_punto(lluvia, q, mov, la, lo, edad_min)
+        if nc and nc["min"] <= NC_MAX_MIN:
+            est["preds"].append({"c": c, "t0": ahora_loc.strftime("%Y-%m-%dT%H:%M"), "m": nc["min"], "mm": round(nc["mm"], 1), "r": None})
+            nuevas += 1
+    corte = ahora_loc - timedelta(hours=NC_PRED_HORAS)
+    est["preds"] = [p for p in est["preds"] if _t(p["t0"]) >= corte]
+    est["hechas"] = est["hechas"][-NC_HECHAS_MAX:]
+    return resumen_nc(est, series, nuevas)
+
+
+def resumen_nc(est, series, nuevas=0):
+    h = est["hechas"][-NC_ROLLING:]
+    n, ok = len(h), sum(1 for x in h if x["r"] == 1)
+    prec = ok / n if n else None
+    # frecuencia con la que, sin avisar nada, llega lluvia a una ciudad seca en los siguientes 40 min (punto de comparación)
+    paso, hay, tot = timedelta(minutes=10), 0, 0
+    for serie in series.values():
+        for k, v in serie.items():
+            if v >= NC_LLUVIA_MM:
+                continue
+            sig = [serie.get((_t(k) + paso * i).strftime("%Y-%m-%dT%H:%M")) for i in range(1, 5)]
+            if sum(x is not None for x in sig) < 3:
+                continue
+            tot += 1
+            hay += any(x is not None and x >= NC_LLUVIA_MM for x in sig)
+    base = hay / tot if tot >= 200 else None
+    t = est["tot"]
+    estado = "pruebas" if n < NC_MIN_CASOS else ("verificado" if prec >= NC_MIN_PRECISION else "oculto")
+    return {"estado": estado, "n": n, "ok": ok, "precision": None if prec is None else round(prec * 100),
+            "base": None if base is None else round(base * 100, 1), "casos_totales": t["n"], "min_casos": NC_MIN_CASOS,
+            "min_precision": round(NC_MIN_PRECISION * 100), "ventana_min": NC_VENTANA_MIN,
+            "eventos": t["eventos"], "detectados": t["detectados"],
+            "cobertura": round(t["detectados"] / t["eventos"] * 100) if t["eventos"] >= NC_MIN_EVENTOS else None,
+            "pendientes": sum(1 for p in est["preds"] if p.get("r") is None), "nuevas": nuevas}
+
+
+# =====================================================================================================
 #  4. HISTORIAL PARA VERIFICAR (hist.json)
 # =====================================================================================================
 def cargar_hist():
@@ -787,11 +966,14 @@ def main():
     carpeta = destino if os.path.isdir(destino) else os.path.dirname(os.path.abspath(destino))
     ruta_ahora = os.path.join(destino, "ahora.json") if os.path.isdir(destino) else destino
     ruta_hist = os.path.join(carpeta, "hist.json")
-    salida = {"generado": iso_local(ahora_utc()), "lluvia": None, "movimiento": None, "mov_diag": None, "rayos": None, "oficial": None, "errores": []}
-    utc_frame, lluvia_c, franjas = None, None, None
+    ruta_nc = os.path.join(carpeta, "nowcast.json")
+    salida = {"generado": iso_local(ahora_utc()), "lluvia": None, "lluvia_prev": None, "movimiento": None, "mov_diag": None, "nowcast": None,
+              "rayos": None, "oficial": None, "errores": []}
+    utc_frame, lluvia_c, franjas, hist = None, None, None, None
     t0 = time.time()
     try:
         salida["lluvia"], salida["movimiento"], motivo, lluvia_c, utc_frame, diag = lluvia_y_movimiento()
+        salida["lluvia_prev"] = salida["lluvia"].pop("_previas", None) or None
         salida["mov_diag"] = dict(diag or {}, motivo=motivo)        # se guarda en ahora.json: ya no hay que mirar el log
         print(f"  lluvia: OK ({time.time() - t0:.0f} s)")
         if salida["movimiento"]:
@@ -826,6 +1008,25 @@ def main():
     except Exception as e:
         salida["errores"].append(f"historial: {e}")
         print(f"  historial: ERROR {e}")
+    try:
+        est = cargar_nc()
+        if hist is not None and salida["lluvia"]:
+            import numpy as np
+            L = salida["lluvia"]
+            qn = np.frombuffer(base64.b64decode(L["q"]), dtype=np.uint8).reshape(L["ny"], L["nx"])
+            edad = max(0.0, (ahora_utc() - (utc_frame or ahora_utc())).total_seconds() / 60)
+            salida["nowcast"] = verificar_nc(est, hist, a_local(ahora_utc()).replace(second=0, microsecond=0), L, qn, salida["movimiento"], edad)
+            tmp = ruta_nc + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(est, fh, ensure_ascii=False, separators=(",", ":"))
+            os.replace(tmp, ruta_nc)
+            r = salida["nowcast"]
+            print(f"  lluvia en camino: {r['estado']} ({r['ok']} de {r['n']} aciertos; base {r['base']}%; cobertura {r['cobertura']}%; {r['nuevas']} predicciones nuevas)")
+        else:
+            salida["nowcast"] = resumen_nc(est, _series(hist) if hist else {})
+    except Exception as e:
+        salida["errores"].append(f"verificación de la lluvia en camino: {e}")
+        print(f"  lluvia en camino: ERROR {e}")
     tmp = ruta_ahora + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(salida, fh, ensure_ascii=False, separators=(",", ":"))
