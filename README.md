@@ -29,7 +29,8 @@ signifique de verdad 3 de cada 10, **y publica cada día lo que dijo contra lo q
 - **Reportar** el clima (soleado, despejado, nublado, llovizna, lluvia, aguacero, tormenta) y, aparte, «¿Algo más?»: **escucho truenos** o **calle inundada**. También **¿Llovió donde estás?** al abrir un aviso de lluvia.
 - **Avisos al teléfono a tu medida**: eliges entre lluvia, tormentas eléctricas y avisos oficiales.
 - Aviso de **fuera de Ecuador** (por ejemplo, VPN): sin datos de Ecuador y con el pronóstico marcado como _no verificado_.
-- Compartir, modo claro/oscuro, instalable como app, se actualiza sola.
+- **Compartir**: genera una imagen (para WhatsApp, Instagram, etc.) con el mismo diseño de la página y en el tema que estés usando: lugar, temperatura y sensación, titular, etiquetas, **próximas horas con íconos**, **próximos 5 días con barra de rango**, aviso oficial o de rayos si lo hay, cuánto acertamos esta semana y **la hora en que se generó**. Fuera de Ecuador no dice que está verificado. No incluye los reportes de la gente (no verificados). Mide hasta 1920 px de alto (cabe como historia).
+- Modo claro/oscuro, instalable como app, se actualiza sola.
 
 ## Cómo funciona (y cómo sabemos que acierta)
 
@@ -70,6 +71,19 @@ pasando ahora**, así que las reglas son más estrictas:
 - **No cuentan como lluvia ni como seco** al comparar con el pronóstico: oír un trueno no significa que llueva donde estás, y una calle puede seguir inundada cuando ya no llueve.
 - Cada categoría (clima, truenos, inundación) tiene su **propio tiempo de espera**: reportar lluvia no impide reportar una inundación.
 - **Límite conocido:** muchas conexiones móviles comparten la misma dirección de red, y el servicio cuenta personas por conexión. Dos personas con la misma conexión cuentan como una: se muestran _menos_ avisos de los que podría haber, no más.
+
+## Cómo comprobar que de verdad aprende
+
+Que los números guardados cambien no prueba nada. Lo que importa es que los pronósticos **publicados** acierten más, y eso solo se puede medir con datos que el sistema no usó para aprender:
+
+```powershell
+python auditar_aprendizaje.py                                   # todas las ciudades con datos
+python auditar_aprendizaje.py --ciudad Guayaquil --anticipaciones 1,6,24
+```
+
+Compara lo que mostró la página (`datos/historial`) con lo que observaron los aeropuertos (`datos/observaciones`): el pronóstico publicado contra **el mismo pronóstico sin calibrar** y contra **decir siempre el promedio**, con un intervalo de confianza del 90% (remuestreando días enteros, no horas sueltas) y un veredicto honesto: _mejor_, _peor_ o _no se distingue del azar todavía_. Con menos de 14 días no concluye. También muestra cómo ha evolucionado lo aprendido leyendo el historial de git de `datos/pesos.json`.
+
+Límites: mide la lluvia en el aeropuerto de cada ciudad y solo separa el efecto de la calibración (los pesos de los modelos solo se evalúan en el «examen sin trampa», que es algo optimista porque elige la mejor de varias combinaciones sobre los mismos 10 días). En épocas secas hay poca evidencia y es normal que el veredicto sea «no se distingue».
 
 ## Archivos de datos
 

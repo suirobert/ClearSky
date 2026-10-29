@@ -25,6 +25,7 @@ Página (index.html, generada aquí y dibujada con JavaScript):
     satelital, ambas solo cuando hay suficientes días acumulados y pasan el examen (datos/observado/).
   - Tablero público de aciertos día por día (tarjeta "Cómo nos fue esta semana") y selector de rango 24 h / 3 días / 7 días.
   - Reportes de la gente de truenos e inundación: solo se muestran si coinciden 2 o más personas cerca (siempre "no verificado").
+  - Compartir: imagen con el mismo diseño de la página (tema claro u oscuro, íconos, tira de horas y días) y con la hora en que se generó.
   - La ubicación sigue a la persona: se vuelve a leer el GPS al abrir, al volver a la pestaña y cada 5 minutos, y si se movió
     más de 300 m se recalcula el lugar y el pronóstico (con un botón para forzarlo).
   - "Lluvia en camino" con verificación propia (ahora.py): solo se muestra como verificada si acierta; mapa que se reproduce solo.
@@ -3119,6 +3120,16 @@ document.addEventListener('pointerdown', e => { const g = $('#graf'); if (g && g
 
 // ---------- días ----------
 function porDia(filas, ahora) { const d = {}; for (const r of filas) if (r.hora >= ahora) (d[r.hora.slice(0, 10)] ||= []).push(r); return d; }
+// ícono de un día: tormenta si es probable; si no, lluvia o llovizna; si no, el cielo más frecuente de las horas de sol
+function iconoDia(rs, top, tsTop) {
+  const diur = rs.filter(r => !esNoche(r.hora)), base = diur.length ? diur : rs;
+  let ic;
+  if ((tsTop.prob_ts || 0) >= 30) ic = 'tormenta';
+  else if (top.prob >= 20 || top.prob_dz >= 50) ic = condicion(top)[0];
+  else { const cuenta = {}; base.map(r => cielo(r)[0]).forEach(c => cuenta[c] = (cuenta[c] || 0) + 1);
+    ic = Object.entries(cuenta).sort((a, b) => b[1] - a[1])[0][0]; }
+  return {luna: 'sol', parcial_noche: 'parcial_dia'}[ic] || ic;
+}
 function htmlDias(dias, filas, ahora, hoy, cfg, off, onda) {
   const ts = filas.filter(r => r.temp != null).map(r => r.temp);
   const tmn = Math.min(...ts), tmx = Math.max(...ts), rng = Math.max(tmx - tmn, 1);
@@ -3127,13 +3138,7 @@ function htmlDias(dias, filas, ahora, hoy, cfg, off, onda) {
     const top = rs.reduce((a, b) => (b.prob > a.prob || (b.prob === a.prob && b.mm > a.mm)) ? b : a);
     const tsTop = rs.reduce((a, b) => (b.prob_ts || 0) > (a.prob_ts || 0) ? b : a);
     const t = rs.filter(r => r.temp != null).map(r => r.temp), mn = Math.min(...t), mx = Math.max(...t);
-    const diur = rs.filter(r => !esNoche(r.hora)), base = diur.length ? diur : rs;
-    let ic;
-    if ((tsTop.prob_ts || 0) >= 30) ic = 'tormenta';
-    else if (top.prob >= 20 || top.prob_dz >= 50) ic = condicion(top)[0];
-    else { const cs = base.map(r => cielo(r)[0]), cuenta = {}; cs.forEach(c => cuenta[c] = (cuenta[c] || 0) + 1);
-      ic = Object.entries(cuenta).sort((a, b) => b[1] - a[1])[0][0]; }
-    ic = {luna: 'sol', parcial_noche: 'parcial_dia'}[ic] || ic;
+    const ic = iconoDia(rs, top, tsTop);
     const pct = top.prob >= 10 ? `<span class="pp">${top.prob}%</span>` : '<span class="pp off">–</span>';
     const sPico = horaPico(rs.filter(r => !esNoche(r.hora)).length ? rs.filter(r => !esNoche(r.hora)) : rs, sens), sMax = sens(sPico);
     const enOnda = onda && onda.dias.includes(d);
@@ -4079,38 +4084,160 @@ async function actualizarSuscripcion() {           // si la persona se movió, s
 }
 
 // ---------- compartir (imagen para WhatsApp y redes) ----------
+// ---------- compartir (imagen para WhatsApp y redes): el mismo diseño que la página ----------
+// Lo que dice la cabecera (titular, lugar, etiquetas, avisos) se lee de la propia página, así la imagen nunca se contradice con lo que ves.
+// Usa los colores del tema activo (claro u oscuro) y se alarga según lo que haya que mostrar. No incluye reportes de la gente (no verificados).
+const MESES_C = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic'];
 async function cargarImg(src) { return new Promise(ok => { if (!src) return ok(null); const i = new Image(); i.onload = () => ok(i); i.onerror = () => ok(null); i.src = src; }); }
+const imgsIcono = {};
+async function imagenIcono(n) {
+  if (n in imgsIcono) return imgsIcono[n];
+  const svg = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="240" height="240">${ICONOS[n] || ICONOS.nube}</svg>`)}`;
+  return imgsIcono[n] = (MC_URL[n] ? await cargarImg(MC_URL[n]) : null) || await cargarImg(svg);
+}
+async function imagenHero() {                 // el mismo ícono que se ve en la cabecera (puede ser el de tormenta o lluvia si hay un aviso)
+  const el = document.querySelector('.hero .ic img, .hero .ic svg'); if (!el) return null;
+  if (el.tagName.toLowerCase() === 'img') return cargarImg(el.src);
+  let s = new XMLSerializer().serializeToString(el); if (!/xmlns=/.test(s)) s = s.replace('<svg', '<svg xmlns="http://www.w3.org/2000/svg"');
+  return cargarImg('data:image/svg+xml;charset=utf-8,' + encodeURIComponent(s));
+}
 async function compartir() {
-  const {v, ahora, hoy, dias, prox} = ctx, [ic] = condicion(prox[0]), tit = $('.tit').textContent, sub = $('.sub').textContent;
-  const W = 1080, H = 1350, cv = document.createElement('canvas'); cv.width = W; cv.height = H;
-  const c = cv.getContext('2d'), F = '-apple-system,"Segoe UI",Roboto,Arial,sans-serif';
-  const g = c.createLinearGradient(0, 0, 0, H); g.addColorStop(0, '#0f1b33'); g.addColorStop(1, '#0b0f17'); c.fillStyle = g; c.fillRect(0, 0, W, H);
-  c.fillStyle = '#93c5fd'; c.font = `600 40px ${F}`; c.fillText('ClearSky', 70, 100);
-  c.fillStyle = '#cbd5e1'; c.font = `500 44px ${F}`; c.fillText(v.nombre, 70, 180);
-  const svg = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="240" height="240">${ICONOS[ic] || ICONOS.nube}</svg>`)}`;
-  const im = await cargarImg(MC_URL[ic]) || await cargarImg(svg); if (im) c.drawImage(im, 60, 220, 220, 220);
-  c.fillStyle = '#fff'; c.font = `200 190px ${F}`; c.fillText(`${Math.round(prox[0].temp)}°`, 320, 400);
-  c.font = `600 54px ${F}`; let y = 520;
-  const partir = (t, ancho) => { const ps = t.split(' '), out = []; let l = ''; for (const p of ps) { if (c.measureText(l + p).width > ancho && l) { out.push(l.trim()); l = ''; } l += p + ' '; } out.push(l.trim()); return out; };
-  partir(tit, W - 140).forEach(l => { c.fillText(l, 70, y); y += 66; });
-  c.fillStyle = '#9ca3af'; c.font = `400 36px ${F}`; partir(sub, W - 140).slice(0, 3).forEach(l => { c.fillText(l, 70, y); y += 48; });
-  y += 30; const p24 = prox.slice(0, 24), bw = (W - 140) / p24.length;
-  p24.forEach((r, i) => { c.fillStyle = condicion(r)[2]; c.fillRect(70 + i * bw, y, bw - 3, 50); });
-  c.fillStyle = '#9ca3af'; c.font = `400 28px ${F}`; [0, 6, 12, 18].forEach(i => p24[i] && c.fillText(i ? p24[i].hora.slice(11, 13) + 'h' : 'Ahora', 70 + i * bw, y + 90));
-  y += 150;
-  for (const [d, rs] of Object.entries(dias).slice(0, 5)) {
-    const top = rs.reduce((a, b) => b.prob > a.prob ? b : a), t = rs.map(r => r.temp).filter(x => x != null);
-    c.fillStyle = '#e5e7eb'; c.font = `500 40px ${F}`; c.fillText(nombreDia(d, hoy), 70, y);
-    c.fillStyle = '#60a5fa'; c.fillText(top.prob >= 10 ? `${top.prob}%` : '–', 520, y);
-    c.fillStyle = '#e5e7eb'; c.fillText(`${Math.round(Math.min(...t))}° / ${Math.round(Math.max(...t))}°`, 760, y); y += 70;
+  const {v, ahora, hoy, dias, prox} = ctx, k = claro();
+  const css = getComputedStyle(document.documentElement), V = (n, d) => css.getPropertyValue(n).trim() || d;
+  const P = {bg: V('--bg', '#0b0f17'), card: V('--card', '#111723'), card2: V('--card2', '#151b26'), tx: V('--tx', '#e5e7eb'), tx2: V('--tx2', '#9ca3af'),
+             tx3: V('--tx3', '#8b95a5'), acc: V('--acc', '#60a5fa'), line: V('--line', '#1a2230'),
+             ts: k ? '#7c3aed' : '#a78bfa', temp: k ? '#f59e0b' : '#fbbf24', ok: k ? '#15803d' : '#4ade80'};
+  const F = '-apple-system,"SF Pro Display","Segoe UI",Roboto,Arial,"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif';
+  const W = 1080, M = 56, IW = W - 2 * M;
+  const leer1 = s => { const e = document.querySelector(s); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+  const tit = leer1('.tit'), sub = leer1('.sub'), hs = leer1('.hero .hs');
+  let lugar = leer1('.lugar').replace(/^\S*\s/, '');                          // quita el 📍 del principio
+  if (!lugar || /Actualizando/.test(lugar)) lugar = v.nombre;
+  const act = prox[0], dentro = !(v.lat != null && !enEcuador(v));
+  // etiquetas de la cabecera con sus colores reales (sin los reportes de la gente ni el botón de aciertos)
+  const chips = [...document.querySelectorAll('.cabA .chips .chip')].filter(e => !e.classList.contains('tru') && !e.classList.contains('btnchip')).slice(0, 6)
+    .map(e => { const s = getComputedStyle(e); return {t: e.textContent.replace(/\s+/g, ' ').trim(), bg: s.backgroundColor, fg: s.color}; });
+  // un aviso arriba, por orden de importancia: rayos ahora, aviso oficial, onda de calor
+  let alerta = null;
+  const eRayo = document.querySelector('.ah-rayo > span:last-child'), eOf = document.querySelector('.ah-of .ah-t'), eCal = document.querySelector('.alerta.calor');
+  if (eRayo) alerta = {c: '#eab308', e: 'AHORA · SATÉLITE', t: eRayo.textContent.replace(/\s+/g, ' ').trim()};
+  else if (eOf) {                                    // lo más importante primero (nivel y vigencia); el nombre del fenómeno, que es lo más largo, al final
+    const b = eOf.querySelector('b'), sm = eOf.querySelector('small'), m = sm ? sm.textContent.trim() : '', i = m.lastIndexOf(' · ');
+    alerta = {c: '#f59e0b', e: 'AVISO OFICIAL · INAMHI', t: [b ? b.textContent.trim() : '', i >= 0 ? m.slice(i + 3) : m, i >= 0 ? m.slice(0, i) : ''].filter(Boolean).join(' · ')};
   }
-  c.fillStyle = '#6b7280'; c.font = `400 28px ${F}`; c.fillText('Pronóstico verificado · suirobert.github.io/ClearSky', 70, H - 60);
+  else if (eCal) alerta = {c: '#ef4444', e: 'CALOR', t: eCal.textContent.replace(/^\S+\s/, '').replace(/\s+/g, ' ').trim()};
+  const horas = [0, 3, 6, 9, 12, 15, 18, 21].map(i => prox[i]).filter(Boolean);
+  const filasDias = Object.entries(dias).slice(0, 5).map(([d, rs]) => {
+    const top = rs.reduce((a, b) => (b.prob > a.prob || (b.prob === a.prob && b.mm > a.mm)) ? b : a), tsTop = rs.reduce((a, b) => (b.prob_ts || 0) > (a.prob_ts || 0) ? b : a);
+    const t = rs.filter(r => r.temp != null).map(r => r.temp);
+    return {d, nombre: nombreDia(d, hoy), prob: top.prob, ts: tsTop.prob_ts || 0, ic: iconoDia(rs, top, tsTop), mn: t.length ? Math.min(...t) : null, mx: t.length ? Math.max(...t) : null};
+  });
+  const tb = D.tablero && tableroDe(v), aciertos = dentro && tb && tb.n >= 4 ? `✓ Acertamos ${tb.a} de ${tb.n} días esta semana` : '';
+  const ahoraT = new Date(Date.now() + v.offset * 1000), fecha = `${DIAS[ahoraT.getUTCDay()].slice(0, 3)} ${ahoraT.getUTCDate()} ${MESES_C[ahoraT.getUTCMonth()]} · ${ahoraT.toISOString().slice(11, 16)}`;
+  // imágenes de los íconos (la de la cabecera, las de la tira de horas y las de los días)
+  const nombresIc = new Set([...horas.map(r => condicion(r)[0]), ...filasDias.map(f => f.ic)]);
+  const [hero] = await Promise.all([imagenHero(), ...[...nombresIc].map(imagenIcono)]);
+  const reg = []; let diasDib = 0;
+  const dibujar = (c, dry, compacto) => {
+    reg.length = 0;
+    // texto: si se pasa `max`, se achica la letra hasta que quepa
+    const T = (t, x, y, px, w, col, al = 'left', max = 0, minPx = 22) => {
+      let p = px; c.font = `${w} ${p}px ${F}`;
+      if (max) { while (c.measureText(t).width > max && p > minPx) { p--; c.font = `${w} ${p}px ${F}`; }
+        if (c.measureText(t).width > max) { while (t.length > 2 && c.measureText(t + '…').width > max) t = t.slice(0, -1); t = t.replace(/[\s,]+$/, '') + '…'; } }
+      c.fillStyle = col; c.textAlign = al; c.textBaseline = 'alphabetic'; c.fillText(t, x, y);
+      const ancho = c.measureText(t).width; reg.push({t, x: al === 'right' ? x - ancho : al === 'center' ? x - ancho / 2 : x, y, w: ancho, px: p});
+      return ancho;
+    };
+    const envolver = (t, px, w, ancho, maxL) => {
+      c.font = `${w} ${px}px ${F}`; const out = []; let l = '';
+      for (const p of t.split(' ')) { const q = l ? l + ' ' + p : p; if (c.measureText(q).width > ancho && l) { out.push(l); l = p; } else l = q; }
+      if (l) out.push(l);
+      if (out.length > maxL) { let u = out[maxL - 1]; while (c.measureText(u + '…').width > ancho && u.length > 1) u = u.slice(0, -1); out.length = maxL; out[maxL - 1] = u.replace(/\s+$/, '') + '…'; }
+      return out;
+    };
+    const rr = (x, y, w, h, r, fill) => { c.beginPath(); c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + h, r); c.arcTo(x + w, y + h, x, y + h, r); c.arcTo(x, y + h, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath(); c.fillStyle = fill; c.fill(); };
+    let y = 96;
+    T('ClearSky', M, y, 42, 700, P.acc); T(fecha, W - M, y, 26, 500, P.tx3, 'right');
+    y += 66; T(lugar, M, y, 46, 600, P.tx, 'left', IW, 34);
+    // cabecera: ícono, temperatura y sensación (igual que la página)
+    const y0 = y + 18; if (hero) c.drawImage(hero, M - 14, y0, 200, 200);
+    T(act.temp != null ? `${Math.round(act.temp)}°` : '–', M + 216, y0 + 168, 200, 200, P.tx);
+    T(hs, M, y0 + 236, 32, 400, P.tx2, 'left', IW);
+    y = y0 + 236 + 76;
+    for (const l of envolver(tit, 56, 600, IW, 2)) { T(l, M, y, 56, 600, P.tx, 'left', IW); y += 64; }
+    y -= 54;                                                          // vuelve al último renglón del titular (+10): el subtítulo va pegado, no lejos
+    for (const l of envolver(sub, 32, 400, IW, compacto ? 2 : 3)) { y += 42; T(l, M, y, 32, 400, P.tx2, 'left', IW); }
+    // etiquetas (humedad, UV, sensación…) con los mismos colores de la página
+    if (chips.length) {
+      y += 30; let x = M, fila = 0; c.font = `500 26px ${F}`;
+      for (const ch of chips) { const w = Math.min(c.measureText(ch.t).width + 40, IW);
+        if (x + w > M + IW && x > M) { if (compacto || fila >= 1) break; x = M; y += 62; fila++; }
+        rr(x, y, w, 50, 25, ch.bg); T(ch.t, x + 20, y + 34, 26, 500, ch.fg, 'left', w - 32); x += w + 12; }
+      y += 50;
+    }
+    // aviso (rayos ahora, aviso oficial o calor)
+    if (alerta) {
+      y += 26; const lineas = envolver(alerta.t, 28, 400, IW - 72, 2), h = 24 + 34 + lineas.length * 38 + 20;
+      rr(M, y, IW, h, 22, P.card); rr(M, y, 10, h, 5, alerta.c);
+      T(alerta.e, M + 36, y + 48, 24, 700, alerta.c); lineas.forEach((l, i) => T(l, M + 36, y + 90 + i * 38, 28, 400, P.tx, 'left', IW - 72)); y += h;
+    }
+    // próximas horas: ícono, probabilidad y temperatura, con la línea de temperatura debajo
+    y += 28; const hh = 342; rr(M, y, IW, hh, 28, P.card);
+    T('PRÓXIMAS HORAS', M + 32, y + 52, 24, 700, P.tx3);
+    const cw = (IW - 40) / horas.length, temps = horas.map(r => r.temp).filter(t => t != null), tmin = Math.min(...temps), tmax = Math.max(...temps), rng = Math.max(tmax - tmin, 2), pts = [];
+    horas.forEach((r, i) => {
+      const cx = M + 20 + cw * (i + 0.5), ic = condicion(r)[0], im = imgsIcono[ic];
+      T(r === act ? 'Ahora' : `${+r.hora.slice(11, 13)}h`, cx, y + 106, 28, 500, P.tx2, 'center');
+      if (im) c.drawImage(im, cx - 34, y + 116, 68, 68);
+      if ((r.prob_ts || 0) >= 30) T(`⚡${r.prob_ts}%`, cx, y + 216, 28, 700, P.ts, 'center'); else if (r.prob >= 10) T(`${r.prob}%`, cx, y + 216, 28, 700, P.acc, 'center');
+      T(r.temp != null ? `${Math.round(r.temp)}°` : '–', cx, y + 266, 36, 500, P.tx, 'center');
+      if (r.temp != null) pts.push([cx, y + 316 - (r.temp - tmin) / rng * 28]);
+    });
+    if (pts.length > 1) { c.beginPath(); pts.forEach(([x, yy], i) => i ? c.lineTo(x, yy) : c.moveTo(x, yy)); c.strokeStyle = P.temp; c.lineWidth = 4; c.lineJoin = 'round'; c.stroke(); }
+    pts.forEach(([x, yy]) => { c.beginPath(); c.arc(x, yy, 6, 0, 7); c.fillStyle = P.temp; c.fill(); });
+    y += hh;
+    // próximos días: ícono, probabilidad y rango de temperatura
+    y += 24; const nd = compacto ? Math.min(4, filasDias.length) : filasDias.length, dh = 88 + nd * 78; diasDib = nd; rr(M, y, IW, dh, 28, P.card);
+    T('PRÓXIMOS DÍAS', M + 32, y + 52, 24, 700, P.tx3);
+    const gmn = Math.min(...filasDias.filter(f => f.mn != null).map(f => f.mn)), gmx = Math.max(...filasDias.filter(f => f.mx != null).map(f => f.mx)), grng = Math.max(gmx - gmn, 1);
+    filasDias.slice(0, nd).forEach((f, i) => {
+      const ry = y + 88 + i * 78, base = ry + 52;
+      if (i) { c.fillStyle = P.line; c.fillRect(M + 32, ry - 12, IW - 64, 2); }
+      T(f.nombre, M + 32, base, 38, 500, P.tx, 'left', 190);
+      if (imgsIcono[f.ic]) c.drawImage(imgsIcono[f.ic], M + 232, ry - 2, 58, 58);
+      if (f.ts >= 30) T(`⚡${f.ts}%`, M + 380, base, 34, 700, P.ts, 'right'); else if (f.prob >= 10) T(`${f.prob}%`, M + 380, base, 34, 700, P.acc, 'right'); else T('–', M + 380, base, 34, 500, P.tx3, 'right');
+      if (f.mn != null) {
+        T(`${Math.round(f.mn)}°`, M + 470, base, 36, 400, P.tx2, 'right');
+        const tx0 = M + 498, tw = 270; rr(tx0, base - 20, tw, 10, 5, P.card2);
+        const a = tx0 + (f.mn - gmn) / grng * tw, b = Math.max(tx0 + (f.mx - gmn) / grng * tw, a + 12), g = c.createLinearGradient(a, 0, b, 0);
+        g.addColorStop(0, '#60a5fa'); g.addColorStop(1, '#fbbf24'); rr(a, base - 20, b - a, 10, 5, g);
+        T(`${Math.round(f.mx)}°`, M + 800, base, 36, 500, P.tx, 'left');
+      }
+    });
+    y += dh;
+    // pie: cómo nos fue (si hay datos) y de dónde viene
+    y += 50; if (aciertos) { T(aciertos, M, y, 30, 600, P.ok, 'left', IW); y += 44; }
+    T(dentro ? 'Pronóstico verificado cada día · suirobert.github.io/ClearSky' : 'ClearSky · suirobert.github.io/ClearSky · fuera de Ecuador no está verificado', M, y, 26, 400, P.tx3, 'left', IW);
+    return y + 52;
+  };
+  const prueba = document.createElement('canvas'); prueba.width = W; prueba.height = 2400;
+  let compacto = false, H = Math.ceil(dibujar(prueba.getContext('2d'), true, false));          // primera pasada: mide cuánto mide la imagen
+  if (H > 1920) { compacto = true; H = Math.ceil(dibujar(prueba.getContext('2d'), true, true)); }  // más alta que una historia (9:16): se comprime
+  H = Math.max(1350, H);
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const c = cv.getContext('2d'); c.fillStyle = P.bg; c.fillRect(0, 0, W, H);
+  const brillo = c.createRadialGradient(W * 0.2, 0, 0, W * 0.2, 0, 700); brillo.addColorStop(0, k ? 'rgba(96,165,250,.09)' : 'rgba(96,165,250,.11)'); brillo.addColorStop(1, 'rgba(96,165,250,0)');
+  c.fillStyle = brillo; c.fillRect(0, 0, W, H);
+  dibujar(c, false, compacto);
+  estado.ultimaImagen = {w: W, h: H, tema: k ? 'claro' : 'oscuro', fondo: P.bg, textos: reg.slice(), alerta: alerta && alerta.e, compacto, chips: chips.map(x => x.t), dias: filasDias.length, diasDibujados: diasDib, horas: horas.length, aciertos};
   const blob = await new Promise(ok => cv.toBlob(ok, 'image/png'));
-  const archivo = new File([blob], 'clearsky.png', {type: 'image/png'}), texto = `${tit} — ${v.nombre}. ${location.href.split('#')[0]}`;
+  const archivo = new File([blob], 'clearsky.png', {type: 'image/png'}), texto = `${tit} — ${lugar}. ${location.href.split('#')[0]}`;
   try { if (navigator.canShare && navigator.canShare({files: [archivo]})) { await navigator.share({files: [archivo], text: texto}); return; } } catch (e) { if (e.name === 'AbortError') return; }
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'clearsky.png'; a.click();
   toast('Imagen descargada. Ya puedes enviarla por WhatsApp.');
 }
+
 function pie() {
   const gen = new Date(D.generado + ':00Z').getTime() - D.offset * 1000, horas = (Date.now() - gen) / 36e5;
   const [f, h] = D.generado.split('T');
