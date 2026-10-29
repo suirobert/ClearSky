@@ -1326,10 +1326,12 @@ def importar_netcdf():
 
 
 def leer_lluvia_nc(ruta):
-    """Lee la lluvia instantánea (mm/h) y la promedia en una cuadrícula de 0,1° sobre Ecuador."""
+    """Lee la lluvia instantánea (mm/h) y la promedia en una cuadrícula de 0,1° sobre Ecuador.
+       Devuelve (rejilla, tiempo, puntos del archivo dentro de Ecuador)."""
     nc4, np = importar_netcdf()
     s0, n0, w0, e0 = AHORA_CAJA
     ny, nx = round((n0 - s0) / AHORA_PASO), round((e0 - w0) / AHORA_PASO)
+    diag = []
     with nc4.Dataset(ruta) as ds:
         variables = {}
         def recorrer(g):
@@ -1337,36 +1339,44 @@ def leer_lluvia_nc(ruta):
             for sub in g.groups.values():
                 recorrer(sub)
         recorrer(ds)
+        diag.append("variables: " + ", ".join(f"{k}{tuple(v.shape)}" for k, v in sorted(variables.items()))[:400])
         lat = next((variables[k] for k in ("lat", "latitude", "lats") if k in variables), None)
         lon = next((variables[k] for k in ("lon", "longitude", "lons") if k in variables), None)
         if lat is None or lon is None:
-            raise RuntimeError(f"no hay latitud/longitud en el archivo ({', '.join(sorted(variables))[:300]})")
-        cands = [v for k, v in variables.items() if v.ndim >= 2 and any(t in k for t in ("rain", "rrqpe", "precip", "rr"))]
+            raise RuntimeError("no hay latitud/longitud en el archivo; " + " | ".join(diag))
+        cands = [(k, v) for k, v in variables.items() if v.ndim >= 2 and k not in ("lat", "lon", "latitude", "longitude")
+                 and any(t in k for t in ("rain", "rrqpe", "precip", "rr")) and not any(t in k for t in ("dqf", "qual", "flag", "mask"))]
         if not cands:
-            raise RuntimeError(f"no hay variable de lluvia ({', '.join(sorted(variables))[:300]})")
-        var = max(cands, key=lambda v: int(np.prod(v.shape)))
+            raise RuntimeError("no hay variable de lluvia; " + " | ".join(diag))
+        nombre, var = max(cands, key=lambda kv: int(np.prod(kv[1].shape)))
         var.set_auto_maskandscale(True)
-        if lat.ndim == 1 and lon.ndim == 1:
-            la, lo = np.asarray(lat[:], dtype=float), np.asarray(lon[:], dtype=float)
-            lo = np.where(lo > 180, lo - 360, lo)
+        diag.append(f"usada: {nombre} {getattr(var, 'units', '')} dims={var.dimensions}")
+        la = np.ma.filled(np.ma.asarray(lat[:], dtype=float), np.nan)
+        lo = np.ma.filled(np.ma.asarray(lon[:], dtype=float), np.nan)
+        lo = np.where(lo > 180, lo - 360, lo)                  # longitudes 0-360 -> -180..180
+        diag.append(f"lat {np.nanmin(la):.2f}..{np.nanmax(la):.2f} lon {np.nanmin(lo):.2f}..{np.nanmax(lo):.2f}")
+        if la.ndim == 1 and lo.ndim == 1:
             iy = np.where((la >= s0) & (la <= n0))[0]
             ix = np.where((lo >= w0) & (lo <= e0))[0]
             if not len(iy) or not len(ix):
-                raise RuntimeError("el archivo no cubre Ecuador")
+                raise RuntimeError("el archivo no cubre Ecuador; " + " | ".join(diag))
             forma = [d for d in var.shape if d != 1]
+            y0, y1, x0, x1 = iy.min(), iy.max() + 1, ix.min(), ix.max() + 1
             if forma == [len(la), len(lo)]:
-                datos = var[..., iy.min():iy.max() + 1, ix.min():ix.max() + 1]
+                datos = var[..., y0:y1, x0:x1]
             elif forma == [len(lo), len(la)]:
-                datos = np.swapaxes(var[..., ix.min():ix.max() + 1, iy.min():iy.max() + 1], -1, -2)
+                datos = np.swapaxes(var[..., x0:x1, y0:y1], -1, -2)
             else:
-                raise RuntimeError(f"forma inesperada de la lluvia: {var.shape}")
-            datos = np.ma.filled(np.ma.asarray(datos, dtype=float).reshape(iy.max() - iy.min() + 1, ix.max() - ix.min() + 1), np.nan)
-            LA, LO = np.meshgrid(la[iy.min():iy.max() + 1], lo[ix.min():ix.max() + 1], indexing="ij")
-        else:
-            LA, LO = np.asarray(lat[:], dtype=float), np.asarray(lon[:], dtype=float)
-            datos = np.ma.filled(np.ma.asarray(var[:], dtype=float).reshape(LA.shape), np.nan)
-            m = (LA >= s0) & (LA <= n0) & (LO >= w0) & (LO <= e0)
+                raise RuntimeError(f"forma inesperada de la lluvia {var.shape}; " + " | ".join(diag))
+            datos = np.ma.filled(np.ma.asarray(datos, dtype=float).reshape(y1 - y0, x1 - x0), np.nan)
+            LA, LO = np.meshgrid(la[y0:y1], lo[x0:x1], indexing="ij")
+            LA, LO, datos = LA.ravel(), LO.ravel(), datos.ravel()
+            m = (LO >= w0) & (LO <= e0)
             LA, LO, datos = LA[m], LO[m], datos[m]
+        else:
+            datos = np.ma.filled(np.ma.asarray(var[:], dtype=float), np.nan).reshape(la.shape)
+            m = np.isfinite(la) & np.isfinite(lo) & (la >= s0) & (la <= n0) & (lo >= w0) & (lo <= e0)
+            LA, LO, datos = la[m], lo[m], datos[m]
         tiempo = None
         for k in ("time", "t"):
             if k in variables:
@@ -1374,15 +1384,22 @@ def leer_lluvia_nc(ruta):
                     tiempo = nc4.num2date(variables[k][:].ravel()[0], variables[k].units).strftime("%Y%m%d%H%M")
                 except Exception:
                     pass
-    datos = np.where(np.isfinite(datos), np.clip(datos, 0, 300), np.nan).ravel()
-    gy = np.clip(((n0 - LA.ravel()) / AHORA_PASO).astype(int), 0, ny - 1)
-    gx = np.clip(((LO.ravel() - w0) / AHORA_PASO).astype(int), 0, nx - 1)
-    ok = np.isfinite(datos)
+    puntos = int(LA.size)
+    validos = int(np.isfinite(datos).sum())
+    diag.append(f"puntos en Ecuador {puntos}, con valor {validos}")
+    if puntos < 100:
+        raise RuntimeError("el archivo no trae datos sobre Ecuador; " + " | ".join(diag))
+    if validos == 0:
+        # el producto marca como 'sin dato' los píxeles donde no llueve: sobre Ecuador no llueve ahora
+        print("  Satélite: ningún píxel con lluvia sobre Ecuador (" + diag[-1] + ")")
+    datos = np.where(np.isfinite(datos), np.clip(datos, 0, 300), 0.0)
+    gy = np.clip(((n0 - LA) / AHORA_PASO).astype(int), 0, ny - 1)
+    gx = np.clip(((LO - w0) / AHORA_PASO).astype(int), 0, nx - 1)
     suma, cuenta = np.zeros(ny * nx), np.zeros(ny * nx)
-    np.add.at(suma, gy[ok] * nx + gx[ok], datos[ok])
-    np.add.at(cuenta, gy[ok] * nx + gx[ok], 1)
+    np.add.at(suma, gy * nx + gx, datos)
+    np.add.at(cuenta, gy * nx + gx, 1)
     media = np.where(cuenta > 0, suma / np.maximum(cuenta, 1), 0)
-    return media.reshape(ny, nx), tiempo, float(cuenta.sum())
+    return media.reshape(ny, nx), tiempo, float(puntos)
 
 
 def lluvia_ahora():
@@ -1407,11 +1424,12 @@ def lluvia_ahora():
                 if not bloque:
                     break
                 f.write(bloque)
-        rejilla, _, pixeles = leer_lluvia_nc(ruta)
+        try:
+            rejilla, _, pixeles = leer_lluvia_nc(ruta)
+        except Exception as e:
+            raise RuntimeError(f"{e} (archivo {ult['key']})")
     finally:
         os.remove(ruta)
-    if pixeles < 100:
-        raise RuntimeError("el archivo no trae datos sobre Ecuador")
     import numpy as np
     q = np.clip(np.round(rejilla * 2), 0, 255).astype("uint8")       # pasos de 0,5 mm/h
     s0, n0, w0, e0 = AHORA_CAJA
