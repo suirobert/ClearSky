@@ -96,8 +96,8 @@ MIN_HORAS_TORMENTA  = 4          # mínimo de horas con tormenta observada para 
 VARS_PRON = ["precipitation", "temperature_2m", "cloud_cover", "cloud_cover_low", "cloud_cover_mid",
              "shortwave_radiation", "weather_code", "wind_gusts_10m", "uv_index"]
 # Mapa: cuadrícula sobre Ecuador continental
-MAPA_LATS = [round(1.25 - 0.75 * i, 2) for i in range(9)]      # 1.25 … -4.75
-MAPA_LONS = [round(-80.75 + 0.75 * j, 2) for j in range(8)]    # -80.75 … -75.5
+MAPA_LATS = [round(1.75 - 0.75 * i, 2) for i in range(10)]     # 1.75 … -5.0
+MAPA_LONS = [round(-81.5 + 0.75 * j, 2) for j in range(9)]     # -81.5 … -75.5
 # Íconos animados Meteocons (MIT, © Bas Milius). Se descargan una vez y se guardan en datos/iconos.
 ICONOS_METEOCONS = ["clear-day", "clear-night", "partly-cloudy-day", "partly-cloudy-night", "overcast",
                     "drizzle", "rain", "thunderstorms-rain", "fog"]
@@ -1641,6 +1641,11 @@ html[data-tema=claro]{--tx3:#5b6678}
 .mapley i{flex:1;max-width:220px;height:8px;border-radius:4px}
 .mapley{gap:8px}
 .capa-lluvia{image-rendering:auto;mix-blend-mode:normal}
+.cab,.col1,.col2,.cabA,.cabB{min-width:0}
+.dmm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.tmin,.tmax{white-space:nowrap}
+#satmap{position:relative;z-index:0;isolation:isolate;height:340px;border-radius:12px;overflow:hidden;background:#0d121b}
+.satimg{width:100%;height:100%;object-fit:contain;display:block}
 .leaflet-popup-content-wrapper{border-radius:12px}
 .pop .leaflet-popup-content{margin:8px 12px;font-size:13px}
 .sat img{max-height:520px;object-fit:contain}
@@ -1650,12 +1655,17 @@ html[data-tema=claro]{--tx3:#5b6678}
 /* ---------- tableta y PC: dos columnas ---------- */
 @media(min-width:980px){
   .wrap{padding:8px 24px 40px}
-  .lay{display:grid;grid-template-columns:minmax(380px,440px) 1fr;gap:24px;align-items:start}
-  .col2 .card:first-child{margin-top:14px}
+  .lay{display:grid;grid-template-columns:minmax(400px,460px) minmax(0,1fr);grid-template-areas:"cab cab" "col1 col2";gap:0 24px;align-items:start}
+  .cab{grid-area:cab;display:grid;grid-template-columns:minmax(400px,460px) minmax(0,1fr);gap:0 24px;align-items:end}
+  .cab .alerta{grid-column:1/-1}
+  .cabB{padding-bottom:2px}.cabB .chips{margin-top:0}
+  .col1{grid-area:col1}.col2{grid-area:col2}
+  #satmap{height:min(62vh,600px)}
+  .col2 .card:first-child{margin-top:12px}
   #mapa{height:min(62vh,600px)}
   .chips{flex-wrap:wrap;overflow:visible;margin:10px 0 0;padding:0}
   .hero .t{font-size:68px}
-  .drow{grid-template-columns:92px 34px 46px 118px 34px 1fr 34px}
+  .drow{grid-template-columns:minmax(60px,84px) 32px 42px minmax(0,1.1fr) 30px minmax(44px,1fr) 32px;gap:6px}
   .dmm{display:block}
   .sheet{max-width:480px;bottom:auto;top:50%;left:50%;right:auto;width:480px;border-radius:20px;transform:translate(-50%,-46%) scale(.98);opacity:0;transition:transform .2s,opacity .2s}
   .sheet.on{transform:translate(-50%,-50%);opacity:1}
@@ -1854,7 +1864,7 @@ function lineaTiempo(rows, ahora) {
   const n = rows.length; if (!n) return '';
   const conds = rows.map(condicion);
   const segs = rows.map((r, i) => `<div class="seg${estado.tlSel === r.hora ? ' sel' : ''}" data-i="${i}" style="background:${colSeg(conds[i][2])}"></div>`).join('');
-  const tks = rows.map((r, i) => i % 2 ? '' : `<div class="tk" style="left:${i / n * 100}%"><b>${r.hora === ahora ? 'Ahora' : r.hora.slice(11, 13) + 'h'}</b><span>${r.temp != null ? Math.round(r.temp) : '-'}°</span></div>`).join('');
+  const tks = rows.map((r, i) => i % 3 ? '' : `<div class="tk" style="left:${i / n * 100}%"><b>${r.hora === ahora ? 'Ahora' : r.hora.slice(11, 13) + 'h'}</b><span>${r.temp != null ? Math.round(r.temp) : '-'}°</span></div>`).join('');
   const fam = (r, i) => conds[i][0] === 'tormenta' ? 'tormenta' : r.prob >= 20 ? 'lluvia' : conds[i][1];
   const runs = [];
   rows.forEach((r, i) => { const f = fam(r, i), u = runs[runs.length - 1];
@@ -2008,8 +2018,8 @@ function tablaModelos(filas, cfg, hoy) {
 }
 
 // ---------- mapa de lluvia (capa continua y suave) ----------
-const RAMPA = [[0, [59, 130, 246, 0]], [8, [59, 130, 246, 0]], [18, [56, 189, 248, .38]], [35, [37, 99, 235, .55]],
-               [55, [124, 58, 237, .65]], [75, [192, 38, 211, .75]], [100, [236, 72, 153, .85]]];
+const RAMPA = [[0, [56, 189, 248, 0]], [12, [56, 189, 248, 0]], [22, [56, 189, 248, .32]], [38, [37, 99, 235, .52]],
+               [55, [109, 40, 217, .64]], [72, [192, 38, 211, .74]], [88, [236, 72, 153, .82]], [100, [244, 63, 94, .88]]];
 function colorRampa(p) {
   for (let i = 1; i < RAMPA.length; i++) if (p <= RAMPA[i][0]) {
     const [a, ca] = RAMPA[i - 1], [b, cb] = RAMPA[i], f = (p - a) / (b - a || 1);
@@ -2051,8 +2061,11 @@ function imagenMapa(j) {
     for (let x = 0; x < W; x++) for (let y = 0; y < H; y++) { let a = 0, n = 0;
       for (let d = -R; d <= R; d++) { const yy = y + d; if (yy >= 0 && yy < H) { a += T[yy * W + x]; n++; } } V[y * W + x] = a / n; }
   }
-  for (let k = 0; k < W * H; k++) { const c = colorRampa(V[k]);
-    img.data[k * 4] = c[0]; img.data[k * 4 + 1] = c[1]; img.data[k * 4 + 2] = c[2]; img.data[k * 4 + 3] = Math.round(c[3] * 255); }
+  // los bordes de la cuadrícula se desvanecen poco a poco: ya no se ve una línea recta donde termina el mapa
+  const BORDE = PX * 1.6, suave = x => x <= 0 ? 0 : x >= 1 ? 1 : x * x * (3 - 2 * x);
+  for (let k = 0; k < W * H; k++) { const c = colorRampa(V[k]), x = k % W, y = (k - x) / W;
+    const f = suave(Math.min(x, W - 1 - x, y, H - 1 - y) / BORDE);
+    img.data[k * 4] = c[0]; img.data[k * 4 + 1] = c[1]; img.data[k * 4 + 2] = c[2]; img.data[k * 4 + 3] = Math.round(c[3] * 255 * f); }
   cx.putImageData(img, 0, 0);
   return cv.toDataURL();
 }
@@ -2094,17 +2107,59 @@ function activarMapa(v) {
   })();
 }
 
-// ---------- satélite ----------
+// ---------- satélite (capa en el mapa, NASA GIBS; si falla, imagen de NOAA) ----------
+let mapaSat = null;
 function htmlSatelite() {
-  const t = Math.floor(Date.now() / 6e5);
-  return `<div class="sat"><a href="https://www.star.nesdis.noaa.gov/GOES/sector.php?sat=G19&sector=nsa" target="_blank" rel="noopener">` +
-    `<img id="satimg" data-src="https://cdn.star.nesdis.noaa.gov/GOES19/ABI/SECTOR/nsa/GEOCOLOR/600x600.jpg?t=${t}" alt="Imagen de satélite GOES-19 del norte de Sudamérica"></a>` +
-    `<p class="nota">Imagen GeoColor del satélite GOES-19, actualizada cada pocos minutos. De noche, las nubes altas (las de tormenta) se ven en blanco. Toca la imagen para ampliarla. Crédito: CIRA/NOAA.</p></div>`;
+  return `<div id="satmap" role="application" aria-label="Imagen de satélite sobre Ecuador"><div class="vacio"><span class="cargando"></span>Cargando satélite…</div></div>` +
+    `<div class="mapctl"><div class="mapht" id="sathora" aria-live="polite" style="text-align:left"></div></div>` +
+    `<p class="nota">Imagen GeoColor del satélite GOES-19: de día se ve como a simple vista; de noche las nubes altas (las de tormenta) se ven en blanco. ` +
+    `Crédito: CIRA/NOAA, servida por NASA GIBS. <a href="https://www.star.nesdis.noaa.gov/GOES/sector.php?sat=G19&sector=nsa" target="_blank" rel="noopener">Ver en NOAA</a></p>`;
 }
-function activarSatelite() {
-  const img = $('#satimg'); if (!img || !img.dataset.src) return;
-  img.src = img.dataset.src; delete img.dataset.src;
-  img.onerror = () => { img.replaceWith(Object.assign(document.createElement('p'), {className: 'nota', textContent: 'La imagen de satélite no está disponible en este momento.'})); };
+const SAT_IMGS = ['SECTOR/nsa/GEOCOLOR/latest.jpg', 'SECTOR/nsa/GEOCOLOR/1200x1200.jpg', 'SECTOR/nsa/GEOCOLOR/1800x1080.jpg', 'FD/GEOCOLOR/1808x1808.jpg']
+  .map(p => 'https://cdn.star.nesdis.noaa.gov/GOES19/ABI/' + p);
+function satImagenNOAA() {
+  const caja = $('#satmap'); if (!caja) return;
+  if (mapaSat) { mapaSat.remove(); mapaSat = null; }
+  caja.innerHTML = ''; const img = document.createElement('img'); img.alt = 'Imagen de satélite GOES-19'; img.className = 'satimg';
+  let i = 0; const t = Math.floor(Date.now() / 6e5);
+  const sig = () => { if (i >= SAT_IMGS.length) { caja.innerHTML = '<div class="vacio">La imagen de satélite no está disponible en este momento.</div>'; return; }
+    img.src = `${SAT_IMGS[i++]}?t=${t}`; };
+  img.onerror = sig; img.onload = () => { const h = $('#sathora'); if (h) h.textContent = 'Imagen más reciente de NOAA'; };
+  caja.appendChild(img); sig();
+}
+function activarSatelite(v) {
+  if (!$('#satmap')) return;
+  if (mapaSat) { setTimeout(() => mapaSat.invalidateSize(), 50); return; }
+  (async () => {
+    try { await cargarLeaflet(); } catch (e) { satImagenNOAA(); return; }
+    if (!$('#satmap') || mapaSat) return;
+    $('#satmap').innerHTML = '';
+    const tactil = matchMedia('(pointer:coarse)').matches;
+    const map = L.map('satmap', {zoomControl: !tactil, dragging: !tactil, tap: false, scrollWheelZoom: false, minZoom: 4, maxZoom: 9})
+      .setView([v && v.lat != null ? v.lat : -1.6, v && v.lon != null ? v.lon : -78.6], 6);
+    mapaSat = map;
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 9, attribution: '&copy; OpenStreetMap'}).addTo(map);
+    // GIBS publica con algo de retraso: se prueba la imagen de hace ~40 min y, si no hay, otras más antiguas
+    const intentos = [];
+    for (const min of [40, 70, 120, 180]) for (const ext of ['jpg', 'png']) intentos.push([min, ext]);
+    let capa = null, k = 0;
+    const probar = () => {
+      if (capa) { map.removeLayer(capa); capa = null; }
+      if (k >= intentos.length) { satImagenNOAA(); return; }
+      const [min, ext] = intentos[k++];
+      const d = new Date(Date.now() - min * 6e4); d.setUTCSeconds(0, 0); d.setUTCMinutes(Math.floor(d.getUTCMinutes() / 10) * 10);
+      const tiempo = d.toISOString().slice(0, 19) + 'Z';
+      let ok = 0, mal = 0, decidido = false;
+      capa = L.tileLayer(`https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/GOES-East_ABI_GeoColor/default/${tiempo}/GoogleMapsCompatible_Level7/{z}/{y}/{x}.${ext}`,
+        {maxNativeZoom: 7, maxZoom: 9, opacity: 0.92, attribution: 'GOES-19 GeoColor: CIRA/NOAA · NASA GIBS'});
+      capa.on('tileload', () => { ok++; if (!decidido && ok >= 2) { decidido = true;
+        const h = $('#sathora'); if (h) h.textContent = 'Imagen de las ' + new Date(d.getTime() + D.offset * 1000).toISOString().slice(11, 16) + ' (hora de Ecuador)'; } });
+      capa.on('tileerror', () => { mal++; if (!decidido && mal >= 3 && ok === 0) { decidido = true; probar(); } });
+      capa.addTo(map);
+    };
+    probar();
+    if (v && v.lat != null) L.circleMarker([v.lat, v.lon], {radius: 6, color: '#fff', weight: 2, fillColor: '#f59e0b', fillOpacity: 1}).addTo(map);
+  })();
 }
 
 // ---------- reportes de usuarios ----------
@@ -2341,7 +2396,7 @@ function mostrarTab(t, foco) {
   $$('.panel').forEach(p => p.hidden = p.dataset.t !== t);
   if (t === 'graf') pintarGrafica();
   else if (t === 'mapa') activarMapa(ctx.v);
-  else activarSatelite();
+  else activarSatelite(ctx.v);
 }
 function alertaPara(v) {
   return (D.alertas || []).filter(a => a.ciudad === v.ref || a.ciudad === v.nombre).sort((a, b) => b.prob - a.prob)[0];
@@ -2358,6 +2413,7 @@ function render() {
   const dias = porDia(v.filas, ahora);
   if (estado.dia && !dias[estado.dia]) estado.dia = null;
   if (mapa) { mapa.remove(); mapa = null; }
+  if (mapaSat) { mapaSat.remove(); mapaSat = null; }
   ctx = {v, ahora, hoy, dias, prox};
   const p24 = prox.slice(0, 24), tsMax = p24.reduce((a, b) => (b.prob_ts || 0) > (a.prob_ts || 0) ? b : a);
   const uvs = hoyF.filter(r => r.uv != null).map(r => r.uv), uvMax = uvs.length ? Math.max(...uvs) : null;
@@ -2372,15 +2428,15 @@ function render() {
   const actual = v.t ? `Actualizado ${hace(v.t)}` : `Actualizado ${D.generado.slice(11, 16)}`;
   const push = leer('cc_push') ? '🔔 Avisos activos' : '🔔 Avisarme';
   $('#vista').innerHTML =
-    `<div class="lay"><section class="col1" aria-label="Pronóstico">` +
+    `<div class="lay"><section class="cab" aria-label="Ahora">` +
     (al ? `<div class="alerta" role="alert">${al.tormenta ? '⛈️' : '🌧️'} <b>El pronóstico cambió:</b> ${al.prob}% de lluvia hacia las ${al.hora.slice(11, 16)} (antes ${al.antes}%).</div>` : '') +
-    `<div class="hero"><div class="ic">${icono(ic, 64)}</div><div class="ht"><div class="t">${act.temp != null ? Math.round(act.temp) : '-'}<sup>°</sup></div>` +
+    `<div class="cabA"><div class="hero"><div class="ic">${icono(ic, 64)}</div><div class="ht"><div class="t">${act.temp != null ? Math.round(act.temp) : '-'}<sup>°</sup></div>` +
     (tmax != null ? `<div class="hs">Máx ${tmax}° · Mín ${tmin}°</div>` : '') + `</div></div>` +
     `<h1 class="tit">${tit}</h1><p class="sub">${sub}</p>` +
     `<div class="lugar">📍 ${esc(v.nombre)} · <span id="actualizado">${actual}</span></div>` +
-    `<div class="chips">${chips}</div>` +
+    `</div><div class="cabB"><div class="chips">${chips}</div>` +
     `<div class="acciones">` + (D.feedback_url ? `<button class="acc" id="breporte">☂️ Reportar clima</button><button class="acc" id="bpush" aria-pressed="${!!leer('cc_push')}">${push}</button>` : '') +
-    `<button class="acc" id="bcompartir">↗ Compartir</button></div><div class="fbmini" id="fbmini"></div>` +
+    `<button class="acc" id="bcompartir">↗ Compartir</button></div><div class="fbmini" id="fbmini"></div></div></section><section class="col1" aria-label="Pronóstico">` +
     `<div class="card" id="c24"><h3>Próximas 24 horas</h3>${lineaTiempo(p24, ahora)}</div>` +
     `<div class="card"><h3>Próximos 7 días <span class="sub">Toca un día para ver el detalle</span></h3><div id="dias" role="list"></div></div>` +
     `</section><section class="col2" aria-label="Gráfica, mapa y satélite">` +
@@ -2582,7 +2638,7 @@ async function inicio() {
   }
   if (estado.ubic && Date.now() - estado.ubic.t > 15 * 60 * 1000) { const a = $('#actualizado'); if (a) a.textContent = 'Actualizando…'; }
   let rz, ancho = innerWidth;
-  addEventListener('resize', () => { clearTimeout(rz); rz = setTimeout(() => { if (innerWidth !== ancho && ctx) { ancho = innerWidth; pintarGrafica(); if (mapa) mapa.invalidateSize(); } }, 200); });
+  addEventListener('resize', () => { clearTimeout(rz); rz = setTimeout(() => { if (innerWidth !== ancho && ctx) { ancho = innerWidth; pintarGrafica(); if (mapa) mapa.invalidateSize(); if (mapaSat) mapaSat.invalidateSize(); } }, 200); });
   sugerirInstalar();
 }
 inicio();
