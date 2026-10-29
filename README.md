@@ -7,26 +7,23 @@
 Los pronósticos suelen fallar porque dependen de un solo modelo y nadie mide públicamente
 cuánto aciertan. ClearSky combina 7 modelos meteorológicos internacionales, aprende cuál acierta más
 en cada ciudad y ajusta sus porcentajes para que un 30% signifique de verdad 3 de cada 10.
-Lo verifica todos los días: lluvia, tormentas eléctricas y pronósticos de hasta 7 días.
+Además mira lo que está pasando **ahora**: el satélite y los reportes de la gente corrigen las próximas horas.
 
 ## Qué ofrece
 
-- **Tu barrio primero**: al abrir la página se calcula el pronóstico de tu punto exacto y se muestra el nombre del barrio o ciudadela (Urdesa, Alborada, La Carolina…) gracias a OpenStreetMap. Las ciudades están en una lista aparte.
-- **Diseño compacto** al estilo Dark Sky: lo esencial arriba, barra de 24 horas y 7 días. En la PC se reparte en dos columnas (pronóstico a la izquierda; gráfica, mapa y satélite a la derecha).
-- **7 días verificados**: cada plazo (1 a 7 días de anticipación) se mide por separado. Los días que todavía no superan al promedio aparecen como _orientativos_.
-- **Porcentajes por franja horaria**: madrugada, mañana, tarde y noche se calibran por separado cuando eso acierta más.
+- **Tu barrio primero**: pronóstico de tu punto exacto con el nombre del barrio (Urdesa, Alborada, La Carolina…). Las ciudades están en una lista aparte.
+- **Lo que está pasando ahora**: si el satélite o varias personas cerca reportan lluvia, la página lo dice ("Está lloviendo cerca de ti") y corrige las próximas 2-3 horas.
+- **Próximas 24 horas** al estilo Dark Sky: barra de condiciones y tira de horas con ícono, probabilidad y temperatura.
+- **7 días verificados** a cada plazo; los que todavía no superan al promedio aparecen como _orientativos_.
 - **Tormentas eléctricas verificadas** con los truenos que registran los aeropuertos.
-- **Alertas de cambio brusco**: si la lluvia de las próximas horas sube de golpe, la página lo avisa y queda un texto listo para publicar en redes (`datos/alertas.json`).
-- **Avisos en el teléfono**: con el botón 🔔 _Avisarme_, ClearSky te manda una notificación cuando es probable que llueva donde estás en las próximas 2 horas (máximo una cada 6 horas). En iPhone funciona con la app instalada en la pantalla de inicio.
-- **Mapa de lluvia** continuo y suave sobre Ecuador, hora por hora; al tocar un punto muestra su porcentaje. Es un pronóstico, no un radar.
-- **Satélite** GOES-19 de NOAA.
-- **Reportar el clima** (soleado, nublado, llovizna, lluvia, aguacero, tormenta) desde un botón; se ve lo que reporta la gente cerca.
-- **Compartir**: genera una imagen del pronóstico para WhatsApp o redes.
-- **App instalable**, modo claro y oscuro, uso sin conexión, apertura inmediata con el último pronóstico guardado y compatible con lectores de pantalla y teclado.
+- **Mapa** con dos modos: _Pronóstico_ (probabilidad hora por hora) y _Lloviendo ahora_ (estimación satelital de NOAA).
+- **Satélite** GOES-19 interactivo.
+- **Reportar el clima**, **avisos en el teléfono**, **compartir** como imagen, **app instalable**, modo claro y oscuro.
+- **Se actualiza sola** mientras la página está abierta, sin recargar.
 
 ## Ciudades
 
-| Ciudad | Aeropuerto de verificación | Zona |
+| Ciudad | Verificación | Zona |
 |---|---|---|
 | Guayaquil | SEGU – José Joaquín de Olmedo | Costa |
 | Quito | SEQM – Mariscal Sucre (Tababela) | Sierra |
@@ -34,68 +31,72 @@ Lo verifica todos los días: lluvia, tormentas eléctricas y pronósticos de has
 | Salinas | SESA – General Ulpiano Páez | Costa |
 | Esmeraldas | SETN – Carlos Concha Torres | Costa |
 | Cuenca | SECU – Mariscal Lamar | Sierra |
+| Machala | SETR – Santa Rosa | Costa |
+| Portoviejo | sin aeropuerto: usa lo aprendido en la costa | Costa |
+| Santo Domingo | SESD | Costa |
+| Loja | SETM – Catamayo | Sierra |
+| Ambato | SEAM – Chachoán | Sierra |
+| Latacunga | SELT – Cotopaxi | Sierra |
+| Coca | SECO | Oriente |
+| Lago Agrio | SENL | Oriente |
+| Macas | SEMC | Oriente |
+| Galápagos | SEGS – Baltra | Galápagos |
+
+Si un aeropuerto no tiene suficientes reportes (muchos cierran de noche o no publican), la ciudad usa
+lo aprendido en la ciudad verificada más cercana de su misma zona. Loja se verifica en Catamayo, que es
+más bajo y seco que la ciudad. Para agregar una ciudad: una línea en `CIUDADES` dentro de `clima_consenso.py`.
 
 ## Cómo funciona
 
-- **Cada hora** GitHub Actions descarga 7 modelos (ECMWF, GFS, ICON, GEM, JMA, MeteoFrance, UKMO) desde Open-Meteo.
-- **Consenso ponderado**: cada modelo vota con un peso según lo que ha acertado en esa ciudad.
-- **Verificación diaria**: compara lo que cada modelo pronosticó 1 a 7 días antes con lo que reportaron los aeropuertos (METAR) en los últimos 45 días, con ±1 hora de tolerancia.
-- **Examen sin trampa**: aprende con los días anteriores y se examina con los últimos 10 días, que no usó para aprender. Cada ajuste (pesos, calibración, franjas horarias, plazos) solo se acepta si acierta más en ese examen.
-- **Ventana deslizante**: siempre usa los últimos 45 días, así se adapta a la temporada. Las observaciones se guardan para siempre en `datos/`.
+- **Cada hora** GitHub Actions descarga 7 modelos (ECMWF, GFS, ICON, GEM, JMA, MeteoFrance, UKMO) desde Open-Meteo y la lluvia satelital más reciente de NOAA.
+- **Consenso ponderado** según lo que acertó cada modelo en cada ciudad.
+- **Verificación diaria** de lo pronosticado 1 a 7 días antes contra los aeropuertos (METAR), con un **examen sin trampa** sobre días no usados para aprender. Ventana deslizante de 45 días para adaptarse a la temporada.
+- **Corrección inmediata** (en la página y en los avisos): si la estimación satelital marca 1 mm/h o más en la zona, o al menos 3 reportes de la última hora y el 60% dicen que llueve, las próximas horas suben a 85% / 60% / 40%. Si al menos 3 reportes dicen que no llueve (y el satélite no ve lluvia), la hora actual baja a 25% como máximo.
+- **Pruebas antes de publicar**: datos completos, valores en rango, JSON válido y JavaScript sin errores. Si algo falla, se conserva la página anterior y el workflow falla (GitHub avisa por correo).
 
-> Niebla, ráfagas e índice UV vienen directamente de los modelos y **todavía no se verifican**.
+> Niebla, ráfagas, índice UV y la estimación satelital **todavía no se verifican**. La estimación satelital
+> se guarda hora por hora en `datos/satelite/` para poder verificarla contra los aeropuertos más adelante.
 
 ## Datos guardados
 
 | Archivo | Contenido |
 |---|---|
-| `datos/pesos.json` | Lo aprendido: pesos, umbral, calibraciones (general, por franja, por plazo, tormentas) y resultados |
-| `datos/observaciones/AAAA-MM.json` | Lluvia, llovizna y tormenta observadas por hora |
-| `datos/historial/AAAA-MM-DD.csv` | Lo que mostró la página, para medir aciertos reales y detectar cambios bruscos |
-| `datos/alertas.json` | Alertas de cambio brusco con texto listo para publicar |
-| `datos/reportes/AAAA-MM.json` | Reportes de usuarios (zona redondeada a ~5 km) |
-| `datos/respaldos/reportes-AAAA-Sxx.json.gz` | Respaldo semanal completo de los reportes (últimas 8 semanas) |
-| `datos/iconos/*.svg` | Íconos Meteocons |
-
-Junto a la página publicada se generan `push.json` (configuración para los avisos), `manifest.webmanifest`, `sw.js` e íconos.
+| `datos/pesos.json` | Lo aprendido por ciudad |
+| `datos/observaciones/AAAA-MM.json` | Lluvia, llovizna y tormenta observadas en los aeropuertos |
+| `datos/satelite/AAAA-MM.json` | Lluvia satelital (mm/h) en cada ciudad, hora por hora |
+| `datos/historial/AAAA-MM-DD.csv` | Lo que mostró la página |
+| `datos/alertas.json` | Cambios bruscos con texto listo para publicar |
+| `datos/reportes/AAAA-MM.json` y `datos/respaldos/` | Reportes de usuarios (zona ~5 km) y respaldo semanal |
 
 ## Operación
 
 - **Ejecutar a mano**: `gh workflow run actualizar.yml -f verificar=true`.
-- **Antes de editar en tu PC**: `git pull`. Si `git push` es rechazado: `git pull --rebase` y otra vez `git push`.
-- **Probar en un PC**: `python clima_consenso.py` crea `dashboard.html`. No subas los cambios de `datos/` de esa prueba.
+- **Antes de editar**: `git pull`; si `git push` es rechazado, `git pull --rebase` y otra vez `git push`.
+- La lectura del satélite necesita `netCDF4`; en GitHub Actions se instala sola la primera vez de cada ejecución.
 
-## Servicio de reportes y avisos (Cloudflare)
+## Servicio de reportes, avisos y vigilancia (Cloudflare)
 
-Carpeta `feedback/`. Se configura desde el panel de Cloudflare, sin instalar nada:
+Carpeta `feedback/`, configurada desde el panel de Cloudflare:
 
-1. **Base de datos** (D1 → `clearsky` → Console): ejecutar `schema.sql`.
-2. **Worker** `clearsky-feedback`: pegar `worker.js` y _Deploy_. Binding D1 con nombre `DB`.
-3. **Variables**: `SAL` y `TOKEN` (secretos), `ORIGEN` = `https://suirobert.github.io`.
-4. **Avisos**: generar las claves una sola vez con
-   `Invoke-RestMethod https://clearsky-feedback.<tu-subdominio>.workers.dev/vapid-nuevo -Headers @{Authorization="Bearer <TOKEN>"}`
-   y guardar `VAPID_PUBLIC`, `VAPID_PRIVATE` (el JSON completo) y opcionalmente `VAPID_SUB` (`mailto:tu-correo`) como secretos.
-5. **Tarea programada** (Settings → Triggers → Cron): `*/30 * * * *`.
-6. **GitHub**: secreto `FEEDBACK_TOKEN` y variable `FEEDBACK_URL`.
+1. **D1** `clearsky` → Console: ejecutar `schema.sql` (si ya existía la v11, solo las líneas nuevas: `ALTER TABLE sub ADD COLUMN admin INTEGER NOT NULL DEFAULT 0;` y `CREATE TABLE IF NOT EXISTS estado (k TEXT PRIMARY KEY, v TEXT);`).
+2. **Worker** `clearsky-feedback`: pegar `worker.js`, binding D1 `DB`, Cron Trigger `*/30 * * * *`.
+3. **Secretos**: `SAL`, `TOKEN`, `VAPID_PUBLIC`, `VAPID_PRIVATE`, opcional `VAPID_SUB`; variable `ORIGEN` = `https://suirobert.github.io`.
+4. **Vigilancia** (opcional): secreto `GH_TOKEN` con un token de GitHub de grano fino, solo para este repositorio, con permiso _Actions: Read and write_. Si la página lleva más de 3 h sin actualizarse, el Worker relanza el workflow.
+5. **Avisos de mantenimiento**: abre `https://suirobert.github.io/ClearSky/#admin` en tu teléfono, toca 🔔 _Avisarme_ y escribe el `TOKEN` cuando lo pida.
 
-Límites del plan gratuito: cada revisión atiende hasta 15 zonas y 25 avisos.
-
-**Privacidad**: los reportes guardan hora, tipo y ubicación redondeada a ~1 km; la IP nunca se guarda.
-Para los avisos se guarda la suscripción del navegador y la zona redondeada a ~1 km; se borran al desactivarlos.
-El nombre del barrio se consulta a OpenStreetMap con coordenadas redondeadas a ~100 m y se guarda solo en tu navegador.
+**Privacidad**: reportes con hora, tipo y ubicación redondeada (~1 km en el servicio, ~5 km en el repositorio); la IP nunca se guarda.
 
 ## Límites conocidos
 
-- La verificación usa un punto por ciudad (el aeropuerto). En ciudades grandes puede llover en un barrio y no en otro.
-- Quito se verifica en Tababela, que es más seco que el centro de la ciudad.
-- El mapa es un pronóstico de modelos, no un radar: Ecuador casi no tiene cobertura de radar meteorológico.
+- La verificación usa un punto por ciudad (el aeropuerto).
+- La lluvia satelital se estima desde el espacio (infrarrojo calibrado con microondas): detecta bien los aguaceros, pero puede fallar con lloviznas y lluvias débiles. No es un radar.
 - **Para emergencias sigue siempre las alertas oficiales** de la Secretaría de Gestión de Riesgos y del INAMHI.
 
 ## Créditos y licencias
 
-- Pronósticos: [Open-Meteo.com](https://open-meteo.com/), CC BY 4.0 (plan gratuito solo para uso no comercial).
+- Pronósticos: [Open-Meteo.com](https://open-meteo.com/), CC BY 4.0 (uso no comercial en el plan gratuito).
 - Observaciones METAR: [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu/).
-- Satélite: GOES-19 GeoColor, CIRA/NOAA.
-- Mapa y barrios: [Leaflet](https://leafletjs.com/) y © [OpenStreetMap](https://www.openstreetmap.org/copyright) (Nominatim).
+- Lluvia satelital: NOAA Enterprise Rain Rate (Open Data Dissemination Program, AWS). Imagen GOES-19 GeoColor: CIRA/NOAA vía NASA GIBS.
+- Mapa y barrios: [Leaflet](https://leafletjs.com/) y © [OpenStreetMap](https://www.openstreetmap.org/copyright).
 - Íconos: [Meteocons](https://github.com/basmilius/meteocons) de Bas Milius, MIT.
-- Servicio de reportes y avisos: Cloudflare Workers y D1 (plan gratuito).
+- Servicio de reportes y avisos: Cloudflare Workers y D1.

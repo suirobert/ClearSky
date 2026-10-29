@@ -1,16 +1,21 @@
-// ClearSky · servicio de reportes y avisos (Cloudflare Workers + D1, plan gratuito)
+// ClearSky · servicio de reportes y avisos (Cloudflare Workers + D1, plan gratuito) · v12
 // POST /reporte     {lat, lon, tipo}            -> guarda un reporte (máx. 1 cada 30 min por persona y zona)
 // GET  /resumen?lat=&lon=                       -> reportes de la última hora a ~10 km (público)
 // GET  /export?despues=<id>                     -> reportes nuevos para el script (requiere TOKEN)
 // GET  /vapid                                   -> clave pública para los avisos
-// POST /suscribir   {sub, lat, lon, nombre}     -> activa avisos de lluvia para esa zona
+// POST /suscribir   {sub, lat, lon, nombre, admin?} -> activa avisos (admin = TOKEN: avisos de mantenimiento)
 // POST /desuscribir {endpoint}                  -> los desactiva
 // GET  /vapid-nuevo                             -> genera claves VAPID (requiere TOKEN; se usa una sola vez)
-// Tarea programada (cron, cada 30 min): si en la zona de un suscriptor es probable que llueva en las
-// próximas 2 horas, le envía un aviso (máximo uno cada 6 horas).
+// GET  /estado                                  -> antigüedad de la página publicada (público)
+// Tarea programada (cron, cada 30 min):
+//   1. Avisos de lluvia: si el satélite o los reportes de la gente dicen que está lloviendo en la zona de un
+//      suscriptor, o si el pronóstico da 60% o más en las próximas 2 horas (máximo un aviso cada 6 horas).
+//   2. Vigilancia: si la página lleva más de 3 horas sin actualizarse, relanza el workflow de GitHub
+//      (si hay GH_TOKEN) y avisa a los suscriptores administradores.
 const TIPOS = ['soleado', 'nublado', 'llovizna', 'lluvia', 'lluvia_fuerte', 'tormenta'];
 const SITIO = 'https://suirobert.github.io/ClearSky';
-const PROB_AVISO = 60, HORAS_ENTRE_AVISOS = 6, MAX_ZONAS = 15, MAX_ENVIOS = 25;
+const REPO = 'suirobert/ClearSky', WORKFLOW = 'actualizar.yml';
+const PROB_AVISO = 60, HORAS_ENTRE_AVISOS = 6, MAX_ZONAS = 15, MAX_ENVIOS = 25, HORAS_VIEJA = 3;
 const enEcuador = (lat, lon) => lat >= -6 && lat <= 2.5 && lon >= -92.5 && lon <= -75;
 
 export default {
@@ -53,12 +58,7 @@ export default {
       if (url.pathname === '/resumen' && req.method === 'GET') {
         const lat = Number(url.searchParams.get('lat')), lon = Number(url.searchParams.get('lon'));
         if (!isFinite(lat) || !isFinite(lon)) return json({ error: 'datos' }, 400);
-        const r = await env.DB.prepare(
-          'SELECT tipo, COUNT(*) AS n FROM rep WHERE ts > ? AND lat BETWEEN ? AND ? AND lon BETWEEN ? AND ? GROUP BY tipo'
-        ).bind(ahora - 3600, lat - 0.1, lat + 0.1, lon - 0.1, lon + 0.1).all();
-        const o = { total: 0 };
-        for (const x of r.results) { o[x.tipo] = x.n; o.total += x.n; }
-        return json(o, 200, { 'Cache-Control': 'public, max-age=60' });
+        return json(await resumen(env, lat, lon, ahora), 200, { 'Cache-Control': 'public, max-age=60' });
       }
 
       if (url.pathname === '/export' && req.method === 'GET') {
@@ -67,6 +67,11 @@ export default {
         const r = await env.DB.prepare('SELECT id, ts, lat, lon, tipo FROM rep WHERE id > ? ORDER BY id LIMIT 5000')
           .bind(despues).all();
         return json(r.results);
+      }
+
+      if (url.pathname === '/estado' && req.method === 'GET') {
+        const e = await edadPagina(env);
+        return json({ generado: e.generado, horas: e.horas != null ? Math.round(e.horas * 10) / 10 : null });
       }
 
       // ---------- avisos ----------
@@ -87,12 +92,15 @@ export default {
         const lat = Math.round(Number(b && b.lat) * 100) / 100, lon = Math.round(Number(b && b.lon) * 100) / 100;
         if (!s || !k || !k.p256dh || !k.auth || !/^https:\/\//.test(s.endpoint || '')) return json({ error: 'datos' }, 400);
         if (!enEcuador(lat, lon)) return json({ error: 'fuera' }, 400);
+        const admin = b.admin != null && env.TOKEN && String(b.admin) === env.TOKEN ? 1 : 0;
+        if (b.admin != null && !admin) return json({ error: 'clave de administrador incorrecta' }, 403);
         const nombre = String((b && b.nombre) || 'tu zona').slice(0, 60);
         await env.DB.prepare(
-          'INSERT INTO sub (endpoint, p256dh, auth, lat, lon, nombre, creado, aviso) VALUES (?, ?, ?, ?, ?, ?, ?, 0) ' +
-          'ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, lat = excluded.lat, lon = excluded.lon, nombre = excluded.nombre'
-        ).bind(s.endpoint, k.p256dh, k.auth, lat, lon, nombre, ahora).run();
-        return json({ ok: true });
+          'INSERT INTO sub (endpoint, p256dh, auth, lat, lon, nombre, creado, aviso, admin) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?) ' +
+          'ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, lat = excluded.lat, lon = excluded.lon, ' +
+          'nombre = excluded.nombre, admin = MAX(sub.admin, excluded.admin)'
+        ).bind(s.endpoint, k.p256dh, k.auth, lat, lon, nombre, ahora, admin).run();
+        return json({ ok: true, admin: !!admin });
       }
 
       if (url.pathname === '/desuscribir' && req.method === 'POST') {
@@ -108,11 +116,23 @@ export default {
   },
 
   async scheduled(evento, env, ctx) {
-    ctx.waitUntil(revisarAvisos(env).catch(e => console.log('avisos:', e && e.message)));
+    ctx.waitUntil(Promise.all([
+      revisarAvisos(env).catch(e => console.log('avisos:', e && e.message)),
+      vigilar(env).catch(e => console.log('vigilancia:', e && e.message)),
+    ]));
   },
 };
 
-// =================== AVISOS: cálculo igual al de la página ===================
+async function resumen(env, lat, lon, ahora) {
+  const r = await env.DB.prepare(
+    'SELECT tipo, COUNT(*) AS n FROM rep WHERE ts > ? AND lat BETWEEN ? AND ? AND lon BETWEEN ? AND ? GROUP BY tipo'
+  ).bind(ahora - 3600, lat - 0.1, lat + 0.1, lon - 0.1, lon + 0.1).all();
+  const o = { total: 0 };
+  for (const x of r.results) { o[x.tipo] = x.n; o.total += x.n; }
+  return o;
+}
+
+// =================== AVISOS: el mismo cálculo que la página ===================
 function probConsenso(v, pesos, u) { let sw = 0, s = 0; for (const m in v) { const w = pesos[m] ?? 1; sw += w; if (v[m] >= u) s += w; } return sw ? s / sw * 100 : 0; }
 function calibrarProb(p, t) {
   if (!t || !t.length) return p;
@@ -134,41 +154,96 @@ function tablaHora(cfg, conf, hora) {
     if (h >= a && h < b && cfg.franjas.tablas && cfg.franjas.tablas[n]) return cfg.franjas.tablas[n]; }
   return cfg.tabla_lluvia;
 }
+function satelite(conf) {
+  const A = conf.ahora; if (!A || !A.q) return null;
+  const t = Date.parse(A.t + ':00-05:00'); if (!(Date.now() - t < 3 * 3600e3)) return null;
+  const v = Uint8Array.from(atob(A.q), c => c.charCodeAt(0));
+  return { t: A.t, en(lat, lon) {
+    const iy = Math.floor((A.lat0 - lat) / A.paso), ix = Math.floor((lon - A.lon0) / A.paso); let m = null;
+    for (let y = iy - 1; y <= iy + 1; y++) for (let x = ix - 1; x <= ix + 1; x++)
+      if (y >= 0 && y < A.ny && x >= 0 && x < A.nx) m = Math.max(m ?? 0, v[y * A.nx + x] * A.escala);
+    return m;
+  } };
+}
 async function revisarAvisos(env) {
   if (!env.VAPID_PRIVATE || !env.VAPID_PUBLIC) return;
   const sitio = (env.SITIO || SITIO).replace(/\/+$/, '');
   const ahora = Math.floor(Date.now() / 1000);
   const subs = (await env.DB.prepare('SELECT * FROM sub WHERE aviso < ?').bind(ahora - HORAS_ENTRE_AVISOS * 3600).all()).results;
   if (!subs.length) return;
-  const conf = await (await fetch(`${sitio}/push.json`, { cf: { cacheTtl: 600 } })).json();
+  const conf = await (await fetch(`${sitio}/push.json`, { cf: { cacheTtl: 300 } })).json();
+  const sat = satelite(conf);
   const zonas = new Map();                                   // agrupa suscriptores cercanos (~5 km)
   for (const s of subs) { const k = `${(Math.round(s.lat * 20) / 20).toFixed(2)},${(Math.round(s.lon * 20) / 20).toFixed(2)}`;
     (zonas.get(k) || zonas.set(k, []).get(k)).push(s); }
   let envios = 0;
   for (const [k, lista] of [...zonas].slice(0, MAX_ZONAS)) {
     const [lat, lon] = k.split(',').map(Number);
-    const om = await (await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=precipitation` +
-      `&models=${conf.modelos.join(',')}&timezone=auto&forecast_hours=3`)).json();
-    if (!om.hourly) continue;
-    const cfg = referencia(conf, lat, lon, om.elevation ?? 0).cfg;
-    let mejor = null;
-    om.hourly.time.forEach((t, i) => {
-      const v = {}; for (const m of conf.modelos) { const x = (om.hourly[`precipitation_${m}`] || [])[i]; if (x != null) v[m] = x; }
-      if (Object.keys(v).length < 3) return;
-      const p = Math.round(calibrarProb(probConsenso(v, cfg.pesos, cfg.umbral), tablaHora(cfg, conf, t)));
-      if (p >= PROB_AVISO && (!mejor || p > mejor.p)) mejor = { p, t };
-    });
-    if (!mejor) continue;
+    // 1) ¿está lloviendo ya? satélite y reportes de la gente de la última hora
+    const mm = sat ? sat.en(lat, lon) : null;
+    const rep = await resumen(env, lat, lon, ahora);
+    const moja = (rep.lluvia || 0) + (rep.lluvia_fuerte || 0) + (rep.tormenta || 0) + 0.5 * (rep.llovizna || 0);
+    const lluviaRep = rep.total >= 3 && moja / rep.total >= 0.6;
+    let aviso = null;
+    if ((mm != null && mm >= 1) || lluviaRep) {
+      const quien = [mm != null && mm >= 0.5 ? 'el satélite' : '', lluviaRep ? `${rep.total} reportes de la gente` : ''].filter(Boolean).join(' y ');
+      aviso = (nombre) => ({ title: `🌧️ Está lloviendo cerca de ${nombre}`, body: `Según ${quien}. ¡Lleva paraguas!`, url: sitio + '/', tag: 'lluvia' });
+    } else {
+      // 2) pronóstico de las próximas 2 horas
+      const om = await (await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=precipitation` +
+        `&models=${conf.modelos.join(',')}&timezone=auto&forecast_hours=3`)).json();
+      if (!om.hourly) continue;
+      const cfg = referencia(conf, lat, lon, om.elevation ?? 0).cfg;
+      let mejor = null;
+      om.hourly.time.forEach((t, i) => {
+        const v = {}; for (const m of conf.modelos) { const x = (om.hourly[`precipitation_${m}`] || [])[i]; if (x != null) v[m] = x; }
+        if (Object.keys(v).length < 3) return;
+        const p = Math.round(calibrarProb(probConsenso(v, cfg.pesos, cfg.umbral), tablaHora(cfg, conf, t)));
+        if (p >= PROB_AVISO && (!mejor || p > mejor.p)) mejor = { p, t };
+      });
+      if (mejor) aviso = (nombre) => ({ title: `🌧️ Lluvia probable en ${nombre}`,
+        body: `${mejor.p}% de probabilidad hacia las ${mejor.t.slice(11, 16)}. ¡Lleva paraguas!`, url: sitio + '/', tag: 'lluvia' });
+    }
+    if (!aviso) continue;
     for (const s of lista) {
       if (envios >= MAX_ENVIOS) return;
-      const aviso = { title: `🌧️ Lluvia probable en ${s.nombre.split(',')[0]}`,
-        body: `${mejor.p}% de probabilidad hacia las ${mejor.t.slice(11, 16)}. ¡Lleva paraguas!`, url: sitio + '/', tag: 'lluvia' };
-      const r = await enviarPush(s, aviso, env);
+      const r = await enviarPush(s, aviso(s.nombre.split(',')[0]), env);
       envios++;
       if (r.status === 404 || r.status === 410) await env.DB.prepare('DELETE FROM sub WHERE endpoint = ?').bind(s.endpoint).run();
       else if (r.ok) await env.DB.prepare('UPDATE sub SET aviso = ? WHERE endpoint = ?').bind(ahora, s.endpoint).run();
     }
   }
+}
+
+// =================== VIGILANCIA: ¿la página se está actualizando? ===================
+async function edadPagina(env) {
+  const sitio = (env.SITIO || SITIO).replace(/\/+$/, '');
+  try {
+    const conf = await (await fetch(`${sitio}/push.json?t=${Date.now()}`, { cf: { cacheTtl: 0 } })).json();
+    const t = Date.parse(conf.generado + ':00-05:00');
+    return { generado: conf.generado, horas: (Date.now() - t) / 36e5 };
+  } catch (e) { return { generado: null, horas: null }; }
+}
+async function vigilar(env) {
+  const e = await edadPagina(env);
+  if (e.horas != null && e.horas < HORAS_VIEJA) return;
+  const ahora = Math.floor(Date.now() / 1000);
+  const ult = await env.DB.prepare("SELECT v FROM estado WHERE k = 'vigilancia'").first().catch(() => null);
+  if (ult && ahora - Number(ult.v) < HORAS_VIEJA * 3600) return;           // como mucho una vez cada 3 horas
+  await env.DB.prepare("INSERT INTO estado (k, v) VALUES ('vigilancia', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").bind(String(ahora)).run();
+  let relanzado = false;
+  if (env.GH_TOKEN) {
+    const r = await fetch(`https://api.github.com/repos/${REPO}/actions/workflows/${WORKFLOW}/dispatches`, { method: 'POST',
+      headers: { Authorization: `Bearer ${env.GH_TOKEN}`, Accept: 'application/vnd.github+json', 'User-Agent': 'ClearSky-vigilancia',
+                 'X-GitHub-Api-Version': '2022-11-28' }, body: JSON.stringify({ ref: 'main' }) });
+    relanzado = r.status === 204;
+  }
+  if (!env.VAPID_PRIVATE) return;
+  const admins = (await env.DB.prepare('SELECT * FROM sub WHERE admin = 1').all()).results;
+  const cuanto = e.horas == null ? 'no responde' : `lleva ${Math.round(e.horas)} h sin actualizarse`;
+  for (const s of admins) await enviarPush(s, { title: '⚠️ ClearSky ' + cuanto,
+    body: relanzado ? 'Relancé la actualización automáticamente. Revisa GitHub Actions si sigue igual.' : 'Revisa GitHub Actions.',
+    url: `https://github.com/${REPO}/actions`, tag: 'vigilancia' }, env).catch(() => {});
 }
 
 // =================== WEB PUSH (RFC 8291 + VAPID RFC 8292), solo WebCrypto ===================
@@ -193,8 +268,7 @@ export async function cifrar(payload, p256dh, authSecret) {
   const nonce = await hkdf(salt, ikm, enc.encode('Content-Encoding: nonce\0'), 12);
   const clave = await crypto.subtle.importKey('raw', cek, 'AES-GCM', false, ['encrypt']);
   const cifrado = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, clave, unir(enc.encode(payload), new Uint8Array([2]))));
-  const rs = new Uint8Array([0, 0, 16, 0]);                                     // 4096
-  return unir(salt, rs, new Uint8Array([asPub.length]), asPub, cifrado);
+  return unir(salt, new Uint8Array([0, 0, 16, 0]), new Uint8Array([asPub.length]), asPub, cifrado);
 }
 export async function jwtVapid(audiencia, env) {
   const k = await crypto.subtle.importKey('jwk', JSON.parse(env.VAPID_PRIVATE), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
