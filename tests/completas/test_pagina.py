@@ -35,7 +35,7 @@ def test_el_titulo_repetido_ya_no_esta_y_solo_aparece_al_elegir_un_dia(abrir):
 
 
 def test_selector_de_rango_24h_3dias_7dias(abrir):
-    p = abrir(); pg = p.pagina
+    p = abrir(hora_local="14:05"); pg = p.pagina       # reloj fijo: con poco día por delante el tramo de hoy es angosto (ver test_horas_del_dia.py)
     for rango, minimo in (("24", 24), ("72", 72), ("168", 168)):
         pg.click(f"#rsel .rb[data-r='{rango}']")
         assert pg.eval_on_selector("#rsel .rb.on", "e => e.dataset.r") == rango
@@ -63,7 +63,7 @@ def test_diseno_en_pc_y_celular(abrir):
 
 
 def test_etiquetas_con_color_propio(abrir):
-    pg = abrir().pagina
+    pg = abrir(hora_local="14:05").pagina                  # reloj fijo: de noche no hay etiqueta de UV
     colores = pg.evaluate("""() => Object.fromEntries([...document.querySelectorAll('.chips .chip')].map(c => [c.className.replace('chip', '').trim() || 'base', getComputedStyle(c).backgroundColor]))""")
     assert "hum" in colores and any(k.startswith("uv") for k in colores), colores
     assert len(set(colores.values())) >= 4, "humedad, UV, sensación y tormenta se distinguen entre sí"

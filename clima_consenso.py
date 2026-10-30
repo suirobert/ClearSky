@@ -25,6 +25,7 @@ Página (index.html, generada aquí y dibujada con JavaScript):
     satelital, ambas solo cuando hay suficientes días acumulados y pasan el examen (datos/observado/).
   - Tablero público de aciertos día por día (tarjeta "Cómo nos fue esta semana") y selector de rango 24 h / 3 días / 7 días.
   - Reportes de la gente de truenos e inundación: solo se muestran si coinciden 2 o más personas cerca (siempre "no verificado").
+  - Gráfico de 7 días: cada día lleva su nombre y su máximo; el tramo de hoy, si queda poco día, también (pegado a su borde).
   - Compartir: imagen con el mismo diseño de la página (tema claro u oscuro, íconos, tira de horas y días) y con la hora en que se generó.
   - La ubicación sigue a la persona: se vuelve a leer el GPS al abrir, al volver a la pestaña y cada 5 minutos, y si se movió
     más de 300 m se recalcula el lugar y el pronóstico (con un botón para forzarlo).
@@ -2993,10 +2994,12 @@ function grafica(cont, filas, ahora, hoy, vr) {
   for (const v of ticks) s += `<line x1="${pl}" x2="${W - pr}" y1="${Y(v)}" y2="${Y(v)}" stroke="${C.grid}" stroke-width="1"${v === lo ? '' : ' stroke-dasharray="2 4"'}/><text x="${pl - 6}" y="${Y(v) + 4}" text-anchor="end" font-size="10.5" fill="${C.txt}">${fy(v)}</text>`;
   if (vr === 'viento') s += `<text x="${pl - 6}" y="${pt - 6}" text-anchor="end" font-size="10" fill="${C.txt}">km/h</text>`;
   const inicios = filas.map((r, i) => i === 0 || r.hora.slice(11, 13) === '00' ? i : -1).filter(i => i >= 0);
-  // cabecera de cada día (solo 7 días): nombre y el valor máximo del día, centrados sobre su columna
-  const cabeceraDia = (i, fin, ancho) => {
-    if (ancho < 24) return;
-    const rs = filas.slice(i, fin), cx = (X(i) + X(fin - 1)) / 2, dia = nombreDia(filas[i].hora.slice(0, 10), hoy);
+  // cabecera de cada día (solo 7 días): nombre y valor máximo del día. Las columnas de un día completo van centradas. El tramo de hoy (y el
+  // último, si es parcial) puede ser angosto porque queda poco día: entonces va pegado a su borde, con el valor si cabe y solo con el nombre si
+  // no; y si ni así cabe sin pisar a la columna de al lado, no se dibuja. (Antes se omitía siempre que el tramo medía menos de 24 px: en el
+  // celular, el tramo de hoy casi nunca tenía nombre.)
+  const textoDia = (i, fin, ancho) => {
+    const rs = filas.slice(i, fin), dia = nombreDia(filas[i].hora.slice(0, 10), hoy);
     const nombre = ancho >= 66 ? dia : dia === 'Hoy' ? 'Hoy' : dia.slice(0, 3);
     let txt = '–', col = C.txt;
     if (vr === 'lluvia') { const m = Math.max(...rs.map(r => r.prob)), t = Math.max(...rs.map(r => r.prob_ts || 0));
@@ -3004,12 +3007,33 @@ function grafica(cont, filas, ahora, hoy, vr) {
     else if (vr === 'temp') { const m = Math.max(...rs.filter(r => r.temp != null).map(r => r.temp)); if (isFinite(m)) { txt = Math.round(m) + '°'; col = C.temp; } }
     else if (vr === 'viento') { const m = Math.max(...rs.map(r => r.rafaga ?? r.viento ?? 0)); if (m > 0) { txt = Math.round(m); col = C.vto; } }
     else { const m = Math.max(...rs.map(r => r.uv || 0)); if (m >= 1) { txt = Math.round(m); col = m >= 8 ? '#ef4444' : m >= 6 ? '#fb923c' : m >= 3 ? '#facc15' : '#4ade80'; } }
-    s += `<text x="${cx}" y="${pt - 30}" text-anchor="middle" font-size="11" font-weight="600" fill="${C.fuerte}">${nombre}</text>` +
-         `<text x="${cx}" y="${pt - 14}" text-anchor="middle" font-size="12.5" font-weight="700" fill="${col}">${txt}</text>`;
+    return {nombre, txt, col};
+  };
+  const cabecerasDias = () => {
+    const mc = document.createElement('canvas').getContext('2d'), fam = getComputedStyle(cont).fontFamily || 'sans-serif';
+    const medir = (t, px, w) => { mc.font = `${w} ${px}px ${fam}`; return mc.measureText(String(t)).width; };     // el ancho real del texto, no una estimación
+    const cols = inicios.map((i, q) => {
+      const fin = q + 1 < inicios.length ? inicios[q + 1] : n, ancho = X(fin - 1) - X(i), t = textoDia(i, fin, ancho), estrecha = ancho < 24, primera = i === 0;
+      return Object.assign(t, {estrecha, wN: medir(t.nombre, 11, 600), wV: medir(t.txt, 12.5, 700),
+        ancla: estrecha ? (primera ? 'start' : 'end') : 'middle', x: estrecha ? (primera ? X(i) + 2 : X(fin - 1) - 2) : (X(i) + X(fin - 1)) / 2});
+    });
+    const caja = (c, conValor) => { const w = conValor ? Math.max(c.wN, c.wV) : c.wN, izq = c.ancla === 'start' ? c.x : c.ancla === 'end' ? c.x - w : c.x - w / 2; return [izq, izq + w]; };
+    cols.forEach((c, k) => {
+      let conValor = true;
+      if (c.estrecha) {
+        const vec = cols[k === 0 ? 1 : k - 1]; if (!vec || vec.estrecha) return;
+        const [vi, vd] = caja(vec, true);
+        const choca = cv => { const [a, b] = caja(c, cv); return k === 0 ? b + 2 > vi : vd + 2 > a; };
+        if (choca(true)) { if (choca(false)) return; conValor = false; }
+      }
+      s += `<text x="${c.x}" y="${pt - 30}" text-anchor="${c.ancla}" font-size="11" font-weight="600" fill="${C.fuerte}">${c.nombre}</text>` +
+           (conValor ? `<text x="${c.x}" y="${pt - 14}" text-anchor="${c.ancla}" font-size="12.5" font-weight="700" fill="${c.col}">${c.txt}</text>` : '');
+    });
   };
   inicios.forEach((i, q) => { const fin = q + 1 < inicios.length ? inicios[q + 1] : n, ancho = X(fin - 1) - X(i);
-    if (i) s += `<line x1="${X(i)}" x2="${X(i)}" y1="${pt - arr}" y2="${pt + h}" stroke="${C.grid}" stroke-width="1"/>`;
-    if (largo) cabeceraDia(i, fin, ancho); else if (ancho > 38) s += `<text x="${X(i) + 5}" y="${pt - 12}" font-size="11.5" font-weight="600" fill="${C.fuerte}">${nombreDia(filas[i].hora.slice(0, 10), hoy)}</text>`; });
+    if (i) s += `<line x1="${X(i)}" x2="${X(i)}" y1="${largo && q === 1 && X(i) - X(0) < 24 ? pt - 2 : pt - arr}" y2="${pt + h}" stroke="${C.grid}" stroke-width="1"/>`;   // si el tramo de hoy es angosto, la raya no cruza su nombre
+    if (!largo && ancho > 38) s += `<text x="${X(i) + 5}" y="${pt - 12}" font-size="11.5" font-weight="600" fill="${C.fuerte}">${nombreDia(filas[i].hora.slice(0, 10), hoy)}</text>`; });
+  if (largo) cabecerasDias();
   filas.forEach((r, i) => { const hh = +r.hora.slice(11, 13); if ((largo ? hh === 12 : hh % paso === 0) && X(i) > pl + 8 && X(i) < W - pr - 8)
     s += `<text x="${X(i)}" y="${H - 7}" text-anchor="middle" font-size="10.5" fill="${C.txt}">${hh}h</text>`; });
   const serie = (f, min = -Infinity) => filas.map((r, i) => { const v = f(r); return v == null ? null : [X(i), Y(v >= min ? v : lo)]; }).filter(Boolean);
