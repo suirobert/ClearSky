@@ -1,1 +1,11 @@
-[]
+[
+ {
+  "creado": "2026-10-31T07:18:51",
+  "ciudad": "Portoviejo",
+  "hora": "2026-10-31T12:00",
+  "prob": 60,
+  "antes": 10,
+  "tormenta": false,
+  "texto": "🌧️ Lluvia probable en Portoviejo hacia las 12:00: 60% (antes 10%). Pronóstico verificado: https://suirobert.github.io/ClearSky/"
+ }
+]
