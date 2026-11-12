@@ -7,5 +7,14 @@
   "antes": 10,
   "tormenta": false,
   "texto": "🌧️ Lluvia probable en Portoviejo hacia las 12:00: 60% (antes 10%). Pronóstico verificado: https://suirobert.github.io/ClearSky/"
+ },
+ {
+  "creado": "2026-11-12T08:11:56",
+  "ciudad": "Portoviejo",
+  "hora": "2026-11-12T13:00",
+  "prob": 62,
+  "antes": 20,
+  "tormenta": false,
+  "texto": "🌧️ Lluvia probable en Portoviejo hacia las 13:00: 62% (antes 20%). Pronóstico verificado: https://suirobert.github.io/ClearSky/"
  }
 ]
