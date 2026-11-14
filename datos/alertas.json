@@ -16,5 +16,14 @@
   "antes": 20,
   "tormenta": false,
   "texto": "🌧️ Lluvia probable en Portoviejo hacia las 13:00: 62% (antes 20%). Pronóstico verificado: https://suirobert.github.io/ClearSky/"
+ },
+ {
+  "creado": "2026-11-14T08:31:04",
+  "ciudad": "Salinas",
+  "hora": "2026-11-14T08:00",
+  "prob": 62,
+  "antes": 32,
+  "tormenta": false,
+  "texto": "🌧️ Lluvia probable en Salinas hacia las 08:00: 62% (antes 32%). Pronóstico verificado: https://suirobert.github.io/ClearSky/"
  }
 ]
