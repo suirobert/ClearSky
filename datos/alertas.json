@@ -25,5 +25,14 @@
   "antes": 32,
   "tormenta": false,
   "texto": "🌧️ Lluvia probable en Salinas hacia las 08:00: 62% (antes 32%). Pronóstico verificado: https://suirobert.github.io/ClearSky/"
+ },
+ {
+  "creado": "2026-11-19T22:11:42",
+  "ciudad": "Machala",
+  "hora": "2026-11-20T02:00",
+  "prob": 65,
+  "antes": 16,
+  "tormenta": false,
+  "texto": "🌧️ Lluvia probable en Machala hacia las 02:00: 65% (antes 16%). Pronóstico verificado: https://suirobert.github.io/ClearSky/"
  }
 ]
