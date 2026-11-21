@@ -34,5 +34,14 @@
   "antes": 16,
   "tormenta": false,
   "texto": "🌧️ Lluvia probable en Machala hacia las 02:00: 65% (antes 16%). Pronóstico verificado: https://suirobert.github.io/ClearSky/"
+ },
+ {
+  "creado": "2026-11-21T11:30:59",
+  "ciudad": "Santo Domingo",
+  "hora": "2026-11-21T17:00",
+  "prob": 60,
+  "antes": 16,
+  "tormenta": true,
+  "texto": "⛈️ Tormenta probable en Santo Domingo hacia las 17:00: 60% (antes 16%). Pronóstico verificado: https://suirobert.github.io/ClearSky/"
  }
 ]
