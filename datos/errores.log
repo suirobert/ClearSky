@@ -206,3 +206,7 @@
 2026-11-22 13:29 pronóstico Macas: HTTP Error 429: Too Many Requests
 2026-11-22 13:30 pronóstico Galápagos: HTTP Error 429: Too Many Requests
 2026-11-22 13:30 no se pudo descargar ningún pronóstico; se conserva la página anterior
+2026-11-23 02:03 Machala: el aeropuerto solo reportó 0% de las horas (mínimo 25%); se mantiene la configuración anterior
+2026-11-23 02:03 Santo Domingo: el aeropuerto solo reportó 0% de las horas (mínimo 25%); se mantiene la configuración anterior
+2026-11-23 02:03 Loja: el aeropuerto solo reportó 0% de las horas (mínimo 25%); se mantiene la configuración anterior
+2026-11-23 02:03 Ambato: el aeropuerto solo reportó 10% de las horas (mínimo 25%); se mantiene la configuración anterior
