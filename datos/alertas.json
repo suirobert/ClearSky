@@ -43,5 +43,14 @@
   "antes": 16,
   "tormenta": true,
   "texto": "⛈️ Tormenta probable en Santo Domingo hacia las 17:00: 60% (antes 16%). Pronóstico verificado: https://suirobert.github.io/ClearSky/"
+ },
+ {
+  "creado": "2026-11-24T12:29:22",
+  "ciudad": "Santo Domingo",
+  "hora": "2026-11-24T13:00",
+  "prob": 60,
+  "antes": 16,
+  "tormenta": true,
+  "texto": "⛈️ Tormenta probable en Santo Domingo hacia las 13:00: 60% (antes 16%). Pronóstico verificado: https://suirobert.github.io/ClearSky/"
  }
 ]
