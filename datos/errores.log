@@ -218,3 +218,20 @@
 2026-11-24 04:33 historial de pronósticos (3 plazos) no disponible: Expecting value: line 1 column 1 (char 0)
 2026-11-24 04:33 historial de pronósticos (1 plazos) no disponible: Expecting value: line 1 column 1 (char 0)
 2026-11-24 04:34 historial de pronósticos (7 plazos) no disponible: Expecting value: line 1 column 1 (char 0)
+2026-11-24 10:31 pronóstico Guayaquil: HTTP Error 429: Too Many Requests
+2026-11-24 10:31 pronóstico Quito: HTTP Error 429: Too Many Requests
+2026-11-24 10:31 pronóstico Manta: HTTP Error 429: Too Many Requests
+2026-11-24 10:31 pronóstico Salinas: HTTP Error 429: Too Many Requests
+2026-11-24 10:32 pronóstico Esmeraldas: HTTP Error 429: Too Many Requests
+2026-11-24 10:32 pronóstico Cuenca: HTTP Error 429: Too Many Requests
+2026-11-24 10:32 pronóstico Machala: HTTP Error 429: Too Many Requests
+2026-11-24 10:32 pronóstico Portoviejo: HTTP Error 429: Too Many Requests
+2026-11-24 10:33 pronóstico Santo Domingo: HTTP Error 429: Too Many Requests
+2026-11-24 10:33 pronóstico Loja: HTTP Error 429: Too Many Requests
+2026-11-24 10:33 pronóstico Ambato: HTTP Error 429: Too Many Requests
+2026-11-24 10:33 pronóstico Latacunga: HTTP Error 429: Too Many Requests
+2026-11-24 10:34 pronóstico Coca: HTTP Error 429: Too Many Requests
+2026-11-24 10:34 pronóstico Lago Agrio: HTTP Error 429: Too Many Requests
+2026-11-24 10:34 pronóstico Macas: HTTP Error 429: Too Many Requests
+2026-11-24 10:34 pronóstico Galápagos: HTTP Error 429: Too Many Requests
+2026-11-24 10:34 no se pudo descargar ningún pronóstico; se conserva la página anterior
