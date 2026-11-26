@@ -61,5 +61,14 @@
   "antes": 57,
   "tormenta": false,
   "texto": "🌧️ Lluvia probable en Machala hacia las 16:00: 87% (antes 57%). Pronóstico verificado: https://suirobert.github.io/ClearSky/"
+ },
+ {
+  "creado": "2026-11-26T18:43:18",
+  "ciudad": "Machala",
+  "hora": "2026-11-26T18:00",
+  "prob": 87,
+  "antes": 57,
+  "tormenta": true,
+  "texto": "⛈️ Tormenta probable en Machala hacia las 18:00: 87% (antes 57%). Pronóstico verificado: https://suirobert.github.io/ClearSky/"
  }
 ]
